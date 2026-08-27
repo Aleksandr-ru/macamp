@@ -243,8 +243,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mainDragGroupWindows: [NSWindow] = []
     private var mainDragWindowOffsets: [ObjectIdentifier: NSPoint] = [:]
     private var mainDragLastOrigin: NSPoint?
-    private var infoDragGroupWindows: [NSWindow] = []
-    private var infoDragWindowOffsets: [ObjectIdentifier: NSPoint] = [:]
     private var scaleObserver: Any?
     private var focusObservers: [Any] = []
     private var isExplicitTerminationRequested = false
@@ -1219,9 +1217,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.contentView = InfoPanelView(model: infoModel, scale: interfaceScale, focus: infoFocus,
             onClose: { [weak self, weak panel] in panel?.orderOut(nil); self?.infoState.isVisible = false; self?.schedulePersistentStateSave() },
             onResize: { [weak self, weak panel] width, height in self?.resizeInfo(panel, width: width, height: height) },
-            onDragBegan: { [weak self, weak panel] in if let panel { self?.beginInfoWindowDrag(panel) } },
-            onDragChanged: { [weak self, weak panel] in if let panel { self?.moveInfoWindowDragGroup(panel) } },
-            onDragEnded: { [weak self] in self?.endInfoWindowDrag() })
+            onDragChanged: { [weak self, weak panel] in
+                if let panel { self?.magnetWindowWhileDragging(panel) }
+            },
+            onDragEnded: { [weak self] in self?.schedulePersistentStateSave() })
         panel.setFrameOrigin(NSPoint(x: window.frame.maxX, y: window.frame.maxY - panel.frame.height))
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: panel, queue: .main) { [weak self] _ in self?.infoFocus.isKey = true }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in self?.infoFocus.isKey = false }
@@ -1657,50 +1656,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             magnet(movingWindow, against: [window, equalizerWindow].compactMap { $0 } + visibleInfo + allPlaylistWindows)
         }
-    }
-
-    /// Info joins the same connected magnetic component as the three primary
-    /// windows. The component is snapshotted before dragging, so every linked
-    /// panel keeps its relative offset while Info is being moved.
-    func beginInfoWindowDrag(_ info: NSWindow) {
-        var group: [NSWindow] = [info]
-        var remaining = ([window, equalizerWindow].compactMap { $0 } + playlistWindows.values)
-            .filter { $0.isVisible && $0 !== info }
-        var expanded = true
-        while expanded {
-            expanded = false
-            for candidate in remaining where group.contains(where: { windowsAreDocked($0, candidate) }) {
-                group.append(candidate)
-                expanded = true
-            }
-            if expanded {
-                let ids = Set(group.map(ObjectIdentifier.init))
-                remaining.removeAll { ids.contains(ObjectIdentifier($0)) }
-            }
-        }
-        infoDragGroupWindows = group.filter { $0 !== info }
-        infoDragWindowOffsets = Dictionary(uniqueKeysWithValues: infoDragGroupWindows.map {
-            (ObjectIdentifier($0), NSPoint(x: $0.frame.minX - info.frame.minX, y: $0.frame.minY - info.frame.minY))
-        })
-    }
-
-    func moveInfoWindowDragGroup(_ info: NSWindow) {
-        let group = Set(infoDragGroupWindows.map(ObjectIdentifier.init))
-        let neighbours = ([window, equalizerWindow].compactMap { $0 } + playlistWindows.values)
-            .filter { $0 !== info && !group.contains(ObjectIdentifier($0)) }
-        magnet(info, against: neighbours)
-        for panel in infoDragGroupWindows {
-            guard let offset = infoDragWindowOffsets[ObjectIdentifier(panel)] else { continue }
-            panel.setFrameOrigin(NSPoint(x: info.frame.minX + offset.x, y: info.frame.minY + offset.y))
-            if let id = playlistWindows.first(where: { $0.value === panel })?.key,
-               let model = playlistManager.playlist(id: id) { model.windowFrame = panel.frame }
-        }
-    }
-
-    func endInfoWindowDrag() {
-        infoDragGroupWindows.removeAll()
-        infoDragWindowOffsets.removeAll()
-        schedulePersistentStateSave()
     }
 
     /// Snaps a window to a screen edge or to a touching edge of another player

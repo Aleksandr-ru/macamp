@@ -161,7 +161,6 @@ final class InfoPanelView: NSView {
     private let focus: WindowFocusState
     private let onClose: () -> Void
     private let onResize: (CGFloat, CGFloat) -> Void
-    private let onDragBegan: () -> Void
     private let onDragChanged: () -> Void
     private let onDragEnded: () -> Void
     private let skin = WinampSkinStore()
@@ -174,11 +173,11 @@ final class InfoPanelView: NSView {
 
     init(model: InfoWindowModel, scale: InterfaceScale, focus: WindowFocusState,
          onClose: @escaping () -> Void, onResize: @escaping (CGFloat, CGFloat) -> Void,
-         onDragBegan: @escaping () -> Void, onDragChanged: @escaping () -> Void,
+         onDragChanged: @escaping () -> Void,
          onDragEnded: @escaping () -> Void) {
         self.model = model; self.scaleState = scale; self.focus = focus
         self.onClose = onClose; self.onResize = onResize
-        self.onDragBegan = onDragBegan; self.onDragChanged = onDragChanged; self.onDragEnded = onDragEnded
+        self.onDragChanged = onDragChanged; self.onDragEnded = onDragEnded
         super.init(frame: .zero)
         wantsLayer = true
         scrollView.drawsBackground = false
@@ -370,7 +369,6 @@ final class InfoPanelView: NSView {
     }
     private func trackDrag() {
         guard let window else { return }; let origin = window.frame.origin; let start = NSEvent.mouseLocation
-        onDragBegan()
         defer { onDragEnded() }
         while let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             if event.type == .leftMouseUp { return }
