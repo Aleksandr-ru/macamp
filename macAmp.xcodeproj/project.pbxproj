@@ -1,0 +1,378 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 50;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2706773E242E89F100CFBEE7 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2706773D242E89F100CFBEE7 /* AppDelegate.swift */; };
+		27067740242E89F100CFBEE7 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2706773F242E89F100CFBEE7 /* ContentView.swift */; };
+		E1A0000126A0000100000001 /* WinampSkinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000226A0000100000001 /* WinampSkinStore.swift */; };
+		E1A0000326A0000100000001 /* InterfaceScale.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000426A0000100000001 /* InterfaceScale.swift */; };
+		E1A0000526A0000100000001 /* Default.wsz in Resources */ = {isa = PBXBuildFile; fileRef = E1A0000626A0000100000001 /* Default.wsz */; };
+		E1A0000726A0000100000001 /* DefaultSkin in Resources */ = {isa = PBXBuildFile; fileRef = E1A0000826A0000100000001 /* DefaultSkin */; };
+		E1A0000926A0000100000001 /* PlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000A26A0000100000001 /* PlaybackController.swift */; };
+		E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000C26A0000100000001 /* EqualizerController.swift */; };
+		E1A0000D26A0000100000001 /* PlaylistManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000E26A0000100000001 /* PlaylistManager.swift */; };
+		E1A0000F26A0000100000001 /* InfoWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001026A0000100000001 /* InfoWindow.swift */; };
+		27067742242E89F200CFBEE7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067741242E89F200CFBEE7 /* Assets.xcassets */; };
+		27067745242E89F200CFBEE7 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067744242E89F200CFBEE7 /* Preview Assets.xcassets */; };
+		27067748242E89F200CFBEE7 /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 27067746242E89F200CFBEE7 /* Main.storyboard */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		2706773A242E89F100CFBEE7 /* macAmp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = macAmp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		2706773D242E89F100CFBEE7 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		2706773F242E89F100CFBEE7 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		E1A0000226A0000100000001 /* WinampSkinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WinampSkinStore.swift; sourceTree = "<group>"; };
+		E1A0000426A0000100000001 /* InterfaceScale.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterfaceScale.swift; sourceTree = "<group>"; };
+		E1A0000626A0000100000001 /* Default.wsz */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = Resources/Default.wsz; sourceTree = "<group>"; };
+		E1A0000826A0000100000001 /* DefaultSkin */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources/DefaultSkin; sourceTree = "<group>"; };
+		E1A0000A26A0000100000001 /* PlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackController.swift; sourceTree = "<group>"; };
+		E1A0000C26A0000100000001 /* EqualizerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EqualizerController.swift; sourceTree = "<group>"; };
+		E1A0000E26A0000100000001 /* PlaylistManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistManager.swift; sourceTree = "<group>"; };
+		E1A0001026A0000100000001 /* InfoWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InfoWindow.swift; sourceTree = "<group>"; };
+		27067741242E89F200CFBEE7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		27067744242E89F200CFBEE7 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
+		27067747242E89F200CFBEE7 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
+		27067749242E89F200CFBEE7 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		2706774A242E89F200CFBEE7 /* macAmp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = macAmp.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		27067737242E89F100CFBEE7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		27067731242E89F100CFBEE7 = {
+			isa = PBXGroup;
+			children = (
+				2706773C242E89F100CFBEE7 /* macAmp */,
+				2706773B242E89F100CFBEE7 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		2706773B242E89F100CFBEE7 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				2706773A242E89F100CFBEE7 /* macAmp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		2706773C242E89F100CFBEE7 /* macAmp */ = {
+			isa = PBXGroup;
+			children = (
+				2706773D242E89F100CFBEE7 /* AppDelegate.swift */,
+				2706773F242E89F100CFBEE7 /* ContentView.swift */,
+				E1A0000226A0000100000001 /* WinampSkinStore.swift */,
+				E1A0000426A0000100000001 /* InterfaceScale.swift */,
+				E1A0000626A0000100000001 /* Default.wsz */,
+				E1A0000826A0000100000001 /* DefaultSkin */,
+				E1A0000A26A0000100000001 /* PlaybackController.swift */,
+				E1A0000C26A0000100000001 /* EqualizerController.swift */,
+				E1A0000E26A0000100000001 /* PlaylistManager.swift */,
+				E1A0001026A0000100000001 /* InfoWindow.swift */,
+				27067741242E89F200CFBEE7 /* Assets.xcassets */,
+				27067746242E89F200CFBEE7 /* Main.storyboard */,
+				27067749242E89F200CFBEE7 /* Info.plist */,
+				2706774A242E89F200CFBEE7 /* macAmp.entitlements */,
+				27067743242E89F200CFBEE7 /* Preview Content */,
+			);
+			path = macAmp;
+			sourceTree = "<group>";
+		};
+		27067743242E89F200CFBEE7 /* Preview Content */ = {
+			isa = PBXGroup;
+			children = (
+				27067744242E89F200CFBEE7 /* Preview Assets.xcassets */,
+			);
+			path = "Preview Content";
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		27067739242E89F100CFBEE7 /* macAmp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2706774D242E89F200CFBEE7 /* Build configuration list for PBXNativeTarget "macAmp" */;
+			buildPhases = (
+				27067736242E89F100CFBEE7 /* Sources */,
+				27067737242E89F100CFBEE7 /* Frameworks */,
+				27067738242E89F100CFBEE7 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = macAmp;
+			productName = macAmp;
+			productReference = 2706773A242E89F100CFBEE7 /* macAmp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		27067732242E89F100CFBEE7 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastSwiftUpdateCheck = 1140;
+				LastUpgradeCheck = 1140;
+				ORGANIZATIONNAME = Aleksandr.ru;
+				TargetAttributes = {
+					27067739242E89F100CFBEE7 = {
+						CreatedOnToolsVersion = 11.4;
+					};
+				};
+			};
+			buildConfigurationList = 27067735242E89F100CFBEE7 /* Build configuration list for PBXProject "MacAmp" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 27067731242E89F100CFBEE7;
+			productRefGroup = 2706773B242E89F100CFBEE7 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				27067739242E89F100CFBEE7 /* macAmp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		27067738242E89F100CFBEE7 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E1A0000726A0000100000001 /* DefaultSkin in Resources */,
+				E1A0000526A0000100000001 /* Default.wsz in Resources */,
+				27067748242E89F200CFBEE7 /* Main.storyboard in Resources */,
+				27067745242E89F200CFBEE7 /* Preview Assets.xcassets in Resources */,
+				27067742242E89F200CFBEE7 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		27067736242E89F100CFBEE7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E1A0000926A0000100000001 /* PlaybackController.swift in Sources */,
+				E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */,
+				E1A0000D26A0000100000001 /* PlaylistManager.swift in Sources */,
+				E1A0000F26A0000100000001 /* InfoWindow.swift in Sources */,
+				E1A0000326A0000100000001 /* InterfaceScale.swift in Sources */,
+				E1A0000126A0000100000001 /* WinampSkinStore.swift in Sources */,
+				27067740242E89F100CFBEE7 /* ContentView.swift in Sources */,
+				2706773E242E89F100CFBEE7 /* AppDelegate.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXVariantGroup section */
+		27067746242E89F200CFBEE7 /* Main.storyboard */ = {
+			isa = PBXVariantGroup;
+			children = (
+				27067747242E89F200CFBEE7 /* Base */,
+			);
+			name = Main.storyboard;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
+/* Begin XCBuildConfiguration section */
+		2706774B242E89F200CFBEE7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		2706774C242E89F200CFBEE7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		2706774E242E89F200CFBEE7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = macAmp/macAmp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_ASSET_PATHS = "\"macAmp/Preview Content\"";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = macAmp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ru.aleksandr.MacAmp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		2706774F242E89F200CFBEE7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = macAmp/macAmp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_ASSET_PATHS = "\"macAmp/Preview Content\"";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = macAmp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ru.aleksandr.MacAmp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		27067735242E89F100CFBEE7 /* Build configuration list for PBXProject "MacAmp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2706774B242E89F200CFBEE7 /* Debug */,
+				2706774C242E89F200CFBEE7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		2706774D242E89F200CFBEE7 /* Build configuration list for PBXNativeTarget "MacAmp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2706774E242E89F200CFBEE7 /* Debug */,
+				2706774F242E89F200CFBEE7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 27067732242E89F100CFBEE7 /* Project object */;
+}

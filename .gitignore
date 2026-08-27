@@ -1,0 +1,28 @@
+# macOS Finder metadata
+.DS_Store
+
+# Xcode build products and derived data
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Per-user Xcode state
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# Swift Package Manager generated Xcode workspace state
+.swiftpm/xcode/package.xcworkspace/
+.swiftpm/xcode/xcuserdata/
+
+# Dependency-manager build artifacts
+Carthage/Build/
+Pods/
+
+# Xcode intermediate files
+*.hmap
