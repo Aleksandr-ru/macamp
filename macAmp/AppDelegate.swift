@@ -93,12 +93,19 @@ private final class PlayerWindow: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
     override func sendEvent(_ event: NSEvent) {
-        // A non-activating panel receives this original click. Promote it to key
-        // first, so its skin also immediately shows the active state.
-        if event.type == .leftMouseDown {
+        // Keep the original mouse-down/up pair intact: SwiftUI drag gestures
+        // depend on receiving both from the same event sequence. When a panel
+        // is activated by this click, force a display after dispatching its
+        // mouse-down so the skin can show the pressed frame immediately.
+        let activatesPanel = event.type == .leftMouseDown && !isKeyWindow
+        if activatesPanel {
             AppDelegate.shared?.bringPlayerWindowsToFront(active: self)
         }
         super.sendEvent(event)
+        if activatesPanel {
+            contentView?.layoutSubtreeIfNeeded()
+            contentView?.displayIfNeeded()
+        }
     }
 }
 
@@ -2127,13 +2134,6 @@ private struct PlaylistView: View {
                 if !visible.contains(index) {
                     DispatchQueue.main.async { proxy.scrollTo(id, anchor: .center) }
                 }
-            }
-            .onChange(of: playlist.selectedIDs) { _ in
-                guard let selectedID = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) })?.id,
-                      let index = playlist.entries.firstIndex(where: { $0.id == selectedID }) else { return }
-                let visible = playlist.scrollPosition..<min(playlist.entries.count, playlist.scrollPosition + playlist.visibleEntryCount)
-                guard !visible.contains(index) else { return }
-                DispatchQueue.main.async { proxy.scrollTo(selectedID, anchor: .center) }
             }
             .onAppear {
                 let position = min(max(0, playlist.scrollPosition), max(0, playlist.entries.count - 1))
