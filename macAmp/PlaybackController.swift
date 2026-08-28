@@ -342,6 +342,20 @@ final class PlaybackController: NSObject, ObservableObject {
             // contact a file provider. It must never delay painting the newly
             // active Playlist row on the main run loop.
             let obtainedSecurityScope = url.startAccessingSecurityScopedResource()
+            // Do this filesystem query on the opening queue as well.  An SMB
+            // or other network volume is not a candidate for AVAudioFile:
+            // even when constructed off-main, later graph setup can force a
+            // synchronous index/read on the event loop. AVPlayer buffers it
+            // asynchronously and keeps all MacAmp windows responsive.
+            let isNetworkVolume = (try? url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) == false
+            if isNetworkVolume {
+                DispatchQueue.main.async { [weak self] in
+                    if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
+                    guard let self, generation == self.fileOpenGeneration else { return }
+                    self.startStreamingFallback(for: url, generation: generation)
+                }
+                return
+            }
             let result = Result { try AVAudioFile(forReading: url) }
             DispatchQueue.main.async { [self] in
                 guard let self else {
