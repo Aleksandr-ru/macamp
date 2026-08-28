@@ -388,6 +388,27 @@ final class PlaylistManager: ObservableObject {
 
     func focus(_ playlist: PlaylistModel) { focusedPlaylistID = playlist.id; save() }
 
+    /// Moves the single keyboard selection without triggering persistence or
+    /// playlist-wide work. The visible editor decides how to reveal the row.
+    @discardableResult
+    func moveSelection(in playlist: PlaylistModel, by offset: Int) -> PlaylistEntry? {
+        guard offset != 0, !playlist.entries.isEmpty else { return nil }
+
+        let selectedIndices = playlist.entries.indices.filter {
+            playlist.selectedIDs.contains(playlist.entries[$0].id)
+        }
+        let anchor: Int
+        if offset > 0 {
+            anchor = selectedIndices.max() ?? -1
+        } else {
+            anchor = selectedIndices.min() ?? playlist.entries.count
+        }
+        let target = min(max(0, anchor + offset), playlist.entries.count - 1)
+        let entry = playlist.entries[target]
+        playlist.selectedIDs = [entry.id]
+        return entry
+    }
+
     func visibleRangeChanged(for playlist: PlaylistModel, firstEntry: Int, visibleCount: Int) {
         let position = max(0, min(firstEntry, max(0, playlist.entries.count - 1)))
         let count = max(1, visibleCount)

@@ -252,8 +252,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastNowPlayingTitle = ""
     private var lastNowPlayingIsPlaying = false
     private var lastDirectMediaKeyEvent = Date.distantPast
-    private var playbackShortcutMonitor: Any?
     private var mediaKeyMonitor: Any?
+    private var keyboardShortcutMonitor: Any?
     private var controlsMenu: NSMenu?
     private let persistentStateKey = "MacAmp.applicationPersistentState.v1"
 
@@ -383,8 +383,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
-        if let playbackShortcutMonitor { NSEvent.removeMonitor(playbackShortcutMonitor) }
         if let mediaKeyMonitor { NSEvent.removeMonitor(mediaKeyMonitor) }
+        if let keyboardShortcutMonitor { NSEvent.removeMonitor(keyboardShortcutMonitor) }
         pendingPersistenceWorkItem?.cancel()
         playlistManager.cancelFolderScans()
         playlistManager.flushSave()
@@ -393,15 +393,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func installPlaybackShortcuts() {
-        playbackShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.handleWinampPlaybackShortcut(event) else { return event }
-            return nil
+        keyboardShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleLocalPlaybackShortcut(event) ? nil : event
         }
     }
 
-    private func handleWinampPlaybackShortcut(_ event: NSEvent) -> Bool {
+    /// Local monitoring is the only AppKit path that consistently carries the
+    /// key event's source panel for non-activating player windows.
+    private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard modifiers.isEmpty else { return false }
+        // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
+        // Those identify the hardware key; only real shortcut modifiers
+        // should bypass context-sensitive Winamp bindings.
+        let shortcutModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        guard modifiers.intersection(shortcutModifiers).isEmpty else { return false }
+
+        let sourceWindowNumber = event.window?.windowNumber
+        let playlistID = sourceWindowNumber.flatMap { number in
+            playlistWindows.first(where: { $0.value.windowNumber == number })?.key
+        }
+
+        // Playlist navigation intentionally takes precedence over the global
+        // transport mapping. In classic Winamp the same arrows have different
+        // meanings depending on the focused window.
+        if let playlistID, let playlist = playlistManager.playlist(id: playlistID) {
+            switch event.keyCode {
+            case 126: // ↑ — Previous playlist row
+                movePlaylistSelection(in: playlist, by: -1)
+            case 125: // ↓ — Next playlist row
+                movePlaylistSelection(in: playlist, by: 1)
+            default:
+                break
+            }
+            if event.keyCode == 126 || event.keyCode == 125 {
+                return true
+            }
+        }
 
         switch event.keyCode {
         case 6: // physical Z key — Previous
@@ -431,6 +459,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: return false
         }
         return true
+    }
+
+    private func movePlaylistSelection(in playlist: PlaylistModel, by offset: Int) {
+        guard let entry = playlistManager.moveSelection(in: playlist, by: offset) else { return }
+        selectInfoTarget(entry)
     }
 
     private func installMediaKeyHandling() {
@@ -1273,7 +1306,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: panel, queue: .main) { [weak self, weak model] _ in
             context.focus.isKey = true
-            if let model { self?.playlistManager.focus(model); self?.lastActivePlaylistWindow = panel }
+            if let model {
+                self?.playlistManager.focus(model)
+                self?.lastActivePlaylistWindow = panel
+            }
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { _ in
             context.focus.isKey = false
@@ -1325,7 +1361,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: playlist, queue: .main) { [weak self, weak playlist] _ in
             guard let self, let playlist else { return }
             self.playlistFocus.isKey = true; self.lastActivePlaylistWindow = playlist
-            if let id = self.playlistWindows.first(where: { $0.value === playlist })?.key, let model = self.playlistManager.playlist(id: id) { self.playlistManager.focus(model) }
+            if let id = self.playlistWindows.first(where: { $0.value === playlist })?.key,
+               let model = self.playlistManager.playlist(id: id) {
+                self.playlistManager.focus(model)
+            }
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: playlist, queue: .main) { [weak self] _ in self?.playlistFocus.isKey = false }
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: playlist, queue: .main) { [weak self] _ in
@@ -2088,6 +2127,13 @@ private struct PlaylistView: View {
                 if !visible.contains(index) {
                     DispatchQueue.main.async { proxy.scrollTo(id, anchor: .center) }
                 }
+            }
+            .onChange(of: playlist.selectedIDs) { _ in
+                guard let selectedID = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) })?.id,
+                      let index = playlist.entries.firstIndex(where: { $0.id == selectedID }) else { return }
+                let visible = playlist.scrollPosition..<min(playlist.entries.count, playlist.scrollPosition + playlist.visibleEntryCount)
+                guard !visible.contains(index) else { return }
+                DispatchQueue.main.async { proxy.scrollTo(selectedID, anchor: .center) }
             }
             .onAppear {
                 let position = min(max(0, playlist.scrollPosition), max(0, playlist.entries.count - 1))
