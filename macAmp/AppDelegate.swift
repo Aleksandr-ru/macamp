@@ -155,6 +155,15 @@ private final class PlaylistWindowContext {
     }
 }
 
+/// Captures a connected set of touching player windows before a scale change.
+/// Origins are stored relative to one member so the whole group can be
+/// reconstructed after every panel receives its new scaled size.
+private struct AttachedWindowScaleGroup {
+    let anchor: NSWindow
+    let members: [NSWindow]
+    let offsets: [ObjectIdentifier: NSPoint]
+}
+
 /// Header controls use AppKit mouse tracking so the skin's pressed frame is
 /// always shown and the action is delivered even when the panel was inactive.
 struct SkinTitleControlHotspot: NSViewRepresentable {
@@ -210,6 +219,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentInterfaceScale: Double { interfaceScale.factor }
     var window: NSWindow!
     private let interfaceScale = InterfaceScale()
+    private let playlistFontScale = PlaylistFontScale()
     private let timeDisplayPreference = TimeDisplayPreference()
     private let windowFocus = WindowFocusState()
     private let windowShade = WindowShadeState()
@@ -419,6 +429,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
         // Those identify the hardware key; only real shortcut modifiers
         // should bypass context-sensitive Winamp bindings.
@@ -475,6 +486,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: return false
         }
         return true
+    }
+
+    /// The same keys control the visual scale of the active player surface:
+    /// Main/EQ use the skin/interface scale, while Playlist/Info use their
+    /// shared content-font scale.  Keeping this at the local event monitor
+    /// preserves routing for non-activating panels and never intercepts the
+    /// shortcut from Settings or another application window.
+    private func handleContextualScaleShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers.contains(.command),
+              !modifiers.contains(.option),
+              !modifiers.contains(.control) else { return false }
+        let delta: Double
+        switch event.keyCode {
+        case 24: // = (and + when Shift is held)
+            delta = 10
+        case 27: // -
+            delta = -10
+        default:
+            return false
+        }
+        guard let sourceWindow = event.window else { return false }
+        if sourceWindow === window || sourceWindow === equalizerWindow {
+            interfaceScale.percent += delta
+            return true
+        }
+        if sourceWindow === infoWindow || playlistWindows.values.contains(where: { $0 === sourceWindow }) {
+            playlistFontScale.percent += delta
+            return true
+        }
+        return false
     }
 
     private func movePlaylistSelection(in playlist: PlaylistModel, by offset: Int) {
@@ -735,6 +779,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scale = CGFloat(interfaceScale.factor)
         let scaleChanged = abs(scale - lastAppliedInterfaceScale) > 0.0001
         let scaleRatio = scale / lastAppliedInterfaceScale
+        let attachedScaleGroups = scaleChanged ? captureAttachedWindowScaleGroups() : []
         if scaleChanged {
             if isEqualizerDocked {
                 equalizerDockOffset = NSPoint(x: equalizerDockOffset.x * scaleRatio, y: equalizerDockOffset.y * scaleRatio)
@@ -806,7 +851,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             infoWindow.setFrameOrigin(NSPoint(x: infoWindow.frame.minX, y: top - infoWindow.frame.height))
             infoWindow.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
         }
+        if scaleChanged {
+            restoreAttachedWindowScaleGroups(attachedScaleGroups, scaleRatio: scaleRatio)
+            for (id, panel) in playlistWindows {
+                playlistWindowContexts[id]?.model.windowFrame = panel.frame
+            }
+        }
         lastAppliedInterfaceScale = scale
+    }
+
+    /// Build connected components from the pre-scale geometry.  A group can
+    /// contain any combination of Main, EQ, Playlist and Info, including a
+    /// floating group that is not attached to Main.
+    private func captureAttachedWindowScaleGroups() -> [AttachedWindowScaleGroup] {
+        var remaining = ([window, equalizerWindow, infoWindow].compactMap { $0 }
+            + playlistWindows.values).filter(\.isVisible)
+        var groups: [AttachedWindowScaleGroup] = []
+        while let first = remaining.first {
+            var members = [first]
+            remaining.removeFirst()
+            var expanded = true
+            while expanded {
+                expanded = false
+                for candidate in remaining where members.contains(where: { windowsAreDocked($0, candidate) }) {
+                    members.append(candidate)
+                    expanded = true
+                }
+                if expanded {
+                    let memberIDs = Set(members.map(ObjectIdentifier.init))
+                    remaining.removeAll { memberIDs.contains(ObjectIdentifier($0)) }
+                }
+            }
+            let anchor = members.first(where: { $0 === window }) ?? members[0]
+            let offsets = Dictionary(uniqueKeysWithValues: members.map {
+                (ObjectIdentifier($0), NSPoint(x: $0.frame.minX - anchor.frame.minX, y: $0.frame.minY - anchor.frame.minY))
+            })
+            groups.append(AttachedWindowScaleGroup(anchor: anchor, members: members, offsets: offsets))
+        }
+        return groups
+    }
+
+    /// Restore the pre-scale layout as a single scaled coordinate system.
+    /// Window dimensions have already changed when this runs, so scaling the
+    /// old offsets keeps every shared edge shared instead of producing a gap
+    /// or overlap from independently resized panels.
+    private func restoreAttachedWindowScaleGroups(
+        _ groups: [AttachedWindowScaleGroup],
+        scaleRatio: CGFloat
+    ) {
+        for group in groups {
+            let anchorOrigin = group.anchor.frame.origin
+            for member in group.members where member !== group.anchor {
+                guard let offset = group.offsets[ObjectIdentifier(member)] else { continue }
+                member.setFrameOrigin(NSPoint(
+                    x: anchorOrigin.x + offset.x * scaleRatio,
+                    y: anchorOrigin.y + offset.y * scaleRatio
+                ))
+            }
+            // Restore the one-backing-pixel seam compensation for fractional
+            // scales without letting a nearby screen edge pull one member out
+            // of its just-restored group.
+            for member in group.members where member !== group.anchor {
+                magnet(member, against: group.members.filter { $0 !== member }, includeScreenEdges: false)
+            }
+        }
     }
 
     private func connectFileMenu() {
@@ -1147,7 +1255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let preferences = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 172),
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 216),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1156,6 +1264,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preferences.isReleasedWhenClosed = false
         preferences.contentView = NSHostingView(rootView: SettingsView(
             interfaceScale: interfaceScale,
+            playlistFontScale: playlistFontScale,
             timeDisplayPreference: timeDisplayPreference
         ))
         preferences.center()
@@ -1262,7 +1371,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
         panel.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
-        panel.contentView = InfoPanelView(model: infoModel, scale: interfaceScale, focus: infoFocus,
+        panel.contentView = InfoPanelView(model: infoModel, scale: interfaceScale, fontScale: playlistFontScale, focus: infoFocus,
             onClose: { [weak self, weak panel] in panel?.orderOut(nil); self?.infoState.isVisible = false; self?.schedulePersistentStateSave() },
             onResize: { [weak self, weak panel] width, height in self?.resizeInfo(panel, width: width, height: height) },
             onDragChanged: { [weak self, weak panel] in
@@ -1315,7 +1424,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let initialHeight = (context.shade.isEnabled ? 14 : context.layout.height) * scale
         let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: context.layout.width * scale, height: initialHeight), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
-        panel.contentView = NSHostingView(rootView: PlaylistView(interfaceScale: interfaceScale, focus: context.focus, shade: context.shade, layout: context.layout, playback: playback, timeDisplayPreference: timeDisplayPreference, manager: playlistManager, playlist: model, onClose: { [weak self] in self?.closePlaylistWindow(for: model) }, onToggleShade: { [weak self] in self?.toggleFloatingPlaylistShade(panel, context: context) }, onDragEnded: { [weak self] in self?.finishFloatingPlaylistGesture(panel, model: model) }, onResize: { [weak self] width, height in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: height) }, onShadeResize: { [weak self] width in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: 14) }))
+        panel.contentView = NSHostingView(rootView: PlaylistView(interfaceScale: interfaceScale, fontScale: playlistFontScale, focus: context.focus, shade: context.shade, layout: context.layout, playback: playback, timeDisplayPreference: timeDisplayPreference, manager: playlistManager, playlist: model, onClose: { [weak self] in self?.closePlaylistWindow(for: model) }, onToggleShade: { [weak self] in self?.toggleFloatingPlaylistShade(panel, context: context) }, onDragEnded: { [weak self] in self?.finishFloatingPlaylistGesture(panel, model: model) }, onResize: { [weak self] width, height in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: height) }, onShadeResize: { [weak self] width in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: 14) }))
         let activeWindow = lastActivePlaylistWindow ?? playlistWindows.values.first(where: { $0.isKeyWindow }) ?? playlistWindows.values.first
         let origin = model.windowFrame.map { NSPoint(x: $0.minX, y: $0.minY) } ?? activeWindow.map { NSPoint(x: $0.frame.minX + 25 * scale, y: $0.frame.minY - 29 * scale) } ?? NSPoint(x: window.frame.maxX, y: window.frame.maxY - panel.frame.height)
         panel.setFrameOrigin(origin)
@@ -1369,6 +1478,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlist.isMovableByWindowBackground = false
         playlist.contentView = NSHostingView(rootView: PlaylistView(
             interfaceScale: interfaceScale,
+            fontScale: playlistFontScale,
             focus: playlistFocus,
             shade: playlistShade,
             layout: playlistLayout,
@@ -1407,7 +1517,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshPlaylistWindow() {
         guard let playlistWindow, let model = playlistManager.activePlaylist else { return }
         playlistWindow.contentView = NSHostingView(rootView: PlaylistView(
-            interfaceScale: interfaceScale, focus: playlistFocus, shade: playlistShade,
+            interfaceScale: interfaceScale, fontScale: playlistFontScale, focus: playlistFocus, shade: playlistShade,
             layout: playlistLayout, playback: playback,
             timeDisplayPreference: timeDisplayPreference, manager: playlistManager, playlist: model,
             onClose: { [weak self] in self?.closePlaylistWindow(for: model) },
@@ -1570,7 +1680,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func moveDockedPlaylist() {
         guard isPlaylistDocked, playlistState.isVisible else { return }
         isRepositioningPlaylist = true
-        playlistWindow?.setFrameOrigin(NSPoint(x: window.frame.minX + playlistDockOffset.x, y: window.frame.minY + playlistDockOffset.y))
+        if let playlistWindow {
+            playlistWindow.setFrameOrigin(NSPoint(x: window.frame.minX + playlistDockOffset.x, y: window.frame.minY + playlistDockOffset.y))
+            // Re-run the common edge alignment after a scale change. This is
+            // needed when a 10% scale step produces a fractional screen-pixel
+            // window size.
+            magnet(playlistWindow, against: [window])
+        }
         isRepositioningPlaylist = false
     }
 
@@ -1760,9 +1876,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Snaps a window to a screen edge or to a touching edge of another player
     /// panel. Existing EQ/playlist docking remains responsible for group moves.
-    private func magnet(_ movingWindow: NSWindow, against neighbours: [NSWindow]) {
+    private func magnet(
+        _ movingWindow: NSWindow,
+        against neighbours: [NSWindow],
+        includeScreenEdges: Bool = true
+    ) {
         let threshold: CGFloat = 12
         var frame = movingWindow.frame
+        let seamOverlap = compositorSeamOverlap(for: frame)
         for neighbour in neighbours {
             let other = neighbour.frame
             // Snap to a neighbouring playlist even while the windows have not
@@ -1771,12 +1892,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let verticallyClose = frame.maxY >= other.minY - threshold && frame.minY <= other.maxY + threshold
             let horizontallyClose = frame.maxX >= other.minX - threshold && frame.minX <= other.maxX + threshold
             if verticallyClose {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
             }
             if horizontallyClose {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
             }
             // Side-by-side windows also align to a common top or bottom edge.
             if abs(frame.maxY - other.maxY) <= threshold { frame.origin.y = other.maxY - frame.height }
@@ -1785,17 +1906,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if abs(frame.minX - other.minX) <= threshold { frame.origin.x = other.minX }
             if abs(frame.maxX - other.maxX) <= threshold { frame.origin.x = other.maxX - frame.width }
             if frame.maxY > other.minY && frame.minY < other.maxY {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
             }
             if frame.maxX > other.minX && frame.minX < other.maxX {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
             }
         }
         // Screen edges have the final priority over window-to-window alignment.
-        let screen = screenFrame(containing: frame) ?? NSScreen.main?.visibleFrame
-        if let screen {
+        if includeScreenEdges, let screen = screenFrame(containing: frame) ?? NSScreen.main?.visibleFrame {
             if abs(frame.minX - screen.minX) <= threshold { frame.origin.x = screen.minX }
             if abs(frame.maxX - screen.maxX) <= threshold { frame.origin.x = screen.maxX - frame.width }
             if abs(frame.minY - screen.minY) <= threshold { frame.origin.y = screen.minY }
@@ -1804,6 +1924,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if movingWindow.frame.origin != frame.origin {
             movingWindow.setFrameOrigin(frame.origin)
         }
+    }
+
+    /// Window backing stores must start and end on whole device pixels. A
+    /// fractional interface scale (for example, 130%) can place adjacent
+    /// borderless windows on opposite sides of one backing pixel. Overlap the
+    /// two surfaces by that one pixel only in this case; integer pixel scales
+    /// retain exact edge-to-edge classic Winamp geometry.
+    private func compositorSeamOverlap(for frame: NSRect) -> CGFloat {
+        let centre = NSPoint(x: frame.midX, y: frame.midY)
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(centre) }) ?? NSScreen.main
+        let backingScale = screen?.backingScaleFactor ?? 1
+        let scaledPixels = CGFloat(interfaceScale.factor) * backingScale
+        guard abs(scaledPixels - scaledPixels.rounded()) > 0.000_1 else { return 0 }
+        return 1 / backingScale
     }
 
     private func magnetDockedGroupToScreen() {
@@ -1845,7 +1979,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func isMagneticallyAttached(_ frame: NSRect, to other: NSRect) -> Bool {
-        let epsilon: CGFloat = 0.5
+        let epsilon = max(CGFloat(0.5), compositorSeamOverlap(for: frame))
         return abs(frame.minX - other.minX) <= epsilon || abs(frame.maxX - other.maxX) <= epsilon ||
             abs(frame.minX - other.maxX) <= epsilon || abs(frame.maxX - other.minX) <= epsilon ||
             abs(frame.minY - other.minY) <= epsilon || abs(frame.maxY - other.maxY) <= epsilon ||
@@ -1879,7 +2013,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func moveDockedEqualizer() {
         guard isEqualizerDocked, equalizerState.isVisible else { return }
         isRepositioningEqualizer = true
-        equalizerWindow?.setFrameOrigin(NSPoint(x: window.frame.minX + equalizerDockOffset.x, y: window.frame.minY + equalizerDockOffset.y))
+        if let equalizerWindow {
+            equalizerWindow.setFrameOrigin(NSPoint(x: window.frame.minX + equalizerDockOffset.x, y: window.frame.minY + equalizerDockOffset.y))
+            magnet(equalizerWindow, against: [window])
+        }
         isRepositioningEqualizer = false
     }
 
@@ -1947,6 +2084,7 @@ private struct PlaylistStatusField: View {
 
 private struct SettingsView: View {
     @ObservedObject var interfaceScale: InterfaceScale
+    @ObservedObject var playlistFontScale: PlaylistFontScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
 
     var body: some View {
@@ -1960,10 +2098,17 @@ private struct SettingsView: View {
                     .frame(width: 38, alignment: .trailing)
                     .font(.system(.body, design: .monospaced))
             }
+            HStack {
+                Text("Playlist font")
+                Slider(value: $playlistFontScale.percent, in: 100...200, step: 10)
+                Text("\(Int(playlistFontScale.percent))%")
+                    .frame(width: 38, alignment: .trailing)
+                    .font(.system(.body, design: .monospaced))
+            }
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
         }
         .padding(20)
-        .frame(width: 300, height: 172, alignment: .topLeading)
+        .frame(width: 300, height: 216, alignment: .topLeading)
     }
 }
 
@@ -1972,6 +2117,7 @@ private struct SettingsView: View {
 private struct PlaylistView: View {
     @StateObject private var skin = WinampSkinStore()
     @ObservedObject var interfaceScale: InterfaceScale
+    @ObservedObject var fontScale: PlaylistFontScale
     @ObservedObject var focus: PlaylistFocusState
     @ObservedObject var shade: PlaylistShadeState
     @ObservedObject var layout: PlaylistLayout
@@ -2129,6 +2275,7 @@ private struct PlaylistView: View {
 
     private var playlistEntries: some View {
         let colors = skin.playlistColors()
+        let entryHeight = playlistEntryHeight
         // Read the token so completed metadata becomes visible without having
         // to replace the higher-priority Loading/Adding status text.
         _ = playlist.metadataRevision
@@ -2149,13 +2296,13 @@ private struct PlaylistView: View {
                                 Spacer(minLength: 2)
                                 Text(entry.duration.map(formattedTime) ?? "--:--")
                             }
-                            .font(.system(size: 8, weight: .regular, design: .monospaced))
+                            .font(.system(size: CGFloat(8 * fontScale.factor), weight: .regular, design: .monospaced))
                             // draw_pe.cpp: bit 2 (current) selects the text
                             // colour; bit 1 (selection) selects only the row
                             // background.  A selected current entry is white
                             // on the skin's SelectedBG, never black or green.
                             .foregroundColor(playlistColor(isPlayingEntry ? colors.currentText : colors.normalText))
-                            .padding(.horizontal, 2).frame(height: 13)
+                            .padding(.horizontal, 2).frame(height: entryHeight)
                             .background(playlistColor(isSelected ? colors.selectedBackground : colors.background))
                         }.buttonStyle(PlainButtonStyle())
                         // Classic PLEDIT selects on a single click.  Playback
@@ -2197,11 +2344,18 @@ private struct PlaylistView: View {
                 DispatchQueue.main.async { proxy.scrollTo(playlist.entries[position].id, anchor: .top) }
             }
             .onPreferenceChange(PlaylistScrollOffsetKey.self) { offset in
-                let visibleRows = max(1, Int(ceil(max(1, layout.height - 58) / 13)))
+                let visibleRows = visiblePlaylistEntryCount
                 manager.visibleRangeChanged(
                     for: playlist,
-                    firstEntry: Int(max(0, (-offset / 13).rounded(.down))),
+                    firstEntry: Int(max(0, (-offset / entryHeight).rounded(.down))),
                     visibleCount: visibleRows
+                )
+            }
+            .onChange(of: fontScale.percent) { _ in
+                manager.visibleRangeChanged(
+                    for: playlist,
+                    firstEntry: playlist.scrollPosition,
+                    visibleCount: visiblePlaylistEntryCount
                 )
             }
             .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
@@ -2220,6 +2374,16 @@ private struct PlaylistView: View {
                 return true
             }
         }
+    }
+
+    /// Leave the original 13-pixel row untouched at 100%; larger text gains
+    /// matching line height so the glyphs never overlap or get clipped.
+    private var playlistEntryHeight: CGFloat {
+        max(13, ceil(8 * CGFloat(fontScale.factor) + 5))
+    }
+
+    private var visiblePlaylistEntryCount: Int {
+        max(1, Int(ceil(max(1, layout.height - 58) / playlistEntryHeight)))
     }
 
     private func playlistColor(_ color: NSColor) -> Color {

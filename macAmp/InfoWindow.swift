@@ -158,6 +158,7 @@ final class InfoWindowModel: ObservableObject {
 final class InfoPanelView: NSView {
     private let model: InfoWindowModel
     private let scaleState: InterfaceScale
+    private let fontScale: PlaylistFontScale
     private let focus: WindowFocusState
     private let onClose: () -> Void
     private let onResize: (CGFloat, CGFloat) -> Void
@@ -171,11 +172,11 @@ final class InfoPanelView: NSView {
     private var isRebuilding = false
     private var laidOutContentWidth: CGFloat = -.greatestFiniteMagnitude
 
-    init(model: InfoWindowModel, scale: InterfaceScale, focus: WindowFocusState,
+    init(model: InfoWindowModel, scale: InterfaceScale, fontScale: PlaylistFontScale, focus: WindowFocusState,
          onClose: @escaping () -> Void, onResize: @escaping (CGFloat, CGFloat) -> Void,
          onDragChanged: @escaping () -> Void,
          onDragEnded: @escaping () -> Void) {
-        self.model = model; self.scaleState = scale; self.focus = focus
+        self.model = model; self.scaleState = scale; self.fontScale = fontScale; self.focus = focus
         self.onClose = onClose; self.onResize = onResize
         self.onDragChanged = onDragChanged; self.onDragEnded = onDragEnded
         super.init(frame: .zero)
@@ -203,11 +204,18 @@ final class InfoPanelView: NSView {
                 self?.rebuildContent(resetScrollPosition: true)
             }
         }.store(in: &observation)
+        fontScale.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.laidOutContentWidth = -.greatestFiniteMagnitude
+                self?.rebuildContent(resetScrollPosition: false)
+            }
+        }.store(in: &observation)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     private var pixelScale: CGFloat { CGFloat(scaleState.factor) }
+    private var textScale: CGFloat { pixelScale * CGFloat(fontScale.factor) }
     private var contentRect: NSRect {
         let scale = pixelScale
         return NSRect(x: 11 * scale, y: 14 * scale,
@@ -237,7 +245,7 @@ final class InfoPanelView: NSView {
     private func makeLabel(_ text: String, alignment: NSTextAlignment = .left,
                            lineBreakMode: NSLineBreakMode = .byWordWrapping) -> NSTextField {
         let label = NSTextField(wrappingLabelWithString: text)
-        label.font = NSFont.monospacedSystemFont(ofSize: 8 * pixelScale, weight: .regular)
+        label.font = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
         label.textColor = skin.playlistColors().normalText
         label.alignment = alignment
         label.maximumNumberOfLines = 0
@@ -250,7 +258,7 @@ final class InfoPanelView: NSView {
 
     private func textHeight(_ text: String, width: CGFloat,
                             lineBreakMode: NSLineBreakMode = .byWordWrapping) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: 8 * pixelScale, weight: .regular)
+        let font = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
         let storage = NSTextStorage(string: text, attributes: [.font: font])
         let layoutManager = NSLayoutManager()
         let container = NSTextContainer(size: NSSize(width: max(1, width), height: .greatestFiniteMagnitude))
@@ -306,7 +314,7 @@ final class InfoPanelView: NSView {
 
         let gap = 8 * pixelScale
         let columnWidth = max(1, (usableWidth - gap) * 0.5)
-        let tableFont = NSFont.monospacedSystemFont(ofSize: 8 * pixelScale, weight: .regular)
+        let tableFont = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
         let tableColor = skin.playlistColors().normalText
         for field in model.content.fields {
             let key = InfoWrappedTextView(text: field.label, font: tableFont, color: tableColor, alignment: .right)
@@ -324,7 +332,7 @@ final class InfoPanelView: NSView {
         if let filename = model.content.url?.lastPathComponent, !filename.isEmpty {
             let filenameView = InfoWrappedTextView(
                 text: filename,
-                font: NSFont.monospacedSystemFont(ofSize: 8 * pixelScale, weight: .regular),
+                font: NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular),
                 color: skin.playlistColors().normalText,
                 alignment: .center
             )

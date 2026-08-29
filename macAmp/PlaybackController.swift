@@ -70,6 +70,9 @@ final class PlaybackController: NSObject, ObservableObject {
     // Do not serialize potentially stalled network opens: a newly selected
     // track must be able to supersede an earlier URL immediately.
     private let fileOpenQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.audio.open", qos: .userInitiated, attributes: .concurrent)
+    /// Technical display data is cosmetic: never let its AVFoundation query
+    /// compete with opening, buffering or rendering the selected track.
+    private let formatDetailsQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.audio.format", qos: .utility)
     private var fileOpenGeneration = 0
     /// A tiny PCM snapshot from the live audio graph. This avoids repeatedly
     /// seeking and decoding the source file just to draw the visualizer.
@@ -511,6 +514,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.smoothedBandEnergy = Array(repeating: -60, count: 10)
             self.hasAdaptiveAnalysisHistory = false
             self.start()
+            self.loadFormatDetails(for: url, file: file, generation: generation)
                 } catch {
                     self.sourceFile = nil
                     self.hasPlaybackError = true
@@ -542,6 +546,9 @@ final class PlaybackController: NSObject, ObservableObject {
             // opening queue alongside AVPlayerItem construction, never in the
             // ready-to-play callback on the main run loop.
             let audioTrack = asset.tracks(withMediaType: .audio).first
+            let bitrateKbps = audioTrack.map(\.estimatedDataRate).flatMap {
+                $0 > 0 ? Int(($0 / 1_000).rounded()) : nil
+            }
             let item = AVPlayerItem(asset: asset)
             DispatchQueue.main.async {
                 guard let self, self.fileOpenGeneration == generation,
@@ -552,6 +559,7 @@ final class PlaybackController: NSObject, ObservableObject {
                 let player = AVPlayer(playerItem: item)
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
+                self.bitrateKbps = bitrateKbps
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
                 self.updateLiveAnalysisTap()
@@ -574,6 +582,7 @@ final class PlaybackController: NSObject, ObservableObject {
                         self.duration = item.duration.seconds.isFinite ? max(0, item.duration.seconds) : 0
                         self.position = 0
                         self.title = url.deletingPathExtension().lastPathComponent.uppercased()
+                        self.loadStreamingBitrate(for: url, generation: generation)
                         self.installStreamingTimeObserver(on: player)
                         player.play()
                         self.isPlaying = true; self.isPaused = false
@@ -736,25 +745,64 @@ final class PlaybackController: NSObject, ObservableObject {
         }
     }
 
-    private func loadFormatDetails(for url: URL, file: AVAudioFile) {
-        sampleRateKHz = Int((file.processingFormat.sampleRate / 1_000).rounded())
-        channelCount = Int(file.processingFormat.channelCount)
-        let asset = AVURLAsset(url: url)
-        let bitrate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
-        if bitrate > 0 {
-            bitrateKbps = Int((bitrate / 1_000).rounded())
-            return
+    private func loadFormatDetails(for url: URL, file: AVAudioFile, generation: Int) {
+        let sampleRate = Int((file.processingFormat.sampleRate / 1_000).rounded())
+        let channels = Int(file.processingFormat.channelCount)
+        formatDetailsQueue.async { [weak self] in
+            let asset = AVURLAsset(url: url)
+            let estimatedBitrate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
+            let bitrate: Int?
+            if estimatedBitrate > 0 {
+                bitrate = Int((estimatedBitrate / 1_000).rounded())
+            } else {
+                // Some MP3s, especially VBR files without a usable Xing/VBR
+                // header, expose no estimated rate. This fallback remains off
+                // the main thread and runs only after playback has started.
+                let duration = Double(file.length) / file.processingFormat.sampleRate
+                let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+                if let fileSize, duration > 0 {
+                    bitrate = Int((Double(fileSize) * 8 / duration / 1_000).rounded())
+                } else {
+                    bitrate = nil
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, self.fileOpenGeneration == generation,
+                      self.sourceFile != nil, self.streamingOpenGeneration == nil else { return }
+                self.sampleRateKHz = sampleRate
+                self.channelCount = channels
+                self.bitrateKbps = bitrate
+            }
         }
+    }
 
-        // Some MP3s, especially VBR files without a usable Xing/VBR header,
-        // expose a zero `estimatedDataRate` through AVFoundation. File size
-        // divided by decoded duration is the correct average bitrate fallback.
-        let duration = Double(file.length) / file.processingFormat.sampleRate
-        let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
-        if let fileSize, duration > 0 {
-            bitrateKbps = Int((Double(fileSize) * 8 / duration / 1_000).rounded())
-        } else {
-            bitrateKbps = nil
+    /// Match the Info window's asset-loading sequence. An AVPlayerItem being
+    /// ready does not guarantee its shared asset has populated a network
+    /// track's estimated data rate yet.
+    private func loadStreamingBitrate(for url: URL, generation: Int) {
+        formatDetailsQueue.async { [weak self] in
+            let asset = AVURLAsset(url: url)
+            let semaphore = DispatchSemaphore(value: 0)
+            asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata", "duration"]) {
+                semaphore.signal()
+            }
+            guard semaphore.wait(timeout: .now() + 10) == .success else { return }
+            let rate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
+            let duration = asset.duration.seconds
+            let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            let bitrate: Int?
+            if rate > 0 {
+                bitrate = Int((rate / 1_000).rounded())
+            } else if let fileSize, duration.isFinite, duration > 0 {
+                bitrate = Int((Double(fileSize) * 8 / duration / 1_000).rounded())
+            } else {
+                bitrate = nil
+            }
+            DispatchQueue.main.async {
+                guard let self, self.fileOpenGeneration == generation,
+                      self.streamingOpenGeneration == generation else { return }
+                self.bitrateKbps = bitrate
+            }
         }
     }
 

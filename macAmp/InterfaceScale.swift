@@ -27,6 +27,29 @@ final class InterfaceScale: ObservableObject {
     }
 }
 
+/// Independent text scale for dense content views. It deliberately does not
+/// alter skin geometry, so users can enlarge playlist and Info text without
+/// changing the classic window layout.
+final class PlaylistFontScale: ObservableObject {
+    @Published var percent: Double {
+        didSet {
+            let snapped = min(200, max(100, (percent / 10).rounded() * 10))
+            if percent != snapped {
+                percent = snapped
+                return
+            }
+            UserDefaults.standard.set(percent, forKey: "playlistFontScalePercent")
+        }
+    }
+
+    var factor: Double { percent / 100 }
+
+    init() {
+        let stored = UserDefaults.standard.double(forKey: "playlistFontScalePercent")
+        percent = stored == 0 ? 100 : min(200, max(100, (stored / 10).rounded() * 10))
+    }
+}
+
 /// Persisted independently from playback so the same display mode is restored at launch.
 final class TimeDisplayPreference: ObservableObject {
     @Published var showsRemainingTime: Bool {

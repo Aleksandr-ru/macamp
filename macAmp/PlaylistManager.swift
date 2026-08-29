@@ -72,6 +72,11 @@ final class PlaylistModel: ObservableObject, Identifiable {
 /// serial by design: network folders cannot create an unbounded number of jobs.
 final class PlaylistManager: ObservableObject {
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
+    /// Bump when a stored display-title format needs one background refresh.
+    /// Existing snapshots contained title-only metadata, so they must be
+    /// revisited once to obtain the Artist component as well.
+    private static let displayMetadataFormatVersionKey = "MacAmp.playlist.displayMetadataFormatVersion"
+    private static let displayMetadataFormatVersion = 1
     @Published private(set) var playlists: [PlaylistModel] = []
     @Published private(set) var activePlaylistID: UUID?
     @Published private(set) var focusedPlaylistID: UUID?
@@ -136,8 +141,16 @@ final class PlaylistManager: ObservableObject {
         let directory = root.appendingPathComponent("MacAmp", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         persistenceURL = directory.appendingPathComponent("playlists.json")
-        restore()
+        let needsDisplayMetadataRefresh = UserDefaults.standard.integer(forKey: Self.displayMetadataFormatVersionKey) < Self.displayMetadataFormatVersion
+        restore(invalidateMetadata: needsDisplayMetadataRefresh)
         if playlists.isEmpty { playlists = [PlaylistModel(name: "Playlist")] }
+        if needsDisplayMetadataRefresh {
+            // Persist the invalidation before scheduling the low-priority
+            // reader, so a quit during the first refresh cannot leave old
+            // title-only rows permanently marked as complete.
+            writeSnapshot()
+            UserDefaults.standard.set(Self.displayMetadataFormatVersion, forKey: Self.displayMetadataFormatVersionKey)
+        }
         DispatchQueue.main.async { [weak self] in self?.playlists.filter(\.isVisible).forEach { self?.scheduleMetadata(for: $0) } }
     }
 
@@ -657,7 +670,7 @@ final class PlaylistManager: ObservableObject {
             return
         }
 
-        let result: (duration: TimeInterval?, title: String?, available: Bool) = autoreleasepool {
+        let result: (duration: TimeInterval?, artist: String?, title: String?, available: Bool) = autoreleasepool {
             let asset = AVURLAsset(url: work.entry.url)
             metadataAssetLock.lock()
             loadingMetadataAssets[work.entry.id] = asset
@@ -674,14 +687,15 @@ final class PlaylistManager: ObservableObject {
                     didLoad = true
                     break
                 }
-                if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, false) }
+                if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, nil, false) }
             }
-            guard didLoad else { return (nil, nil, false) }
+            guard didLoad else { return (nil, nil, nil, false) }
             var error: NSError?
-            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, false) }
+            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, false) }
             let duration = asset.duration.seconds
+            let artist = asset.commonMetadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
             let title = asset.commonMetadata.first(where: { $0.commonKey?.rawValue == "title" })?.stringValue
-            return (duration.isFinite && duration > 0 ? duration : nil, title, true)
+            return (duration.isFinite && duration > 0 ? duration : nil, artist, title, true)
         }
         let applyResult = DispatchWorkItem { [self] in
             metadataAssetLock.lock()
@@ -692,7 +706,18 @@ final class PlaylistManager: ObservableObject {
             guard !wasCancelled, !pausedPlaylistIDs.contains(work.playlist.id), !work.entry.metadataIsAvailable else { return }
             work.entry.duration = result.duration
             work.playlist.addToTotalDuration(result.duration)
-            if let title = result.title, !title.isEmpty { work.entry.title = title }
+            let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
+            case let (.some(artist), .some(title)):
+                work.entry.title = "\(artist) - \(title)"
+            case let (.some(artist), nil):
+                work.entry.title = artist
+            case let (nil, .some(title)):
+                work.entry.title = title
+            case (nil, nil):
+                break
+            }
             // A timeout/error is still a completed attempt; retrying it forever
             // would prevent lower-priority entries from ever being scanned.
             work.entry.metadataIsAvailable = true
@@ -764,13 +789,13 @@ final class PlaylistManager: ObservableObject {
             try? data.write(to: persistenceURL, options: .atomic)
         }
     }
-    private func restore() {
+    private func restore(invalidateMetadata: Bool = false) {
         guard let data = try? Data(contentsOf: persistenceURL), let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         recentPlaylistURLs = snapshot.recent
         activePlaylistID = snapshot.activePlaylistID
         focusedPlaylistID = snapshot.focusedPlaylistID
         playingEntryID = snapshot.playingEntryID
-        playlists = snapshot.playlists.map { p in let model = PlaylistModel(id: p.id, name: p.name, entries: p.entries.map { storedEntry in let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark) ?? storedEntry.url; return PlaylistEntry(id: storedEntry.id, url: resolvedURL, bookmarkData: storedEntry.bookmark, title: storedEntry.title, duration: storedEntry.duration, metadataIsAvailable: storedEntry.metadata) }, fileURL: p.fileURL); model.isVisible = p.visible; model.isWindowShaded = p.shaded; model.windowFrame = p.frame; model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }; model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }; model.selectedIDs = Set(p.selection ?? []); model.scrollPosition = p.scrollPosition ?? 0; model.lastPlayedEntryID = p.lastPlayedEntryID; return model }
+        playlists = snapshot.playlists.map { p in let model = PlaylistModel(id: p.id, name: p.name, entries: p.entries.map { storedEntry in let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark) ?? storedEntry.url; return PlaylistEntry(id: storedEntry.id, url: resolvedURL, bookmarkData: storedEntry.bookmark, title: storedEntry.title, duration: storedEntry.duration, metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata) }, fileURL: p.fileURL); model.isVisible = p.visible; model.isWindowShaded = p.shaded; model.windowFrame = p.frame; model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }; model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }; model.selectedIDs = Set(p.selection ?? []); model.scrollPosition = p.scrollPosition ?? 0; model.lastPlayedEntryID = p.lastPlayedEntryID; return model }
     }
 
     private func securityScopedBookmark(for url: URL) -> Data? {
