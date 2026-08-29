@@ -54,6 +54,10 @@ final class PlaybackController: NSObject, ObservableObject {
     /// AVPlayer can begin buffering such an URL without waiting for that index,
     /// so it is used as a time-bounded fallback for the initial start.
     private var streamingPlayer: AVPlayer?
+    /// The AVPlayer route has no audio-engine mixer to tap. Keep its selected
+    /// track so the same lightweight PCM tap can be installed only while the
+    /// visualizer (or AUTO EQ) actually needs it.
+    private var streamingAudioTrack: AVAssetTrack?
     private var streamingStatusObservation: NSKeyValueObservation?
     private var streamingTimeObserver: Any?
     private var streamingOpenGeneration: Int?
@@ -83,6 +87,7 @@ final class PlaybackController: NSObject, ObservableObject {
     private let spectrumQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.spectrum", qos: .utility)
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
+    private var isStreamingAnalysisTapInstalled = false
     private var isVisualizationEnabled = true
     private var needsWaveformSamples = false
     private var isInterfaceVisible = true
@@ -345,6 +350,10 @@ final class PlaybackController: NSObject, ObservableObject {
     /// PCM data. The mixer is downstream from the optional EQ node, so it also
     /// works when the EQ is removed from the playback route.
     private func updateLiveAnalysisTap() {
+        if streamingPlayer != nil {
+            updateStreamingAnalysisTap()
+            return
+        }
         let shouldInstall = sourceFile != nil && needsLiveAnalysis
         guard shouldInstall != isLiveAnalysisTapInstalled else { return }
         engine.mainMixerNode.removeTap(onBus: 0)
@@ -373,6 +382,24 @@ final class PlaybackController: NSObject, ObservableObject {
             self.analysisSamplesLock.unlock()
         }
         isLiveAnalysisTapInstalled = true
+    }
+
+    /// AVPlayer is used for network volumes so opening them cannot block the
+    /// UI. Its decoded audio bypasses `engine.mainMixerNode`, therefore the
+    /// visualizer must receive PCM through an `MTAudioProcessingTap` attached
+    /// to the player's item.  Do not keep that tap active while it has no
+    /// visual or adaptive-EQ consumer: its callback runs on the audio thread.
+    private func updateStreamingAnalysisTap() {
+        let shouldInstall = streamingPlayer != nil && streamingAudioTrack != nil && needsLiveAnalysis
+        guard shouldInstall != isStreamingAnalysisTapInstalled else { return }
+        guard let item = streamingPlayer?.currentItem else {
+            isStreamingAnalysisTapInstalled = false
+            return
+        }
+        item.audioMix = shouldInstall
+            ? streamingAudioTrack.flatMap { streamingAudioMix(for: $0) }
+            : nil
+        isStreamingAnalysisTapInstalled = shouldInstall && item.audioMix != nil
     }
 
     /// PlaylistManager owns selection; the audio engine only opens the chosen URL.
@@ -510,7 +537,12 @@ final class PlaybackController: NSObject, ObservableObject {
         streamingOpenGeneration = generation
         fileOpenQueue.async { [weak self] in
             let obtainedSecurityScope = url.startAccessingSecurityScopedResource()
-            let item = AVPlayerItem(url: url)
+            let asset = AVURLAsset(url: url)
+            // Track discovery can contact a file provider. It belongs on the
+            // opening queue alongside AVPlayerItem construction, never in the
+            // ready-to-play callback on the main run loop.
+            let audioTrack = asset.tracks(withMediaType: .audio).first
+            let item = AVPlayerItem(asset: asset)
             DispatchQueue.main.async {
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else {
@@ -519,8 +551,10 @@ final class PlaybackController: NSObject, ObservableObject {
                 }
                 let player = AVPlayer(playerItem: item)
                 self.streamingPlayer = player
+                self.streamingAudioTrack = audioTrack
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
+                self.updateLiveAnalysisTap()
                 self.streamingStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
                     DispatchQueue.main.async {
                         guard let self, self.fileOpenGeneration == generation,
@@ -570,6 +604,8 @@ final class PlaybackController: NSObject, ObservableObject {
         streamingTimeObserver = nil
         streamingStatusObservation?.invalidate(); streamingStatusObservation = nil
         streamingPlayer?.pause(); streamingPlayer = nil
+        streamingAudioTrack = nil
+        isStreamingAnalysisTapInstalled = false
         streamingOpenGeneration = nil
     }
 
