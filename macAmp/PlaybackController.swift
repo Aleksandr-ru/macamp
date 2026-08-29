@@ -3,6 +3,12 @@ import AppKit
 import Combine
 import Accelerate
 
+/// A title-bar drag has a much stricter latency budget than normal playback.
+/// Timers use this main-thread gate to defer cosmetic updates until mouse-up.
+enum InterfaceRenderGate {
+    static var isSuspended = false
+}
+
 /// High-frequency state is kept separate from transport state so spectrum
 /// frames do not invalidate the whole player interface.
 final class PlaybackVisualizationState: ObservableObject {
@@ -20,6 +26,13 @@ final class PlaybackController: NSObject, ObservableObject {
     @Published private(set) var bitrateKbps: Int?
     @Published private(set) var sampleRateKHz: Int?
     @Published private(set) var channelCount = 0
+    @Published private(set) var isVisualUpdatesSuspended = false
+    /// Mirrors Winamp's `draw_playicon(8)`: play glyph with the red
+    /// lost-synchronization lamp after a source/opening failure.
+    @Published private(set) var hasPlaybackError = false
+    /// Keeps UI seeking ahead of a stale timer tick while the player node
+    /// replaces its scheduled segment.
+    @Published private(set) var pendingSeekPosition: Double?
     let visualization = PlaybackVisualizationState()
     @Published var volume: Double = 0.8 { didSet { playerNode.volume = Float(volume) } }
     @Published var balance: Double = 0 { didSet { playerNode.pan = Float(min(1, max(-1, balance))) } }
@@ -132,11 +145,21 @@ final class PlaybackController: NSObject, ObservableObject {
         open(url)
     }
 
-    func togglePlayback() { sourceFile == nil && streamingPlayer == nil ? chooseTrack() : (isPlaying ? pause() : play()) }
+    func togglePlayback() { isPlaying ? pause() : play() }
 
     func play() {
-        if let streamingPlayer { streamingPlayer.play(); isPlaying = true; isPaused = false; return }
-        guard sourceFile != nil else { chooseTrack(); return }
+        if let streamingPlayer {
+            if streamingTimeObserver == nil { installStreamingTimeObserver(on: streamingPlayer) }
+            streamingPlayer.play(); isPlaying = true; isPaused = false
+            return
+        }
+        guard sourceFile != nil else {
+            // Stop releases a network AVPlayer completely so its decoder and
+            // buffering work cannot delay input. Re-open the retained URL on
+            // the next Play rather than showing a file picker.
+            if let scopedURL { open(scopedURL) } else { chooseTrack() }
+            return
+        }
         start(at: isPaused ? scheduledStartFrame : scheduledStartFrame + currentPlayedFrames())
     }
 
@@ -156,10 +179,16 @@ final class PlaybackController: NSObject, ObservableObject {
 
     func stop() {
         playbackGeneration += 1
-        if let streamingPlayer {
-            streamingPlayer.pause()
-            streamingPlayer.seek(to: .zero)
+        if streamingPlayer != nil {
+            // AVPlayer can retain a decoder and continue network buffering
+            // after `pause()`. That work was visible as 40 ms mouse-event
+            // queue delays after Play → Stop. Release it fully; `play()`
+            // retains the URL and opens it again when requested.
+            stopStreamingPlayback()
+            if hasSecurityScope { scopedURL?.stopAccessingSecurityScopedResource() }
+            hasSecurityScope = false
             position = 0
+            pendingSeekPosition = nil
             isPlaying = false
             isPaused = false
             visualization.spectrumLevels = Array(repeating: 0, count: 16)
@@ -169,8 +198,17 @@ final class PlaybackController: NSObject, ObservableObject {
         playerNode.stop()
         timer?.invalidate()
         timer = nil
+        // Unlike a cold launch, an AVAudioEngine keeps rendering silence after
+        // its player node stops. Its mixer tap then continues taking locks and
+        // copying PCM buffers, which is needless work and made window drags
+        // slower after a Play → Stop cycle. Keep the graph configured, but
+        // pause rendering and reinstall the tap only when playback resumes.
+        engine.mainMixerNode.removeTap(onBus: 0)
+        isLiveAnalysisTapInstalled = false
+        engine.pause()
         scheduledStartFrame = 0
         position = 0
+        pendingSeekPosition = nil
         isPlaying = false
         isPaused = false
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
@@ -198,17 +236,38 @@ final class PlaybackController: NSObject, ObservableObject {
         if isPlaying { startTimer() }
     }
 
+    /// Preserve playback while a connected player-window group is dragged,
+    /// but stop publishing animation frames that would otherwise contend with
+    /// AppKit's mouse-tracking loop.
+    func setVisualUpdatesSuspended(_ suspended: Bool) {
+        guard isVisualUpdatesSuspended != suspended else { return }
+        isVisualUpdatesSuspended = suspended
+        InterfaceRenderGate.isSuspended = suspended
+        guard !suspended else { return }
+        // Refresh the static position immediately; the next regular tick
+        // restores spectrum/waveform animation without a burst of work.
+        if let streamingPlayer {
+            position = max(0, streamingPlayer.currentTime().seconds)
+        } else if sourceFile != nil, isPlaying {
+            startTimer()
+        }
+    }
+
     func seek(to value: Double) {
         if let streamingPlayer {
             let target = min(max(0, value), duration)
+            pendingSeekPosition = target
             position = target
-            streamingPlayer.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+            streamingPlayer.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+                DispatchQueue.main.async { self?.pendingSeekPosition = nil }
+            }
             return
         }
         guard let sourceFile else { return }
         let target = min(max(0, value), duration)
         // Publish the target before scheduling the segment so the skin thumb does
         // not briefly fall back to its previous playback position on mouse-up.
+        pendingSeekPosition = target
         position = target
         start(at: AVAudioFramePosition(target * sourceFile.processingFormat.sampleRate))
     }
@@ -272,6 +331,7 @@ final class PlaybackController: NSObject, ObservableObject {
             scheduledStartFrame = resumeFrame
             if wasPlaying { start(at: resumeFrame) }
         } catch {
+            hasPlaybackError = true
             title = "AUDIO ENGINE ERROR"
         }
     }
@@ -316,7 +376,24 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     /// PlaylistManager owns selection; the audio engine only opens the chosen URL.
-    func open(_ url: URL) {
+    func open(_ requestedURL: URL, bookmarkData: Data? = nil) {
+        let url: URL
+        if let bookmarkData {
+            var isStale = false
+            guard let resolvedURL = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: .withSecurityScope,
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ) else {
+                hasPlaybackError = true
+                title = "SOURCE UNAVAILABLE"
+                return
+            }
+            url = resolvedURL
+        } else {
+            url = requestedURL
+        }
         fileOpenGeneration &+= 1
         let generation = fileOpenGeneration
         stopStreamingPlayback()
@@ -330,6 +407,7 @@ final class PlaybackController: NSObject, ObservableObject {
         if hasSecurityScope { scopedURL?.stopAccessingSecurityScopedResource() }
         scopedURL = nil; hasSecurityScope = false
         isPlaying = false; isPaused = false
+        hasPlaybackError = false
         title = "OPENING…"
         duration = 0
         bitrateKbps = nil
@@ -373,6 +451,7 @@ final class PlaybackController: NSObject, ObservableObject {
                     return
                 }
                 guard case let .success(file) = result else {
+                    self.hasPlaybackError = true
                     self.title = "UNSUPPORTED AUDIO FILE"
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
                     return
@@ -407,6 +486,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.start()
                 } catch {
                     self.sourceFile = nil
+                    self.hasPlaybackError = true
                     self.title = "UNSUPPORTED AUDIO FILE"
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
                 }
@@ -450,6 +530,7 @@ final class PlaybackController: NSObject, ObservableObject {
                                 self.stopStreamingPlayback()
                                 if self.hasSecurityScope { self.scopedURL?.stopAccessingSecurityScopedResource() }
                                 self.scopedURL = nil; self.hasSecurityScope = false
+                                self.hasPlaybackError = true
                                 self.title = "SOURCE UNAVAILABLE"
                             }
                             return
@@ -474,9 +555,13 @@ final class PlaybackController: NSObject, ObservableObject {
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             guard let self, self.streamingPlayer === player else { return }
+            guard !self.isVisualUpdatesSuspended else { return }
             self.position = max(0, time.seconds)
             self.isPlaying = player.rate > 0
             self.isPaused = !self.isPlaying
+            if self.isPlaying, self.isInterfaceVisible, self.isVisualizationEnabled {
+                self.updateSpectrum(at: time.seconds, includesWaveform: self.needsWaveformSamples)
+            }
         }
     }
 
@@ -486,6 +571,52 @@ final class PlaybackController: NSObject, ObservableObject {
         streamingStatusObservation?.invalidate(); streamingStatusObservation = nil
         streamingPlayer?.pause(); streamingPlayer = nil
         streamingOpenGeneration = nil
+    }
+
+    private func streamingAudioMix(for track: AVAssetTrack) -> AVAudioMix? {
+        var callbacks = MTAudioProcessingTapCallbacks(
+            version: kMTAudioProcessingTapCallbacksVersion_0,
+            clientInfo: Unmanaged.passUnretained(self).toOpaque(),
+            init: streamingTapInit,
+            finalize: nil,
+            prepare: nil,
+            unprepare: nil,
+            process: streamingTapProcess
+        )
+        var tap: MTAudioProcessingTap?
+        guard MTAudioProcessingTapCreate(
+            kCFAllocatorDefault,
+            &callbacks,
+            kMTAudioProcessingTapCreationFlag_PostEffects,
+            &tap
+        ) == noErr, let tap else { return nil }
+        let parameters = AVMutableAudioMixInputParameters(track: track)
+        parameters.audioTapProcessor = tap
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = [parameters]
+        return mix
+    }
+
+    /// Called on AVPlayer's real-time audio thread. It only retains the newest
+    /// small PCM slice; FFT work remains on the existing utility queue.
+    fileprivate func captureStreamingAnalysisSamples(
+        from bufferList: UnsafeMutablePointer<AudioBufferList>,
+        frameCount: Int
+    ) {
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+        guard frameCount > 0, let first = buffers.first, let data = first.mData else { return }
+        let sampleCount = min(frameCount, liveAnalysisSamples.count)
+        let samples = data.assumingMemoryBound(to: Float.self)
+        analysisSamplesLock.lock()
+        liveAnalysisSamples.withUnsafeMutableBufferPointer {
+            $0.baseAddress!.update(from: samples.advanced(by: frameCount - sampleCount), count: sampleCount)
+        }
+        liveAnalysisSampleCount = sampleCount
+        // AVPlayer's tap commonly supplies Float32 PCM. The FFT only needs a
+        // valid frequency scale; 44.1 kHz is the conservative fallback when
+        // a track does not expose its processing format to the tap.
+        liveAnalysisSampleRate = 44_100
+        analysisSamplesLock.unlock()
     }
 
     /// Network shares mounted by Finder normally live at /Volumes/<share>.
@@ -527,7 +658,12 @@ final class PlaybackController: NSObject, ObservableObject {
             playerNode.scheduleFile(file, at: nil, completionCallbackType: completion,
                                     completionHandler: finished)
         }
-        do { if !engine.isRunning { try engine.start() } } catch { title = "AUDIO ENGINE ERROR"; return }
+        updateLiveAnalysisTap()
+        do { if !engine.isRunning { try engine.start() } } catch {
+            hasPlaybackError = true
+            title = "AUDIO ENGINE ERROR"
+            return
+        }
         playerNode.play()
         isPlaying = true
         isPaused = false
@@ -545,6 +681,7 @@ final class PlaybackController: NSObject, ObservableObject {
         let interval = isInterfaceVisible ? equalizer.adaptiveConfiguration.analysisInterval : 1.0
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self, let file = self.sourceFile else { return }
+            guard !self.isVisualUpdatesSuspended else { return }
             let rawPosition = Double(self.scheduledStartFrame + self.currentPlayedFrames()) / file.processingFormat.sampleRate
             let currentPosition = self.duration > 0 ? min(self.duration, rawPosition) : rawPosition
             // The time digits and progress thumb cannot display sub-quarter-
@@ -552,6 +689,7 @@ final class PlaybackController: NSObject, ObservableObject {
             // the entire SwiftUI hierarchy redraw needlessly.
             if Date().timeIntervalSince(self.lastPublishedPosition) >= self.positionPublishInterval || currentPosition >= self.duration {
                 self.position = currentPosition
+                self.pendingSeekPosition = nil
                 self.lastPublishedPosition = Date()
             }
             let nodeIsPlaying = self.playerNode.isPlaying
@@ -618,6 +756,7 @@ final class PlaybackController: NSObject, ObservableObject {
                 ? (0..<76).map { CGFloat(min(1, max(-1, latestSamples[min(self.visualFFTSize - 1, $0 * (self.visualFFTSize - 1) / 75)]))) }
                 : []
             DispatchQueue.main.async {
+                guard !self.isVisualUpdatesSuspended else { return }
                 if self.visualization.spectrumLevels != levels { self.visualization.spectrumLevels = levels }
                 if includesWaveform { self.visualization.waveformSamples = waveform }
                 if needsAdaptiveAnalysis { self.updateAdaptiveEqualizer(with: decibels) }
@@ -725,4 +864,34 @@ final class PlaybackController: NSObject, ObservableObject {
         let preamp = estimatedPeakGain > configuration.preampHeadroom ? configuration.preampHeadroom - estimatedPeakGain : 0
         equalizer.updateAdaptive(targetBands: target, targetPreamp: preamp)
     }
+}
+
+private func streamingTapInit(
+    _ tap: MTAudioProcessingTap,
+    _ clientInfo: UnsafeMutableRawPointer?,
+    _ tapStorageOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>
+) {
+    tapStorageOut.pointee = clientInfo
+}
+
+private func streamingTapProcess(
+    _ tap: MTAudioProcessingTap,
+    _ numberFrames: CMItemCount,
+    _ flags: MTAudioProcessingTapFlags,
+    _ bufferList: UnsafeMutablePointer<AudioBufferList>,
+    _ numberFramesOut: UnsafeMutablePointer<CMItemCount>,
+    _ flagsOut: UnsafeMutablePointer<MTAudioProcessingTapFlags>
+) {
+    var sourceFlags: MTAudioProcessingTapFlags = 0
+    var sourceFrames: CMItemCount = 0
+    var sourceTimeRange = CMTimeRange()
+    let status = MTAudioProcessingTapGetSourceAudio(
+        tap, numberFrames, bufferList, &sourceFlags, &sourceTimeRange, &sourceFrames
+    )
+    numberFramesOut.pointee = status == noErr ? sourceFrames : 0
+    flagsOut.pointee = sourceFlags
+    guard status == noErr else { return }
+    let storage = MTAudioProcessingTapGetStorage(tap)
+    let controller = Unmanaged<PlaybackController>.fromOpaque(storage).takeUnretainedValue()
+    controller.captureStreamingAnalysisSamples(from: bufferList, frameCount: Int(sourceFrames))
 }

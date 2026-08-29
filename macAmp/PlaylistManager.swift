@@ -7,13 +7,17 @@ import Foundation
 /// render this state; hiding a window never destroys a playlist or its work.
 final class PlaylistEntry: ObservableObject, Identifiable {
     let id: UUID
-    let url: URL
+    var url: URL
+    /// A path from NSOpenPanel is only authorised for this process. Store its
+    /// sandbox bookmark alongside the playlist entry for later launches.
+    var bookmarkData: Data?
     @Published var title: String
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
 
-    init(id: UUID = UUID(), url: URL, title: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
+    init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
         self.id = id; self.url = url; self.title = title ?? url.deletingPathExtension().lastPathComponent
+        self.bookmarkData = bookmarkData
         self.duration = duration; self.metadataIsAvailable = metadataIsAvailable
     }
 }
@@ -306,7 +310,8 @@ final class PlaylistManager: ObservableObject {
     func addFiles(_ urls: [URL], to playlist: PlaylistModel) {
         let audio = urls.filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
         guard !audio.isEmpty else { return }
-        let entries = audio.map { PlaylistEntry(url: $0) }
+        let entries = audio.map { PlaylistEntry(url: $0, bookmarkData: securityScopedBookmark(for: $0)) }
+        propagateBookmarks(from: entries)
         playlist.entries.append(contentsOf: entries)
         playlist.appendToTotalDuration(entries)
         playlist.isDirty = true; playlist.scannerState = .adding(playlist.entries.count); save(); finishEntryLoading(playlist)
@@ -334,6 +339,12 @@ final class PlaylistManager: ObservableObject {
     func cancelFolderScans() { cancelledFolderPlaylistIDs.formUnion(playlists.map(\.id)) }
 
     func play(_ entry: PlaylistEntry, in playlist: PlaylistModel, revealIfNeeded: Bool = true) {
+        // Migrate entries from snapshots written before persistent file access
+        // was retained. If the current process can already read this URL, the
+        // resulting bookmark makes the next launch independent of that grant.
+        if entry.bookmarkData == nil {
+            entry.bookmarkData = securityScopedBookmark(for: entry.url)
+        }
         activePlaylistID = playlist.id; focusedPlaylistID = playlist.id
         playlist.lastPlayedEntryID = entry.id; playingEntryID = entry.id
         if revealIfNeeded { playbackRevealRevision &+= 1 }
@@ -531,7 +542,8 @@ final class PlaylistManager: ObservableObject {
     private func appendBatch(_ batch: [URL], to playlist: PlaylistModel) {
         guard !batch.isEmpty else { return }
         DispatchQueue.main.sync {
-            let entries = batch.map { PlaylistEntry(url: $0) }
+            let entries = batch.map { PlaylistEntry(url: $0, bookmarkData: self.securityScopedBookmark(for: $0)) }
+            self.propagateBookmarks(from: entries)
             playlist.entries.append(contentsOf: entries)
             playlist.appendToTotalDuration(entries)
             playlist.isDirty = true; playlist.scannerState = .scanningFolder(playlist.entries.count)
@@ -726,7 +738,7 @@ final class PlaylistManager: ObservableObject {
 
     private struct Snapshot: Codable { var recent: [URL]; var playlists: [StoredPlaylist]; var activePlaylistID: UUID?; var focusedPlaylistID: UUID?; var playingEntryID: UUID? }
     private struct StoredPlaylist: Codable { var id: UUID; var name: String; var fileURL: URL?; var visible: Bool; var shaded: Bool; var frame: CGRect?; var unshadedWidth: Double?; var unshadedHeight: Double?; var entries: [StoredEntry]; var selection: [UUID]?; var scrollPosition: Int?; var lastPlayedEntryID: UUID? }
-    private struct StoredEntry: Codable { var id: UUID; var url: URL; var title: String; var duration: TimeInterval?; var metadata: Bool }
+    private struct StoredEntry: Codable { var id: UUID; var url: URL; var bookmark: Data?; var title: String; var duration: TimeInterval?; var metadata: Bool }
     /// Most calls happen in bursts (folder scans, metadata updates, scrolling).
     /// Writing a full JSON snapshot for every one of them creates O(n²) disk
     /// work for a playlist with n tracks.  Coalesce those mutations instead.
@@ -747,8 +759,10 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func writeSnapshot() {
-        let stored = playlists.map { p in StoredPlaylist(id: p.id, name: p.name, fileURL: p.fileURL, visible: p.isVisible, shaded: p.isWindowShaded, frame: p.windowFrame, unshadedWidth: p.unshadedWindowWidth.map(Double.init), unshadedHeight: p.unshadedWindowHeight.map(Double.init), entries: p.entries.map { StoredEntry(id: $0.id, url: $0.url, title: $0.title, duration: $0.duration, metadata: $0.metadataIsAvailable) }, selection: Array(p.selectedIDs), scrollPosition: p.scrollPosition, lastPlayedEntryID: p.lastPlayedEntryID) }
-        if let data = try? JSONEncoder().encode(Snapshot(recent: recentPlaylistURLs, playlists: stored, activePlaylistID: activePlaylistID, focusedPlaylistID: focusedPlaylistID, playingEntryID: playingEntryID)) { try? data.write(to: persistenceURL, options: .atomic) }
+        let stored = playlists.map { p in StoredPlaylist(id: p.id, name: p.name, fileURL: p.fileURL, visible: p.isVisible, shaded: p.isWindowShaded, frame: p.windowFrame, unshadedWidth: p.unshadedWindowWidth.map(Double.init), unshadedHeight: p.unshadedWindowHeight.map(Double.init), entries: p.entries.map { StoredEntry(id: $0.id, url: $0.url, bookmark: $0.bookmarkData, title: $0.title, duration: $0.duration, metadata: $0.metadataIsAvailable) }, selection: Array(p.selectedIDs), scrollPosition: p.scrollPosition, lastPlayedEntryID: p.lastPlayedEntryID) }
+        if let data = try? JSONEncoder().encode(Snapshot(recent: recentPlaylistURLs, playlists: stored, activePlaylistID: activePlaylistID, focusedPlaylistID: focusedPlaylistID, playingEntryID: playingEntryID)) {
+            try? data.write(to: persistenceURL, options: .atomic)
+        }
     }
     private func restore() {
         guard let data = try? Data(contentsOf: persistenceURL), let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
@@ -756,6 +770,46 @@ final class PlaylistManager: ObservableObject {
         activePlaylistID = snapshot.activePlaylistID
         focusedPlaylistID = snapshot.focusedPlaylistID
         playingEntryID = snapshot.playingEntryID
-        playlists = snapshot.playlists.map { p in let model = PlaylistModel(id: p.id, name: p.name, entries: p.entries.map { PlaylistEntry(id: $0.id, url: $0.url, title: $0.title, duration: $0.duration, metadataIsAvailable: $0.metadata) }, fileURL: p.fileURL); model.isVisible = p.visible; model.isWindowShaded = p.shaded; model.windowFrame = p.frame; model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }; model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }; model.selectedIDs = Set(p.selection ?? []); model.scrollPosition = p.scrollPosition ?? 0; model.lastPlayedEntryID = p.lastPlayedEntryID; return model }
+        playlists = snapshot.playlists.map { p in let model = PlaylistModel(id: p.id, name: p.name, entries: p.entries.map { storedEntry in let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark) ?? storedEntry.url; return PlaylistEntry(id: storedEntry.id, url: resolvedURL, bookmarkData: storedEntry.bookmark, title: storedEntry.title, duration: storedEntry.duration, metadataIsAvailable: storedEntry.metadata) }, fileURL: p.fileURL); model.isVisible = p.visible; model.isWindowShaded = p.shaded; model.windowFrame = p.frame; model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }; model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }; model.selectedIDs = Set(p.selection ?? []); model.scrollPosition = p.scrollPosition ?? 0; model.lastPlayedEntryID = p.lastPlayedEntryID; return model }
+    }
+
+    private func securityScopedBookmark(for url: URL) -> Data? {
+        let beganScope = url.startAccessingSecurityScopedResource()
+        defer { if beganScope { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let bookmark = try url.bookmarkData(options: .withSecurityScope,
+                                                includingResourceValuesForKeys: nil,
+                                                relativeTo: nil)
+            return bookmark
+        } catch {
+            return nil
+        }
+    }
+
+    private func resolvedBookmarkURL(_ data: Data?) -> URL? {
+        guard let data else { return nil }
+        var isStale = false
+        return try? URL(resolvingBookmarkData: data,
+                        options: .withSecurityScope,
+                        relativeTo: nil,
+                        bookmarkDataIsStale: &isStale)
+    }
+
+    /// Older snapshots contain paths only. When the user subsequently adds a
+    /// file through the system picker, reuse its newly granted bookmark for
+    /// every matching existing row instead of requiring a rebuilt playlist.
+    private func propagateBookmarks(from entries: [PlaylistEntry]) {
+        var bookmarksByPath: [String: Data] = [:]
+        for entry in entries {
+            if let bookmark = entry.bookmarkData {
+                bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path] = bookmark
+            }
+        }
+        guard !bookmarksByPath.isEmpty else { return }
+        for playlist in playlists {
+            for entry in playlist.entries where entry.bookmarkData == nil {
+                entry.bookmarkData = bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path]
+            }
+        }
     }
 }

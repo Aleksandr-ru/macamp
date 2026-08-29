@@ -34,10 +34,6 @@ struct ContentView: View {
     @State private var pressedClutterbarButton: Int?
     @State private var pressedWindowShadeControl: Int?
     @State private var visualizationMode: VisualizationMode = .spectrum
-    @State private var tickerOffset: CGFloat = 0
-    @State private var tickerPauseTicks = 10
-    @State private var tickerSourceText = ""
-    @State private var tickerTimer: Timer?
 
     var body: some View {
         Group {
@@ -277,102 +273,17 @@ private struct SkinTitleBarButtonStyle: ButtonStyle {
 
 extension ContentView {
     private var ticker: some View {
-        let colors = skin.playlistColors()
-        return ZStack(alignment: .leading) {
-            Text(tickerDisplayText)
-                .lineLimit(1)
-                .font(.system(size: 7, weight: .regular, design: .monospaced))
-                .foregroundColor(skinTextColor(colors.normalText))
-                .fixedSize(horizontal: true, vertical: false)
-                .offset(y: -1)
-                .offset(x: -tickerOffset)
-        }
-        .frame(width: 154, height: 10, alignment: .topLeading)
-        .background(Color.black.opacity(0.86))
-        .clipped()
-        .position(x: 188, y: 32)
-        .onAppear {
-            resetTicker(for: statusText)
-            startTickerTimer()
-        }
-        .onDisappear {
-            tickerTimer?.invalidate()
-            tickerTimer = nil
-        }
-        .onChange(of: statusText) { resetTicker(for: $0) }
-    }
-
-    private var statusText: String {
-        if isAdjustingVolume {
-            return "VOLUME: \(Int((playback.volume * 100).rounded()))%"
-        }
-        if isAdjustingBalance {
-            let magnitude = Int((abs(playback.balance) * 100).rounded())
-            if magnitude == 0 { return "BALANCE: CENTER" }
-            return "BALANCE: \(playback.balance < 0 ? "L" : "R") \(magnitude)%"
-        }
-        return playback.title
-    }
-
-    private var tickerDisplayText: String {
-        tickerShouldScroll ? "\(statusText)  ***  \(statusText)" : statusText
-    }
-
-    private var tickerShouldScroll: Bool {
-        !isAdjustingVolume && !isAdjustingBalance && tickerTextWidth(statusText) > 154
-    }
-
-    private func tickerTextWidth(_ text: String) -> CGFloat {
-        (text as NSString).size(withAttributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 7, weight: .regular)
-        ]).width
-    }
-
-    private func skinTextColor(_ color: NSColor) -> Color {
-        let rgb = color.usingColorSpace(.deviceRGB) ?? color
-        return Color(
-            red: Double(rgb.redComponent),
-            green: Double(rgb.greenComponent),
-            blue: Double(rgb.blueComponent),
-            opacity: Double(rgb.alphaComponent)
+        TickerDisplay(
+            skin: skin,
+            playback: playback,
+            isAdjustingVolume: isAdjustingVolume,
+            isAdjustingBalance: isAdjustingBalance
         )
-    }
-
-    private func resetTicker(for text: String) {
-        tickerSourceText = text
-        tickerOffset = 0
-        tickerPauseTicks = 10
-    }
-
-    private func advanceTicker() {
-        let text = statusText
-        if tickerSourceText != text { resetTicker(for: text) }
-        guard tickerShouldScroll else { return }
-        if tickerPauseTicks > 0 {
-            tickerPauseTicks -= 1
-            return
-        }
-        // Winamp advances the ticker by five skin pixels every 200 ms.
-        tickerOffset += 5
-        let cycleWidth = tickerTextWidth(text) + tickerTextWidth("  ***  ")
-        if tickerOffset >= cycleWidth {
-            tickerOffset = 0
-            tickerPauseTicks = 10
-        }
-    }
-
-    private func startTickerTimer() {
-        tickerTimer?.invalidate()
-        tickerTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
-            advanceTicker()
-        }
-        if let tickerTimer {
-            RunLoop.main.add(tickerTimer, forMode: .common)
-        }
+        .position(x: 188, y: 32)
     }
 
     private var progressBar: some View {
-        let displayedPosition = seekPreviewPosition ?? playback.position
+        let displayedPosition = seekPreviewPosition ?? playback.pendingSeekPosition ?? playback.position
         let fraction = playback.duration > 0
             ? min(1, max(0, displayedPosition / playback.duration))
             : 0
@@ -401,7 +312,11 @@ extension ContentView {
                 }
                 .onEnded { value in
                     previewSeek(toProgressBarLocation: value.location.x)
-                    if let preview = seekPreviewPosition { AppDelegate.shared?.seekPlayback(to: preview) }
+                    if let preview = seekPreviewPosition {
+                        AppDelegate.shared?.seekPlayback(to: preview)
+                    }
+                    // The playback controller retains this target until it
+                    // receives a frame from the newly scheduled segment.
                     seekPreviewPosition = nil
                     isSeeking = false
                 }
@@ -664,9 +579,11 @@ extension ContentView {
     }
 
     private var playbackIndicator: some View {
-        let indicator: WinampSkinStore.PlaybackIndicator = playback.isPlaying
+        let indicator: WinampSkinStore.PlaybackIndicator = playback.hasPlaybackError
+            ? .lostSync
+            : (playback.isPlaying
             ? .play
-            : (playback.isPaused ? .pause : .stop)
+            : (playback.isPaused ? .pause : .stop))
         return Group {
             if let image = skin.playbackIndicatorImage(indicator) {
                 Image(nsImage: image)
@@ -813,6 +730,113 @@ struct ContentView_Previews: PreviewProvider {
             playlistState: PlaylistWindowState(),
             infoState: InfoWindowState()
         )
+    }
+}
+
+/// Keeps the periodically-updated marquee state out of the main player view.
+/// This prevents a long track title from invalidating the entire skin every 200 ms.
+private struct TickerDisplay: View {
+    @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var playback: PlaybackController
+    let isAdjustingVolume: Bool
+    let isAdjustingBalance: Bool
+    @State private var tickerOffset: CGFloat = 0
+    @State private var tickerPauseTicks = 10
+    @State private var tickerSourceText = ""
+    @State private var tickerTimer: Timer?
+
+    var body: some View {
+        let colors = skin.playlistColors()
+        ZStack(alignment: .leading) {
+            Text(tickerDisplayText)
+                .lineLimit(1)
+                .font(.system(size: 7, weight: .regular, design: .monospaced))
+                .foregroundColor(skinTextColor(colors.normalText))
+                .fixedSize(horizontal: true, vertical: false)
+                .offset(y: -1)
+                .offset(x: -tickerOffset)
+        }
+        .frame(width: 154, height: 10, alignment: .topLeading)
+        .background(Color.black.opacity(0.86))
+        .clipped()
+        .onAppear {
+            resetTicker(for: statusText)
+            startTickerTimer()
+        }
+        .onDisappear {
+            tickerTimer?.invalidate()
+            tickerTimer = nil
+        }
+        .onChange(of: statusText) { resetTicker(for: $0) }
+    }
+
+    private var statusText: String {
+        if isAdjustingVolume {
+            return "VOLUME: \(Int((playback.volume * 100).rounded()))%"
+        }
+        if isAdjustingBalance {
+            let magnitude = Int((abs(playback.balance) * 100).rounded())
+            if magnitude == 0 { return "BALANCE: CENTER" }
+            return "BALANCE: \(playback.balance < 0 ? "L" : "R") \(magnitude)%"
+        }
+        return playback.title
+    }
+
+    private var tickerDisplayText: String {
+        tickerShouldScroll ? "\(statusText)  ***  \(statusText)" : statusText
+    }
+
+    private var tickerShouldScroll: Bool {
+        !isAdjustingVolume && !isAdjustingBalance && tickerTextWidth(statusText) > 154
+    }
+
+    private func tickerTextWidth(_ text: String) -> CGFloat {
+        (text as NSString).size(withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 7, weight: .regular)
+        ]).width
+    }
+
+    private func skinTextColor(_ color: NSColor) -> Color {
+        let rgb = color.usingColorSpace(.deviceRGB) ?? color
+        return Color(
+            red: Double(rgb.redComponent),
+            green: Double(rgb.greenComponent),
+            blue: Double(rgb.blueComponent),
+            opacity: Double(rgb.alphaComponent)
+        )
+    }
+
+    private func resetTicker(for text: String) {
+        tickerSourceText = text
+        tickerOffset = 0
+        tickerPauseTicks = 10
+    }
+
+    private func advanceTicker() {
+        guard !playback.isVisualUpdatesSuspended else { return }
+        let text = statusText
+        if tickerSourceText != text { resetTicker(for: text) }
+        guard tickerShouldScroll else { return }
+        if tickerPauseTicks > 0 {
+            tickerPauseTicks -= 1
+            return
+        }
+        tickerOffset += 5
+        let cycleWidth = tickerTextWidth(text) + tickerTextWidth("  ***  ")
+        if tickerOffset >= cycleWidth {
+            tickerOffset = 0
+            tickerPauseTicks = 10
+        }
+    }
+
+    private func startTickerTimer() {
+        tickerTimer?.invalidate()
+        tickerTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+            advanceTicker()
+        }
+        if let tickerTimer {
+            RunLoop.main.add(tickerTimer, forMode: .common)
+        }
     }
 }
 
@@ -1003,21 +1027,19 @@ private final class SkinWindowDragNSView: NSView {
         }
         guard let window else { return }
         AppDelegate.shared?.beginMainWindowDrag()
+        defer { AppDelegate.shared?.mainWindowDragEnded() }
         let origin = window.frame.origin
         let start = NSEvent.mouseLocation
         while let nextEvent = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             if nextEvent.type == .leftMouseUp { break }
             let location = NSEvent.mouseLocation
-            window.setFrameOrigin(NSPoint(
-                x: origin.x + location.x - start.x,
-                y: origin.y + location.y - start.y
-            ))
-            // Keep the already-attached group in lockstep with the main
-            // window.  Magnetism below may make a small final correction, but
-            // must never be the first moment the EQ/editor follows.
+            let frameOrigin = NSPoint(x: origin.x + location.x - start.x,
+                                      y: origin.y + location.y - start.y)
+            AppDelegate.shared?.beginMainDragFrame()
+            window.setFrame(NSRect(origin: frameOrigin, size: window.frame.size), display: false)
+            // Keep the group in lockstep. Snapping is intentionally deferred
+            // to mouse-up, so no neighbour/screen search delays drag events.
             AppDelegate.shared?.moveAttachedWindowsWithMain()
-            AppDelegate.shared?.magnetWindowWhileDragging(window)
         }
-        AppDelegate.shared?.mainWindowDragEnded()
     }
 }

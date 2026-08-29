@@ -250,6 +250,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mainDragGroupWindows: [NSWindow] = []
     private var mainDragWindowOffsets: [ObjectIdentifier: NSPoint] = [:]
     private var mainDragLastOrigin: NSPoint?
+    private var mainDragShadowStates: [ObjectIdentifier: Bool] = [:]
+    /// Suppresses persistence and legacy docking observers while a title-bar
+    /// gesture moves a connected window group every drag tick.
+    private var isMovingMainDragGroup = false
     private var scaleObserver: Any?
     private var focusObservers: [Any] = []
     private var isExplicitTerminationRequested = false
@@ -363,9 +367,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
                                                object: window,
                                                queue: .main) { [weak self] _ in
-            self?.moveDockedEqualizer()
-            self?.moveDockedPlaylist()
-            self?.schedulePersistentStateSave()
+            // The title-bar drag already moves its complete connected group
+            // from fixed offsets. Running the old one-window docking paths in
+            // addition to that makes every mouse event reposition panels
+            // repeatedly and causes visible lag.
+            guard let self, self.mainDragLastOrigin == nil else { return }
+            self.moveDockedEqualizer()
+            self.moveDockedPlaylist()
+            self.schedulePersistentStateSave()
         }
         connectFileMenu()
         connectPreferencesMenu()
@@ -695,7 +704,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard isExplicitTerminationRequested else {
-            NSLog("MacAmp: cancelled an unexpected termination request")
             return .terminateCancel
         }
         return .terminateNow
@@ -999,11 +1007,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel) {
         guard let entry else {
             if playback.isRepeatEnabled, let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID }) {
-                playlistManager.play(current, in: playlist); playback.open(current.url); infoModel.showForPlayback(current.url)
+                playlistManager.play(current, in: playlist); playback.open(current.url, bookmarkData: current.bookmarkData); infoModel.showForPlayback(current.url)
             }
             return
         }
-        playlistManager.play(entry, in: playlist); playback.open(entry.url); infoModel.showForPlayback(entry.url)
+        playlistManager.play(entry, in: playlist); playback.open(entry.url, bookmarkData: entry.bookmarkData); infoModel.showForPlayback(entry.url)
     }
 
     /// Playlist rows call this route as well, so their double-click has the
@@ -1011,7 +1019,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func playPlaylistEntryFromSelection(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
         resetInfoTarget()
         playlistManager.play(entry, in: playlist, revealIfNeeded: false)
-        playback.open(entry.url)
+        playback.open(entry.url, bookmarkData: entry.bookmarkData)
         infoModel.showForPlayback(entry.url)
     }
 
@@ -1264,7 +1272,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.setFrameOrigin(NSPoint(x: window.frame.maxX, y: window.frame.maxY - panel.frame.height))
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: panel, queue: .main) { [weak self] _ in self?.infoFocus.isKey = true }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in self?.infoFocus.isKey = false }
-        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in self?.schedulePersistentStateSave() }
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
+            guard let self, !self.isMovingMainDragGroup else { return }
+            self.schedulePersistentStateSave()
+        }
         infoWindow = panel
         return panel
     }
@@ -1296,6 +1307,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let existing = playlistWindows[model.id] {
             playlistManager.setVisible(true, for: model)
             lastActivePlaylistWindow = existing
+            playlistState.isVisible = true
             existing.makeKeyAndOrderFront(nil); return
         }
         let scale = CGFloat(interfaceScale.factor)
@@ -1309,7 +1321,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.setFrameOrigin(origin)
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self, weak panel, weak model] _ in
             guard let self, let panel, let model else { return }
-            model.windowFrame = panel.frame; self.playlistManager.save()
+            model.windowFrame = panel.frame
+            // A main-window drag may update several connected editors dozens
+            // of times per second. Their final positions are saved once when
+            // that gesture ends.
+            guard !self.isMovingMainDragGroup else { return }
+            self.playlistManager.save()
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: panel, queue: .main) { [weak self, weak model] _ in
             context.focus.isKey = true
@@ -1375,7 +1392,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: playlist, queue: .main) { [weak self] _ in self?.playlistFocus.isKey = false }
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: playlist, queue: .main) { [weak self] _ in
-            guard let self, !self.isRepositioningPlaylist else { return }
+            guard let self, !self.isRepositioningPlaylist, !self.isMovingMainDragGroup else { return }
             self.schedulePersistentStateSave()
         }
         playlistWindow = playlist
@@ -1594,7 +1611,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
                                                object: equalizer,
                                                queue: .main) { [weak self] _ in
-            guard let self, !self.isRepositioningEqualizer else { return }
+            guard let self, !self.isRepositioningEqualizer, !self.isMovingMainDragGroup else { return }
             self.schedulePersistentStateSave()
         }
         equalizerWindow = equalizer
@@ -1611,6 +1628,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func mainWindowDragEnded() {
+        defer {
+            isMovingMainDragGroup = false
+            playback.setVisualUpdatesSuspended(false)
+        }
         let group = Set(mainDragGroupWindows.map(ObjectIdentifier.init))
         magnet(window, against: ([equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values)
             .filter { !group.contains(ObjectIdentifier($0)) })
@@ -1621,6 +1642,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainDragGroupWindows.removeAll()
         mainDragWindowOffsets.removeAll()
         mainDragLastOrigin = nil
+        restoreMainDragShadows()
+        playlistManager.save()
         schedulePersistentStateSave()
     }
 
@@ -1628,6 +1651,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// before the first movement, since after the player has moved even one
     /// pixel its neighbours no longer touch it.
     func beginMainWindowDrag() {
+        playback.setVisualUpdatesSuspended(true)
+        isMovingMainDragGroup = true
         // EQ has a persistent docking relationship with the player.  Do not
         // infer it solely from frame contact: after interface scaling AppKit
         // can leave a sub-pixel gap even though the windows are still docked.
@@ -1654,6 +1679,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             (ObjectIdentifier($0), NSPoint(x: $0.frame.minX - window.frame.minX, y: $0.frame.minY - window.frame.minY))
         })
         mainDragLastOrigin = window.frame.origin
+        // A group of transparent borderless windows makes the compositor
+        // recalculate several blurred shadows for every pixel of movement.
+        // The skins themselves remain visible; restore the shadows at rest.
+        let draggedWindows = [window].compactMap { $0 } + mainDragGroupWindows
+        mainDragShadowStates = Dictionary(uniqueKeysWithValues: draggedWindows.map {
+            (ObjectIdentifier($0), $0.hasShadow)
+        })
+        draggedWindows.forEach { $0.hasShadow = false }
+    }
+
+    /// Start one window-server transaction for the main panel and all of its
+    /// attached panels. Called immediately before a drag-frame is positioned.
+    func beginMainDragFrame() {
+        window.disableScreenUpdatesUntilFlush()
+    }
+
+    private func restoreMainDragShadows() {
+        let draggedWindows = [window].compactMap { $0 } + mainDragGroupWindows
+        for panel in draggedWindows {
+            if let hadShadow = mainDragShadowStates[ObjectIdentifier(panel)] {
+                panel.hasShadow = hadShadow
+            }
+            panel.displayIfNeeded()
+        }
+        mainDragShadowStates.removeAll()
     }
 
     /// Moves every playlist/EQ attached to the player by the same delta.  The
@@ -1666,7 +1716,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // be observed after the main frame has already been redrawn.
         for panel in mainDragGroupWindows {
             guard let offset = mainDragWindowOffsets[ObjectIdentifier(panel)] else { continue }
-            panel.setFrameOrigin(NSPoint(x: window.frame.minX + offset.x, y: window.frame.minY + offset.y))
+            let origin = NSPoint(x: window.frame.minX + offset.x, y: window.frame.minY + offset.y)
+            if panel.frame.origin != origin {
+                panel.setFrame(NSRect(origin: origin, size: panel.frame.size), display: false)
+            }
             if let id = playlistWindows.first(where: { $0.value === panel })?.key,
                let model = playlistManager.playlist(id: id) {
                 model.windowFrame = panel.frame
@@ -1678,7 +1731,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func moveMainDragGroup(by delta: NSPoint) {
         guard delta != .zero else { return }
         for panel in mainDragGroupWindows {
-            panel.setFrameOrigin(NSPoint(x: panel.frame.minX + delta.x, y: panel.frame.minY + delta.y))
+            panel.setFrame(NSRect(x: panel.frame.minX + delta.x, y: panel.frame.minY + delta.y,
+                                  width: panel.frame.width, height: panel.frame.height), display: false)
             if let id = playlistWindows.first(where: { $0.value === panel })?.key,
                let model = playlistManager.playlist(id: id) {
                 model.windowFrame = panel.frame
@@ -1747,7 +1801,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if abs(frame.minY - screen.minY) <= threshold { frame.origin.y = screen.minY }
             if abs(frame.maxY - screen.maxY) <= threshold { frame.origin.y = screen.maxY - frame.height }
         }
-        movingWindow.setFrameOrigin(frame.origin)
+        if movingWindow.frame.origin != frame.origin {
+            movingWindow.setFrameOrigin(frame.origin)
+        }
     }
 
     private func magnetDockedGroupToScreen() {

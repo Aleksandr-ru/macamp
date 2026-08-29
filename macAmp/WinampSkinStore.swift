@@ -19,6 +19,13 @@ final class WinampSkinStore: ObservableObject {
     /// every SwiftUI body pass was the dominant rendering cost.
     private var bitmapCache: [String: NSImage] = [:]
     private var skinFileURLCache: [String: URL] = [:]
+    /// A valid skin may intentionally omit optional resources. Remember those
+    /// misses too, so a redraw never rescans its directory for the same name.
+    private var missingSkinFiles: Set<String> = []
+    /// Cursors are requested while SwiftUI rebuilds title/resize areas. Keep
+    /// the decoded image and cursor object just like the bitmap sheets; disk
+    /// I/O here directly delays input processing.
+    private var cursorCache: [String: NSCursor] = [:]
     private var timeDigitCache: [Int: NSImage] = [:]
     private var positionBarCache: [String: NSImage] = [:]
     private var volumeBarCache: [Int: NSImage] = [:]
@@ -74,6 +81,8 @@ final class WinampSkinStore: ObservableObject {
         case play
         case pause
         case stop
+        /// Winamp draw_playicon(8): play glyph with the red lost-sync lamp.
+        case lostSync
     }
 
     init() {
@@ -143,6 +152,8 @@ final class WinampSkinStore: ObservableObject {
     private func clearImageCaches() {
         bitmapCache.removeAll()
         skinFileURLCache.removeAll()
+        missingSkinFiles.removeAll()
+        cursorCache.removeAll()
         timeDigitCache.removeAll()
         positionBarCache.removeAll()
         volumeBarCache.removeAll()
@@ -172,6 +183,7 @@ final class WinampSkinStore: ObservableObject {
         guard let directory = extractedDirectory else { return nil }
         let key = filename.lowercased()
         if let cached = bitmapCache[key] { return cached }
+        if missingSkinFiles.contains(key) { return nil }
         let url: URL
         if let cachedURL = skinFileURLCache[key] {
             url = cachedURL
@@ -183,13 +195,17 @@ final class WinampSkinStore: ObservableObject {
                 guard let files = try? FileManager.default.contentsOfDirectory(at: directory,
                                                                                 includingPropertiesForKeys: nil),
                       let match = files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame }) else {
+                    missingSkinFiles.insert(key)
                     return nil
                 }
                 url = match
             }
             skinFileURLCache[key] = url
         }
-        guard let image = NSImage(contentsOf: url) else { return nil }
+        guard let image = NSImage(contentsOf: url) else {
+            missingSkinFiles.insert(key)
+            return nil
+        }
         bitmapCache[key] = image
         return image
     }
@@ -400,18 +416,28 @@ final class WinampSkinStore: ObservableObject {
     /// Classic skins provide a dedicated diagonal Playlist resize cursor.
     func cursor(named filename: String, hotSpot: NSPoint = NSPoint(x: 8, y: 8)) -> NSCursor? {
         guard let directory = extractedDirectory else { return nil }
-        let direct = directory.appendingPathComponent(filename)
+        let fileKey = filename.lowercased()
+        let key = "\(fileKey)-\(hotSpot.x)-\(hotSpot.y)"
+        if let cached = cursorCache[key] { return cached }
+        if missingSkinFiles.contains(fileKey) { return nil }
         let url: URL
-        if FileManager.default.fileExists(atPath: direct.path) {
-            url = direct
+        if let cachedURL = skinFileURLCache[fileKey] {
+            url = cachedURL
         } else if let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil),
                   let match = files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame }) {
             url = match
         } else {
+            missingSkinFiles.insert(fileKey)
             return nil
         }
-        guard let image = NSImage(contentsOf: url) else { return nil }
-        return NSCursor(image: image, hotSpot: hotSpot)
+        guard let image = NSImage(contentsOf: url) else {
+            missingSkinFiles.insert(fileKey)
+            return nil
+        }
+        skinFileURLCache[fileKey] = url
+        let cursor = NSCursor(image: image, hotSpot: hotSpot)
+        cursorCache[key] = cursor
+        return cursor
     }
 
     /// The classic title bar uses rows 0/15; windowshade uses the compact rows 29/42.
@@ -853,6 +879,7 @@ final class WinampSkinStore: ObservableObject {
         case .play: (mainX, leftX, leftWidth) = (0, 36, 3)
         case .pause: (mainX, leftX, leftWidth) = (9, 27, 2)
         case .stop: (mainX, leftX, leftWidth) = (18, 27, 2)
+        case .lostSync: (mainX, leftX, leftWidth) = (0, 39, 3)
         }
         guard let sheet = bitmap(named: "PLAYPAUS.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),

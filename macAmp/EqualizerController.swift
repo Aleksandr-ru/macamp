@@ -321,6 +321,7 @@ final class EqualizerController: ObservableObject {
         guard adaptiveReturnTimer == nil else { return }
         adaptiveReturnTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
+            guard !InterfaceRenderGate.isSuspended else { return }
             let factor = self.smoothingFactor(duration: self.adaptiveConfiguration.releaseTime, interval: 1.0 / 30.0)
             self.adaptiveBands = self.adaptiveBands.map { abs($0) < 0.01 ? 0 : $0 + (0 - $0) * factor }
             self.adaptivePreamp = abs(self.adaptivePreamp) < 0.01 ? 0 : self.adaptivePreamp + (0 - self.adaptivePreamp) * factor
@@ -341,6 +342,7 @@ final class EqualizerController: ObservableObject {
         }
         presetPreampReturnTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
+            guard !InterfaceRenderGate.isSuspended else { return }
             let factor = self.smoothingFactor(duration: self.adaptiveConfiguration.releaseTime, interval: 1.0 / 30.0)
             self.adaptivePreamp += (0 - self.adaptivePreamp) * factor
             if abs(self.adaptivePreamp) < 0.01 {
