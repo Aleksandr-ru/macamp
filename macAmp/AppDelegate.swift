@@ -1,6 +1,6 @@
 //
 //  AppDelegate.swift
-//  MacAmp
+//  macAmp
 //
 //  Created by Rebel on 27.03.2020.
 //  Copyright © 2020 Aleksandr.ru. All rights reserved.
@@ -276,7 +276,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mediaKeyMonitor: Any?
     private var keyboardShortcutMonitor: Any?
     private var controlsMenu: NSMenu?
-    private let persistentStateKey = "MacAmp.applicationPersistentState.v1"
+    private let persistentStateKey = "macAmp.applicationPersistentState.v1"
 
     private struct PersistentState: Codable {
         var volume: Double
@@ -566,7 +566,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // first hardware Play key press instead of routing that press here.
         let hasTrack = playback.duration > 0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
-            MPMediaItemPropertyTitle: hasTrack ? playback.title : "MacAmp",
+            MPMediaItemPropertyTitle: hasTrack ? playback.title : "macAmp",
             MPMediaItemPropertyPlaybackDuration: hasTrack ? playback.duration : 0,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: hasTrack ? playback.position : 0,
             MPNowPlayingInfoPropertyPlaybackRate: playback.isPlaying ? 1.0 : 0.0
@@ -615,7 +615,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let state = Int((event.data1 & 0x0000_FF00) >> 8)
         // Consume both down and up events. Letting the up event propagate can
         // still make macOS hand the same media-key press to Music/another
-        // default media app after MacAmp has already handled it.
+        // default media app after macAmp has already handled it.
         switch key {
         case 16:
             if state == 0xA {

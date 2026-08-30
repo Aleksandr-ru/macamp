@@ -24,7 +24,7 @@ final class InfoWindowModel: ObservableObject {
     /// the same local file. Once APIC was decoded, never replace it with an
     /// incomplete later metadata result for that URL.
     private var artworkCache: [URL: NSImage] = [:]
-    private let queue = DispatchQueue(label: "ru.aleksandr.MacAmp.info", qos: .utility)
+    private let queue = DispatchQueue(label: "ru.aleksandr.macAmp.info", qos: .utility)
 
     func show(_ url: URL?) { show(url, metadataDelay: 0) }
 

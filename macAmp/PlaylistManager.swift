@@ -75,7 +75,7 @@ final class PlaylistManager: ObservableObject {
     /// Bump when a stored display-title format needs one background refresh.
     /// Existing snapshots contained title-only metadata, so they must be
     /// revisited once to obtain the Artist component as well.
-    private static let displayMetadataFormatVersionKey = "MacAmp.playlist.displayMetadataFormatVersion"
+    private static let displayMetadataFormatVersionKey = "macAmp.playlist.displayMetadataFormatVersion"
     private static let displayMetadataFormatVersion = 1
     @Published private(set) var playlists: [PlaylistModel] = []
     @Published private(set) var activePlaylistID: UUID?
@@ -88,8 +88,8 @@ final class PlaylistManager: ObservableObject {
     @Published private(set) var playbackRevealRevision = 0
     @Published private(set) var recentPlaylistURLs: [URL] = []
 
-    private let folderQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.playlist.folder", qos: .utility)
-    private let metadataQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.playlist.metadata", qos: .background, attributes: .concurrent)
+    private let folderQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.folder", qos: .utility)
+    private let metadataQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.metadata", qos: .background, attributes: .concurrent)
     private let persistenceURL: URL
     private var pausedPlaylistIDs = Set<UUID>()
     private var cancelledFolderPlaylistIDs = Set<UUID>()
@@ -138,7 +138,7 @@ final class PlaylistManager: ObservableObject {
     init() {
         let root = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
             ?? FileManager.default.temporaryDirectory
-        let directory = root.appendingPathComponent("MacAmp", isDirectory: true)
+        let directory = root.appendingPathComponent("macAmp", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         persistenceURL = directory.appendingPathComponent("playlists.json")
         let needsDisplayMetadataRefresh = UserDefaults.standard.integer(forKey: Self.displayMetadataFormatVersionKey) < Self.displayMetadataFormatVersion

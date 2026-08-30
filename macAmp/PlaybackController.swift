@@ -69,10 +69,10 @@ final class PlaybackController: NSObject, ObservableObject {
     /// on the main thread once the file is ready.
     // Do not serialize potentially stalled network opens: a newly selected
     // track must be able to supersede an earlier URL immediately.
-    private let fileOpenQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.audio.open", qos: .userInitiated, attributes: .concurrent)
+    private let fileOpenQueue = DispatchQueue(label: "ru.aleksandr.macAmp.audio.open", qos: .userInitiated, attributes: .concurrent)
     /// Technical display data is cosmetic: never let its AVFoundation query
     /// compete with opening, buffering or rendering the selected track.
-    private let formatDetailsQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.audio.format", qos: .utility)
+    private let formatDetailsQueue = DispatchQueue(label: "ru.aleksandr.macAmp.audio.format", qos: .utility)
     private var fileOpenGeneration = 0
     /// A tiny PCM snapshot from the live audio graph. This avoids repeatedly
     /// seeking and decoding the source file just to draw the visualizer.
@@ -87,7 +87,7 @@ final class PlaybackController: NSObject, ObservableObject {
     /// Invalidates completion handlers from segments replaced by seek/restart.
     private var playbackGeneration = 0
     private var isSpectrumAnalysisScheduled = false
-    private let spectrumQueue = DispatchQueue(label: "ru.aleksandr.MacAmp.spectrum", qos: .utility)
+    private let spectrumQueue = DispatchQueue(label: "ru.aleksandr.macAmp.spectrum", qos: .utility)
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
     private var isStreamingAnalysisTapInstalled = false
@@ -110,8 +110,8 @@ final class PlaybackController: NSObject, ObservableObject {
     }()
     private var smoothedBandEnergy = Array(repeating: -60.0, count: 10)
     private var hasAdaptiveAnalysisHistory = false
-    private static let shufflePreferenceKey = "MacAmp.playback.shuffleEnabled"
-    private static let repeatPreferenceKey = "MacAmp.playback.repeatEnabled"
+    private static let shufflePreferenceKey = "macAmp.playback.shuffleEnabled"
+    private static let repeatPreferenceKey = "macAmp.playback.repeatEnabled"
     private lazy var fftWindow: [Float] = {
         var window = [Float](repeating: 0, count: fftSize)
         vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
@@ -454,7 +454,7 @@ final class PlaybackController: NSObject, ObservableObject {
             // or other network volume is not a candidate for AVAudioFile:
             // even when constructed off-main, later graph setup can force a
             // synchronous index/read on the event loop. AVPlayer buffers it
-            // asynchronously and keeps all MacAmp windows responsive.
+            // asynchronously and keeps all macAmp windows responsive.
             let isNetworkVolume = (try? url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) == false
             if isNetworkVolume {
                 DispatchQueue.main.async { [weak self] in
@@ -749,6 +749,10 @@ final class PlaybackController: NSObject, ObservableObject {
         let sampleRate = Int((file.processingFormat.sampleRate / 1_000).rounded())
         let channels = Int(file.processingFormat.channelCount)
         formatDetailsQueue.async { [weak self] in
+            // AVAudioFile.length may scan a VBR source. Keep that work off the
+            // main thread, but always publish the result: position navigation
+            // cannot operate while duration remains at its opening value (0).
+            let trackDuration = Double(file.length) / file.processingFormat.sampleRate
             let asset = AVURLAsset(url: url)
             let estimatedBitrate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
             let bitrate: Int?
@@ -758,10 +762,9 @@ final class PlaybackController: NSObject, ObservableObject {
                 // Some MP3s, especially VBR files without a usable Xing/VBR
                 // header, expose no estimated rate. This fallback remains off
                 // the main thread and runs only after playback has started.
-                let duration = Double(file.length) / file.processingFormat.sampleRate
                 let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
-                if let fileSize, duration > 0 {
-                    bitrate = Int((Double(fileSize) * 8 / duration / 1_000).rounded())
+                if let fileSize, trackDuration > 0 {
+                    bitrate = Int((Double(fileSize) * 8 / trackDuration / 1_000).rounded())
                 } else {
                     bitrate = nil
                 }
@@ -772,6 +775,9 @@ final class PlaybackController: NSObject, ObservableObject {
                 self.sampleRateKHz = sampleRate
                 self.channelCount = channels
                 self.bitrateKbps = bitrate
+                if trackDuration.isFinite, trackDuration > 0 {
+                    self.duration = trackDuration
+                }
             }
         }
     }
@@ -802,6 +808,9 @@ final class PlaybackController: NSObject, ObservableObject {
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else { return }
                 self.bitrateKbps = bitrate
+                if duration.isFinite, duration > 0 {
+                    self.duration = duration
+                }
             }
         }
     }

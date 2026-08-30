@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 extension Notification.Name {
-    static let macAmpInterfaceScaleDidChange = Notification.Name("MacAmpInterfaceScaleDidChange")
+    static let macAmpInterfaceScaleDidChange = Notification.Name("macAmpInterfaceScaleDidChange")
 }
 
 /// Winamp's original double-size mode, generalized to a precise 10% grid.

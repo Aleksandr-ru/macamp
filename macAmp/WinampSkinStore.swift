@@ -126,7 +126,7 @@ final class WinampSkinStore: ObservableObject {
                                                in: .userDomainMask,
                                                appropriateFor: nil,
                                                create: true)
-            .appendingPathComponent("MacAmp/Skins", isDirectory: true)
+            .appendingPathComponent("macAmp/Skins", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let destination = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)

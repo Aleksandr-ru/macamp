@@ -83,8 +83,8 @@ final class EqualizerController: ObservableObject {
     private var pendingSince = Array(repeating: Date.distantPast, count: 10)
     private var adaptiveReturnTimer: Timer?
     private var presetPreampReturnTimer: Timer?
-    private let customPresetsKey = "MacAmp.equalizer.customPresets"
-    private let adaptiveEnabledDefaultsKey = "MacAmp.equalizer.adaptiveEnabled"
+    private let customPresetsKey = "macAmp.equalizer.customPresets"
+    private let adaptiveEnabledDefaultsKey = "macAmp.equalizer.adaptiveEnabled"
 
     static let factoryPresets: [EqualizerPreset] = [
         preset("Classical", [31,31,31,31,31,31,44,44,44,48]),

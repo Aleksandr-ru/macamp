@@ -1,12 +1,12 @@
-# MacAmp
+# macAmp
 
 > True vibe coded winamp for macos
 
 You've been looking for years and now it's here!
 
-MacAmp brings the classic Winamp look and feel to the Mac. Behind the classics MacAmp equipped with modern features. It's built for people who miss original Winamp but expect a modern macOS experience.
+macAmp brings the classic Winamp look and feel to the Mac. Behind the classics macAmp equipped with modern features. It's built for people who miss original Winamp but expect a modern macOS experience.
 
-## Why MacAmp
+## Why macAmp
 
 - Use your favorite classic Winamp `.wsz` skins as is.
 - Keep the iconic separate Player, Playlist, and Equalizer windows - or snap them together into one tidy setup.
@@ -21,8 +21,8 @@ Open and manage multiple playlists at once. Every playlist has its own window, n
 
 ## A smarter equalizer
 
-MacAmp keeps the familiar ten-band equalizer while adding an adaptive automatic mode. It listens to the music locally and makes gentle, smooth adjustments to reveal detail without flattening the character of the track. Your own EQ choices always remain part of the sound.
+macAmp keeps the familiar ten-band equalizer while adding an adaptive automatic mode. It listens to the music locally and makes gentle, smooth adjustments to reveal detail without flattening the character of the track. Your own EQ choices always remain part of the sound.
 
 ## Classic look, made for macOS
 
-Skins define the experience - from bitmap buttons and sliders to shaped windows - while MacAmp adds the things a current Mac app should have: high-resolution graphics, multi-display support, flexible window docking, and efficient playback designed to be light on system resources.
+Skins define the experience - from bitmap buttons and sliders to shaped windows - while macAmp adds the things a current Mac app should have: high-resolution graphics, multi-display support, flexible window docking, and efficient playback designed to be light on system resources.
