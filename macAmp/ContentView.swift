@@ -22,8 +22,6 @@ struct ContentView: View {
     @ObservedObject var equalizerState: EqualizerWindowState
     @ObservedObject var playlistState: PlaylistWindowState
     @ObservedObject var infoState: InfoWindowState
-    @State private var isSeeking = false
-    @State private var seekPreviewPosition: Double?
     @State private var isAdjustingVolume = false
     @State private var isAdjustingBalance = false
     @State private var isEqualizerPressed = false
@@ -61,14 +59,19 @@ struct ContentView: View {
             }
             skinTitleBar
             playbackIndicator
-            timeDisplay
+            MainTimeDisplay(
+                skin: skin,
+                clock: playback.clock,
+                duration: playback.duration,
+                preference: timeDisplayPreference
+            )
             spectrumAnalyzer
             visualizationModeButtons
             ticker
             bitrateIndicator
             sampleRateIndicator
             channelIndicator
-            progressBar
+            MainProgressBar(skin: skin, clock: playback.clock, duration: playback.duration)
             volumeBar
             balanceBar
             equalizerButton
@@ -102,35 +105,20 @@ struct ContentView: View {
             titleBarControlButton(.close, x: 266.5, isWindowActive: windowFocus.isKey, action: { AppDelegate.shared?.terminateApplication(nil) })
             if windowShade.isEnabled {
                 windowShadeSpectrum
-                windowShadeTime
+                WindowShadeTimeDisplay(
+                    skin: skin,
+                    clock: playback.clock,
+                    duration: playback.duration,
+                    preference: timeDisplayPreference
+                )
                 windowShadeTimeControl
-                windowShadePosition
+                WindowShadePositionDisplay(skin: skin, clock: playback.clock, duration: playback.duration)
                 windowShadePositionControl
                 windowShadeControls
             }
         }
         .frame(width: 275, height: 14)
         .position(x: 137.5, y: 7)
-    }
-
-    private var windowShadeTime: some View {
-        let total = timeDisplayPreference.showsRemainingTime && playback.duration > 0
-            ? max(0, Int((playback.duration - playback.position).rounded(.down)))
-            : max(0, Int(playback.position.rounded(.down)))
-        let minutes = min(total / 60, 99)
-        let seconds = total % 60
-        let showsMinus = timeDisplayPreference.showsRemainingTime && playback.duration > 0
-
-        return Group {
-            if let image = skin.windowShadeTimeImage(minutes: minutes, seconds: seconds, isRemaining: showsMinus) {
-                Image(nsImage: image).interpolation(.none)
-            } else {
-                Color.clear
-            }
-        }
-        .frame(width: 32, height: 6, alignment: .leading)
-        // draw_time() updates exactly the 125...157 px compact time field.
-        .position(x: 141, y: 8)
     }
 
     /// Winamp toggles elapsed/remaining time from the compact display at x: 129...157, y: 3...9.
@@ -151,19 +139,6 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .highPriorityGesture(TapGesture().onEnded { visualizationMode.advance() })
         .position(x: 98, y: 7.5)
-    }
-
-    private var windowShadePosition: some View {
-        let progress = playback.duration > 0 ? playback.position / playback.duration : 0
-        return Group {
-            if let image = skin.windowShadePositionImage(progress: progress) {
-                Image(nsImage: image).interpolation(.none)
-            } else {
-                Color.clear
-            }
-        }
-        .frame(width: 17, height: 7)
-        .position(x: 234.5, y: 7.5)
     }
 
     /// The compact position bar is draggable in the original player.
@@ -280,54 +255,6 @@ extension ContentView {
             isAdjustingBalance: isAdjustingBalance
         )
         .position(x: 188, y: 32)
-    }
-
-    private var progressBar: some View {
-        let displayedPosition = seekPreviewPosition ?? playback.pendingSeekPosition ?? playback.position
-        let fraction = playback.duration > 0
-            ? min(1, max(0, displayedPosition / playback.duration))
-            : 0
-
-        return ZStack(alignment: .leading) {
-            if let track = skin.positionBarTrack() {
-                Image(nsImage: track)
-                    .interpolation(.none)
-            } else {
-                Color.black
-            }
-
-            if let thumb = skin.positionBarThumb(pressed: isSeeking) {
-                Image(nsImage: thumb)
-                    .interpolation(.none)
-                    .offset(x: CGFloat(fraction) * 219)
-            }
-        }
-        .frame(width: 248, height: 10, alignment: .leading)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    isSeeking = true
-                    previewSeek(toProgressBarLocation: value.location.x)
-                }
-                .onEnded { value in
-                    previewSeek(toProgressBarLocation: value.location.x)
-                    if let preview = seekPreviewPosition {
-                        AppDelegate.shared?.seekPlayback(to: preview)
-                    }
-                    // The playback controller retains this target until it
-                    // receives a frame from the newly scheduled segment.
-                    seekPreviewPosition = nil
-                    isSeeking = false
-                }
-        )
-        .position(x: 140, y: 77)
-    }
-
-    private func previewSeek(toProgressBarLocation location: CGFloat) {
-        guard playback.duration > 0 else { return }
-        let fraction = min(1, max(0, Double(location / 248)))
-        seekPreviewPosition = playback.duration * fraction
     }
 
     private var volumeBar: some View {
@@ -545,39 +472,6 @@ extension ContentView {
         )
     }
 
-    private var timeDisplay: some View {
-        let elapsedSeconds = max(0, Int(playback.position.rounded(.down)))
-        let showsRemainingTime = timeDisplayPreference.showsRemainingTime && playback.duration > 0
-        let totalSeconds = showsRemainingTime
-            ? max(0, Int((playback.duration - playback.position).rounded(.down)))
-            : elapsedSeconds
-        let minutes = min(totalSeconds / 60, 99)
-        let seconds = totalSeconds % 60
-
-        return Button(action: timeDisplayPreference.toggle) {
-            ZStack(alignment: .leading) {
-                if showsRemainingTime {
-                    timeMinusSign
-                        .position(x: 1.5, y: 6.5)
-                }
-                HStack(spacing: 0) {
-                    timeDigit(minutes / 10)
-                    Color.clear.frame(width: 3)
-                    timeDigit(minutes % 10)
-                    Color.clear.frame(width: 9)
-                    timeDigit(seconds / 10)
-                    Color.clear.frame(width: 3)
-                    timeDigit(seconds % 10)
-                }
-                .offset(x: 9)
-            }
-            .frame(width: 60, height: 13, alignment: .leading)
-        }
-        .buttonStyle(PlainButtonStyle())
-        .frame(width: 60, height: 13)
-        .position(x: 69, y: 32.5)
-    }
-
     private var playbackIndicator: some View {
         let indicator: WinampSkinStore.PlaybackIndicator = playback.hasPlaybackError
             ? .lostSync
@@ -647,30 +541,6 @@ extension ContentView {
         .position(x: 14, y: 43.5)
     }
 
-    private var timeMinusSign: some View {
-        Group {
-            if let glyph = skin.timeMinusSign() {
-                Image(nsImage: glyph)
-                    .interpolation(.none)
-            } else {
-                Color.clear
-            }
-        }
-        .frame(width: 5, height: 1)
-    }
-
-    private func timeDigit(_ digit: Int) -> some View {
-        Group {
-            if let glyph = skin.timeDigit(digit) {
-                Image(nsImage: glyph)
-                    .interpolation(.none)
-            } else {
-                Color.clear
-            }
-        }
-        .frame(width: 9, height: 13)
-    }
-
     private var controls: some View {
         ZStack(alignment: .topLeading) {
             playerControlButton(.previous, x: 16, width: 23, action: { AppDelegate.shared?.playlistTransportAction(0) })
@@ -718,6 +588,156 @@ extension ContentView {
     }
 }
 
+/// Only this small subtree listens to the 4 Hz playback clock. Static skin
+/// controls and auxiliary windows no longer rebuild for every time tick.
+private struct MainTimeDisplay: View {
+    @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var clock: PlaybackClockState
+    let duration: Double
+    @ObservedObject var preference: TimeDisplayPreference
+
+    var body: some View {
+        let elapsed = max(0, Int(clock.position.rounded(.down)))
+        let remaining = preference.showsRemainingTime && duration > 0
+        let total = remaining ? max(0, Int((duration - clock.position).rounded(.down))) : elapsed
+        let minutes = min(total / 60, 99)
+        let seconds = total % 60
+
+        return Button(action: preference.toggle) {
+            ZStack(alignment: .leading) {
+                if remaining {
+                    Group {
+                        if let glyph = skin.timeMinusSign() {
+                            Image(nsImage: glyph).interpolation(.none)
+                        } else {
+                            Color.clear
+                        }
+                    }
+                    .frame(width: 5, height: 1)
+                    .position(x: 1.5, y: 6.5)
+                }
+                HStack(spacing: 0) {
+                    digit(minutes / 10)
+                    Color.clear.frame(width: 3)
+                    digit(minutes % 10)
+                    Color.clear.frame(width: 9)
+                    digit(seconds / 10)
+                    Color.clear.frame(width: 3)
+                    digit(seconds % 10)
+                }
+                .offset(x: 9)
+            }
+            .frame(width: 60, height: 13, alignment: .leading)
+        }
+        .buttonStyle(PlainButtonStyle())
+        .frame(width: 60, height: 13)
+        .position(x: 69, y: 32.5)
+    }
+
+    private func digit(_ value: Int) -> some View {
+        Group {
+            if let glyph = skin.timeDigit(value) {
+                Image(nsImage: glyph).interpolation(.none)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 9, height: 13)
+    }
+}
+
+private struct MainProgressBar: View {
+    @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var clock: PlaybackClockState
+    let duration: Double
+    @State private var isSeeking = false
+    @State private var previewPosition: Double?
+
+    var body: some View {
+        let displayed = previewPosition ?? clock.pendingSeekPosition ?? clock.position
+        let fraction = duration > 0 ? min(1, max(0, displayed / duration)) : 0
+        return ZStack(alignment: .leading) {
+            if let track = skin.positionBarTrack() {
+                Image(nsImage: track).interpolation(.none)
+            } else {
+                Color.black
+            }
+            if let thumb = skin.positionBarThumb(pressed: isSeeking) {
+                Image(nsImage: thumb)
+                    .interpolation(.none)
+                    .offset(x: CGFloat(fraction) * 219)
+            }
+        }
+        .frame(width: 248, height: 10, alignment: .leading)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    isSeeking = true
+                    preview(at: value.location.x)
+                }
+                .onEnded { value in
+                    preview(at: value.location.x)
+                    if let previewPosition { AppDelegate.shared?.seekPlayback(to: previewPosition) }
+                    previewPosition = nil
+                    isSeeking = false
+                }
+        )
+        .position(x: 140, y: 77)
+    }
+
+    private func preview(at location: CGFloat) {
+        guard duration > 0 else { return }
+        previewPosition = duration * min(1, max(0, Double(location / 248)))
+    }
+}
+
+private struct WindowShadeTimeDisplay: View {
+    @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var clock: PlaybackClockState
+    let duration: Double
+    @ObservedObject var preference: TimeDisplayPreference
+
+    var body: some View {
+        let remaining = preference.showsRemainingTime && duration > 0
+        let total = remaining
+            ? max(0, Int((duration - clock.position).rounded(.down)))
+            : max(0, Int(clock.position.rounded(.down)))
+        return Group {
+            if let image = skin.windowShadeTimeImage(
+                minutes: min(total / 60, 99),
+                seconds: total % 60,
+                isRemaining: remaining
+            ) {
+                Image(nsImage: image).interpolation(.none)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 32, height: 6, alignment: .leading)
+        .position(x: 141, y: 8)
+    }
+}
+
+private struct WindowShadePositionDisplay: View {
+    @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var clock: PlaybackClockState
+    let duration: Double
+
+    var body: some View {
+        let progress = duration > 0 ? clock.position / duration : 0
+        return Group {
+            if let image = skin.windowShadePositionImage(progress: progress) {
+                Image(nsImage: image).interpolation(.none)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 17, height: 7)
+        .position(x: 234.5, y: 7.5)
+    }
+}
+
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView(
@@ -743,6 +763,8 @@ private struct TickerDisplay: View {
     @State private var tickerOffset: CGFloat = 0
     @State private var tickerPauseTicks = 10
     @State private var tickerSourceText = ""
+    @State private var tickerTextWidthValue: CGFloat = 0
+    @State private var tickerCycleWidth: CGFloat = 0
     @State private var tickerTimer: Timer?
 
     var body: some View {
@@ -761,7 +783,6 @@ private struct TickerDisplay: View {
         .clipped()
         .onAppear {
             resetTicker(for: statusText)
-            startTickerTimer()
         }
         .onDisappear {
             tickerTimer?.invalidate()
@@ -787,7 +808,7 @@ private struct TickerDisplay: View {
     }
 
     private var tickerShouldScroll: Bool {
-        !isAdjustingVolume && !isAdjustingBalance && tickerTextWidth(statusText) > 154
+        !isAdjustingVolume && !isAdjustingBalance && tickerTextWidthValue > 154
     }
 
     private func tickerTextWidth(_ text: String) -> CGFloat {
@@ -810,6 +831,13 @@ private struct TickerDisplay: View {
         tickerSourceText = text
         tickerOffset = 0
         tickerPauseTicks = 10
+        tickerTextWidthValue = tickerTextWidth(text)
+        tickerCycleWidth = tickerTextWidthValue + tickerTextWidth("  ***  ")
+        tickerTimer?.invalidate()
+        tickerTimer = nil
+        if !isAdjustingVolume && !isAdjustingBalance && tickerTextWidthValue > 154 {
+            startTickerTimer()
+        }
     }
 
     private func advanceTicker() {
@@ -822,8 +850,7 @@ private struct TickerDisplay: View {
             return
         }
         tickerOffset += 5
-        let cycleWidth = tickerTextWidth(text) + tickerTextWidth("  ***  ")
-        if tickerOffset >= cycleWidth {
+        if tickerOffset >= tickerCycleWidth {
             tickerOffset = 0
             tickerPauseTicks = 10
         }
@@ -843,29 +870,163 @@ private struct TickerDisplay: View {
 /// Mirrors Winamp's separate spectrum drawing surface: updates here do not
 /// invalidate controls, title text, or the static skin around it.
 private struct VisualizationDisplay: View {
-    @ObservedObject var visualization: PlaybackVisualizationState
+    let visualization: PlaybackVisualizationState
     let palette: [NSColor]
     let mode: VisualizationMode
     let isWindowShade: Bool
 
     var body: some View {
+        VisualizationSurface(
+            visualization: visualization,
+            palette: palette,
+            mode: mode,
+            isWindowShade: isWindowShade
+        )
+    }
+}
+
+/// One AppKit drawing surface replaces hundreds of one-pixel SwiftUI views.
+/// It subscribes directly to analyzer state, so a spectrum frame does not
+/// enter SwiftUI's diff/layout pipeline at all.
+private struct VisualizationSurface: NSViewRepresentable {
+    let visualization: PlaybackVisualizationState
+    let palette: [NSColor]
+    let mode: VisualizationMode
+    let isWindowShade: Bool
+
+    func makeNSView(context: Context) -> VisualizationNSView {
+        let view = VisualizationNSView()
+        view.configure(palette: palette, mode: mode, isWindowShade: isWindowShade)
+        view.bind(to: visualization)
+        return view
+    }
+
+    func updateNSView(_ nsView: VisualizationNSView, context: Context) {
+        nsView.configure(palette: palette, mode: mode, isWindowShade: isWindowShade)
+        nsView.bind(to: visualization)
+    }
+}
+
+private final class VisualizationNSView: NSView {
+    private weak var visualization: PlaybackVisualizationState?
+    private var cancellables = Set<AnyCancellable>()
+    private var palette: [NSColor] = [.black, .darkGray, .green]
+    private var mode: VisualizationMode = .spectrum
+    private var isWindowShade = false
+    private var levels = Array(repeating: CGFloat(0), count: 16)
+    private var samples = Array(repeating: CGFloat(0), count: 76)
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.magnificationFilter = .nearest
+        layer?.minificationFilter = .nearest
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    func configure(palette: [NSColor], mode: VisualizationMode, isWindowShade: Bool) {
+        self.palette = palette.isEmpty ? [.black, .darkGray, .green] : palette
+        self.mode = mode
+        self.isWindowShade = isWindowShade
+        needsDisplay = true
+    }
+
+    func bind(to visualization: PlaybackVisualizationState) {
+        guard self.visualization !== visualization else { return }
+        self.visualization = visualization
+        levels = visualization.spectrumLevels
+        samples = visualization.waveformSamples
+        cancellables.removeAll()
+        visualization.$spectrumLevels
+            .removeDuplicates()
+            .sink { [weak self] values in
+                guard let self else { return }
+                self.levels = values
+                if self.mode == .spectrum { self.needsDisplay = true }
+            }
+            .store(in: &cancellables)
+        visualization.$waveformSamples
+            .removeDuplicates()
+            .sink { [weak self] values in
+                guard let self else { return }
+                self.samples = values
+                if self.mode == .oscilloscope { self.needsDisplay = true }
+            }
+            .store(in: &cancellables)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard mode != .off, let context = NSGraphicsContext.current?.cgContext else { return }
+        context.setShouldAntialias(false)
+        context.setFillColor(color(at: 0, fallback: .black).cgColor)
+        context.fill(bounds)
         switch mode {
         case .off:
-            Color.clear
+            break
         case .spectrum:
-            if isWindowShade {
-                WindowShadeSpectrumView(palette: palette, levels: visualization.spectrumLevels)
-            } else {
-                SpectrumAnalyzerView(palette: palette, levels: visualization.spectrumLevels)
-            }
+            isWindowShade ? drawWindowShadeSpectrum(in: context) : drawMainSpectrum(in: context)
         case .oscilloscope:
-            OscilloscopeView(
-                palette: palette,
-                samples: visualization.waveformSamples,
-                width: isWindowShade ? 38 : 76,
-                height: isWindowShade ? 5 : 15
-            )
+            drawOscilloscope(in: context)
         }
+    }
+
+    private func drawMainSpectrum(in context: CGContext) {
+        for column in 0..<19 {
+            let sourceBand = Int((Double(column) * 15 / 18).rounded())
+            let level = levels.indices.contains(sourceBand) ? min(1, max(0, levels[sourceBand])) : 0
+            let litRows = Int((level * 15).rounded(.down))
+            for displayRow in 0..<15 {
+                let row = 14 - displayRow
+                let color = row < litRows
+                    ? color(at: 17 - row, fallback: .green)
+                    : color(at: 1, fallback: .darkGray)
+                context.setFillColor(color.cgColor)
+                context.fill(CGRect(x: column * 4, y: displayRow, width: 3, height: 1))
+            }
+        }
+    }
+
+    private func drawWindowShadeSpectrum(in context: CGContext) {
+        for column in 0..<38 where column != 37 && column & 3 != 3 {
+            let sourceBand = Int((Double(column) * 15 / 36).rounded())
+            let level = levels.indices.contains(sourceBand) ? min(1, max(0, levels[sourceBand])) : 0
+            let litRows = Int((level * 5).rounded(.down))
+            for displayRow in 0..<5 {
+                let row = 4 - displayRow
+                let color = row < litRows
+                    ? color(at: 17 - row * 3, fallback: .green)
+                    : color(at: 1, fallback: .darkGray)
+                context.setFillColor(color.cgColor)
+                context.fill(CGRect(x: column, y: displayRow, width: 1, height: 1))
+            }
+        }
+    }
+
+    private func drawOscilloscope(in context: CGContext) {
+        let width = max(2, Int(bounds.width.rounded(.down)))
+        let height = max(1, bounds.height - 1)
+        guard samples.count > 1 else { return }
+        context.setStrokeColor((palette.last ?? .green).cgColor)
+        context.setLineWidth(1)
+        context.beginPath()
+        for x in 0..<width {
+            let source = x * (samples.count - 1) / (width - 1)
+            let value = min(1, max(-1, samples[source]))
+            let y = (1 - (value + 1) / 2) * height
+            let point = CGPoint(x: CGFloat(x) + 0.5, y: y + 0.5)
+            x == 0 ? context.move(to: point) : context.addLine(to: point)
+        }
+        context.strokePath()
+    }
+
+    private func color(at index: Int, fallback: NSColor) -> NSColor {
+        palette.indices.contains(index) ? palette[index] : fallback
     }
 }
 

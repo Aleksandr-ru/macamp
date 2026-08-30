@@ -268,6 +268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var focusObservers: [Any] = []
     private var isExplicitTerminationRequested = false
     private var persistenceCancellables = Set<AnyCancellable>()
+    private var playingEntryTitleCancellable: AnyCancellable?
     private var pendingPersistenceWorkItem: DispatchWorkItem?
     private var lastNowPlayingUpdate = Date.distantPast
     private var lastNowPlayingTitle = ""
@@ -357,6 +358,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.refreshInterfaceVisibility()
             },
             NotificationCenter.default.addObserver(forName: NSWindow.didDeminiaturizeNotification,
+                                                   object: window,
+                                                   queue: .main) { [weak self] _ in
+                self?.refreshInterfaceVisibility()
+            },
+            NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
                                                    object: window,
                                                    queue: .main) { [weak self] _ in
                 self?.refreshInterfaceVisibility()
@@ -546,7 +552,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func observeNowPlayingState() {
-        playback.objectWillChange
+        let transportChanges = Publishers.Merge3(
+            playback.$title.map { _ in () },
+            playback.$isPlaying.map { _ in () },
+            playback.$duration.map { _ in () }
+        )
+        let clockChanges = playback.clock.$position
+            .throttle(for: .seconds(1), scheduler: RunLoop.main, latest: true)
+            .map { _ in () }
+        transportChanges
+            .merge(with: clockChanges)
             .sink { [weak self] _ in
                 // ObservableObject publishes before assigning its new value.
                 DispatchQueue.main.async { self?.updateNowPlayingInfo() }
@@ -1115,11 +1130,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel) {
         guard let entry else {
             if playback.isRepeatEnabled, let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID }) {
-                playlistManager.play(current, in: playlist); playback.open(current.url, bookmarkData: current.bookmarkData); infoModel.showForPlayback(current.url)
+                playlistManager.play(current, in: playlist)
+                playback.open(current.url, bookmarkData: current.bookmarkData, displayTitle: current.title)
+                observePlayingEntryTitle(current)
+                infoModel.showForPlayback(current.url)
             }
             return
         }
-        playlistManager.play(entry, in: playlist); playback.open(entry.url, bookmarkData: entry.bookmarkData); infoModel.showForPlayback(entry.url)
+        playlistManager.play(entry, in: playlist)
+        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        observePlayingEntryTitle(entry)
+        infoModel.showForPlayback(entry.url)
     }
 
     /// Playlist rows call this route as well, so their double-click has the
@@ -1127,8 +1148,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func playPlaylistEntryFromSelection(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
         resetInfoTarget()
         playlistManager.play(entry, in: playlist, revealIfNeeded: false)
-        playback.open(entry.url, bookmarkData: entry.bookmarkData)
+        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
+    }
+
+    private func observePlayingEntryTitle(_ entry: PlaylistEntry) {
+        playingEntryTitleCancellable = entry.$title
+            .removeDuplicates()
+            .sink { [weak self] title in self?.playback.updateDisplayTitle(title) }
     }
 
     func seekPlayback(to position: TimeInterval) {
@@ -1143,6 +1171,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let playlist = playlistManager.activePlaylist,
               let entry = playlistManager.preferredEntryToPlay(in: playlist) else { return }
         if playback.currentURL == entry.url {
+            observePlayingEntryTitle(entry)
             if !playback.isPlaying { playback.play() }
         } else {
             playPlaylistEntry(entry, in: playlist)
@@ -1223,10 +1252,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshInterfaceVisibility() {
-        // A visible player must keep its spectrum alive even when another app
-        // owns keyboard focus.  Suspend expensive UI work only when this
-        // window is actually hidden or miniaturized.
-        playback.setInterfaceVisible(window.isVisible && !window.isMiniaturized)
+        // Occluded windows keep playing audio but do not need analyzer PCM,
+        // FFT work or visual publishes until they become visible again.
+        let isVisible = window.isVisible
+            && !window.isMiniaturized
+            && window.occlusionState.contains(.visible)
+        playback.setInterfaceVisible(isVisible)
     }
 
     /// The classic player is a set of panels: activating any one panel must

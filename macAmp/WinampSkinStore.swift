@@ -116,6 +116,7 @@ final class WinampSkinStore: ObservableObject {
         }
         extractedDirectory = directory
         clearImageCaches()
+        predecodeCoreBitmaps()
         name = "WINAMP CLASSIC 2.91"
         status = "DEFAULT WINAMP 2.91 SKIN"
         visualizationPalette = loadVisualizationPalette(from: directory)
@@ -147,6 +148,7 @@ final class WinampSkinStore: ObservableObject {
         extractedDirectory = destination
         visualizationPalette = loadVisualizationPalette(from: destination)
         clearImageCaches()
+        predecodeCoreBitmaps()
     }
 
     private func clearImageCaches() {
@@ -202,12 +204,32 @@ final class WinampSkinStore: ObservableObject {
             }
             skinFileURLCache[key] = url
         }
-        guard let image = NSImage(contentsOf: url) else {
+        // NSImage(contentsOf:) defers BMP/RLE decoding until the first draw,
+        // which can put image decompression back on the main thread during
+        // playback. Materialize a CG-backed bitmap once at skin-load time.
+        guard let data = try? Data(contentsOf: url),
+              let representation = NSBitmapImageRep(data: data),
+              let cgImage = representation.cgImage else {
             missingSkinFiles.insert(key)
             return nil
         }
+        let image = NSImage(
+            cgImage: cgImage,
+            size: NSSize(width: representation.pixelsWide, height: representation.pixelsHigh)
+        )
+        image.cacheMode = .always
         bitmapCache[key] = image
         return image
+    }
+
+    private func predecodeCoreBitmaps() {
+        let filenames = [
+            "MAIN.BMP", "TITLEBAR.BMP", "CBUTTONS.BMP", "SHUFREP.BMP",
+            "VOLUME.BMP", "BALANCE.BMP", "MONOSTER.BMP", "POSBAR.BMP",
+            "PLAYPAUS.BMP", "NUMBERS.BMP", "NUMS_EX.BMP", "TEXT.BMP",
+            "EQMAIN.BMP", "EQ_EX.BMP", "PLEDIT.BMP", "GEN.BMP"
+        ]
+        for filename in filenames { _ = bitmap(named: filename) }
     }
 
     /// Exact generic-dialog compositor from Winamp's draw_embed.cpp.

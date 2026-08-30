@@ -16,12 +16,79 @@ final class PlaybackVisualizationState: ObservableObject {
     @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
 }
 
+/// High-frequency clock updates are isolated from transport and settings.
+/// A position tick must not invalidate every player and playlist view that
+/// observes PlaybackController.
+final class PlaybackClockState: ObservableObject {
+    @Published fileprivate(set) var position: Double = 0
+    @Published fileprivate(set) var pendingSeekPosition: Double?
+}
+
+/// Reuses all FFT storage. The spectrum queue is serial, so one workspace per
+/// transform size avoids heap traffic without adding synchronization.
+private final class FFTWorkspace {
+    let size: Int
+    private let halfSize: Int
+    private let log2Size: vDSP_Length
+    private let setup: FFTSetup
+    private var window: [Float]
+    private var windowed: [Float]
+    private var real: [Float]
+    private var imaginary: [Float]
+    private var power: [Float]
+
+    init?(size: Int) {
+        self.size = size
+        halfSize = size / 2
+        log2Size = vDSP_Length(log2(Float(size)))
+        guard let setup = vDSP_create_fftsetup(log2Size, FFTRadix(kFFTRadix2)) else { return nil }
+        self.setup = setup
+        window = Array(repeating: 0, count: size)
+        windowed = Array(repeating: 0, count: size)
+        real = Array(repeating: 0, count: halfSize)
+        imaginary = Array(repeating: 0, count: halfSize)
+        power = Array(repeating: 0, count: halfSize)
+        vDSP_hann_window(&window, vDSP_Length(size), Int32(vDSP_HANN_NORM))
+    }
+
+    deinit { vDSP_destroy_fftsetup(setup) }
+
+    func withPower<R>(samples: ArraySlice<Float>, _ body: ([Float]) -> R) -> R? {
+        guard samples.count >= size else { return nil }
+        let source = samples.suffix(size)
+        source.withUnsafeBufferPointer { sourceBuffer in
+            window.withUnsafeBufferPointer { windowBuffer in
+                vDSP_vmul(sourceBuffer.baseAddress!, 1, windowBuffer.baseAddress!, 1,
+                          &windowed, 1, vDSP_Length(size))
+            }
+        }
+        windowed.withUnsafeMutableBufferPointer { sourceBuffer in
+            real.withUnsafeMutableBufferPointer { realBuffer in
+                imaginary.withUnsafeMutableBufferPointer { imaginaryBuffer in
+                    var split = DSPSplitComplex(realp: realBuffer.baseAddress!, imagp: imaginaryBuffer.baseAddress!)
+                    sourceBuffer.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) {
+                        vDSP_ctoz($0, 2, &split, 1, vDSP_Length(halfSize))
+                    }
+                    vDSP_fft_zrip(setup, &split, 1, log2Size, FFTDirection(FFT_FORWARD))
+                    vDSP_zvmags(&split, 1, &power, 1, vDSP_Length(halfSize))
+                }
+            }
+        }
+        power[0] = real[0] * real[0]
+        return body(power)
+    }
+}
+
 final class PlaybackController: NSObject, ObservableObject {
     var onTrackFinished: (() -> Void)?
     @Published private(set) var title = "MACAMP — READY"
     @Published private(set) var isPlaying = false
     @Published private(set) var isPaused = false
-    @Published var position: Double = 0
+    let clock = PlaybackClockState()
+    var position: Double {
+        get { clock.position }
+        set { clock.position = newValue }
+    }
     @Published private(set) var duration: Double = 0
     @Published private(set) var bitrateKbps: Int?
     @Published private(set) var sampleRateKHz: Int?
@@ -32,7 +99,10 @@ final class PlaybackController: NSObject, ObservableObject {
     @Published private(set) var hasPlaybackError = false
     /// Keeps UI seeking ahead of a stale timer tick while the player node
     /// replaces its scheduled segment.
-    @Published private(set) var pendingSeekPosition: Double?
+    private(set) var pendingSeekPosition: Double? {
+        get { clock.pendingSeekPosition }
+        set { clock.pendingSeekPosition = newValue }
+    }
     let visualization = PlaybackVisualizationState()
     @Published var volume: Double = 0.8 { didSet { playerNode.volume = Float(volume) } }
     @Published var balance: Double = 0 { didSet { playerNode.pan = Float(min(1, max(-1, balance))) } }
@@ -78,10 +148,14 @@ final class PlaybackController: NSObject, ObservableObject {
     /// seeking and decoding the source file just to draw the visualizer.
     private let analysisSamplesLock = NSLock()
     private var liveAnalysisSamples = Array(repeating: Float(0), count: 1_024)
+    private var analysisSnapshot = Array(repeating: Float(0), count: 1_024)
     private var liveAnalysisSampleCount = 0
     private var liveAnalysisSampleRate = 0.0
     private var timer: Timer?
     private var scopedURL: URL?
+    /// The playlist is the authority for the user-facing track name. Keep it
+    /// separately from transient states such as OPENING and decoder errors.
+    private var preferredDisplayTitle = ""
     private var hasSecurityScope = false
     private var scheduledStartFrame: AVAudioFramePosition = 0
     /// Invalidates completion handlers from segments replaced by seek/restart.
@@ -105,23 +179,12 @@ final class PlaybackController: NSObject, ObservableObject {
     /// benefit from the more expensive window needed by Adaptive EQ.
     private let visualFFTSize = 512
     private var fftSize: Int { equalizer.adaptiveConfiguration.fftSize }
-    private lazy var adaptiveFFTSetup: FFTSetup? = {
-        vDSP_create_fftsetup(vDSP_Length(log2(Float(fftSize))), FFTRadix(kFFTRadix2))
-    }()
+    private lazy var adaptiveFFTWorkspace = FFTWorkspace(size: fftSize)
+    private lazy var visualFFTWorkspace = FFTWorkspace(size: visualFFTSize)
     private var smoothedBandEnergy = Array(repeating: -60.0, count: 10)
     private var hasAdaptiveAnalysisHistory = false
     private static let shufflePreferenceKey = "macAmp.playback.shuffleEnabled"
     private static let repeatPreferenceKey = "macAmp.playback.repeatEnabled"
-    private lazy var fftWindow: [Float] = {
-        var window = [Float](repeating: 0, count: fftSize)
-        vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
-        return window
-    }()
-    private lazy var visualFFTWindow: [Float] = {
-        var window = [Float](repeating: 0, count: visualFFTSize)
-        vDSP_hann_window(&window, vDSP_Length(visualFFTSize), Int32(vDSP_HANN_NORM))
-        return window
-    }()
 
     override init() {
         super.init()
@@ -141,7 +204,6 @@ final class PlaybackController: NSObject, ObservableObject {
         timer?.invalidate()
         if let streamingTimeObserver { streamingPlayer?.removeTimeObserver(streamingTimeObserver) }
         engine.mainMixerNode.removeTap(onBus: 0)
-        if let adaptiveFFTSetup { vDSP_destroy_fftsetup(adaptiveFFTSetup) }
         engine.stop()
     }
 
@@ -241,7 +303,14 @@ final class PlaybackController: NSObject, ObservableObject {
         guard isInterfaceVisible != visible else { return }
         isInterfaceVisible = visible
         updateLiveAnalysisTap()
-        if isPlaying { startTimer() }
+        if let streamingPlayer {
+            installStreamingTimeObserver(on: streamingPlayer)
+            return
+        }
+        // AVPlayer owns its own periodic observer; installing the engine timer
+        // as well would create a second wakeup source that can never produce a
+        // position because streaming playback has no sourceFile.
+        if isPlaying, streamingPlayer == nil { startTimer() }
     }
 
     /// Preserve playback while a connected player-window group is dragged,
@@ -297,6 +366,7 @@ final class PlaybackController: NSObject, ObservableObject {
     private func applyEqualizer() {
         equalizerNode.globalGain = Float(equalizer.preamp)
         for (band, value) in zip(equalizerNode.bands, equalizer.bands) { band.gain = Float(value) }
+        equalizerNode.bypass = !hasEffectiveEqualizerCorrection
         updateLiveAnalysisTap()
 
         // Bypassing AVAudioUnitEQ still leaves its ten filters on the render
@@ -311,7 +381,7 @@ final class PlaybackController: NSObject, ObservableObject {
         engine.disconnectNodeOutput(equalizerNode)
         routesThroughEqualizer = equalizer.isEnabled
         if routesThroughEqualizer {
-            equalizerNode.bypass = false
+            equalizerNode.bypass = !hasEffectiveEqualizerCorrection
             engine.connect(playerNode, to: equalizerNode, format: format)
             engine.connect(equalizerNode, to: engine.mainMixerNode, format: format)
         } else {
@@ -319,6 +389,15 @@ final class PlaybackController: NSObject, ObservableObject {
             engine.connect(playerNode, to: engine.mainMixerNode, format: format)
         }
         updateLiveAnalysisTap()
+    }
+
+    /// A flat EQ should be acoustically identical to a direct route. Keeping
+    /// the unit connected makes later slider changes cheap, while bypassing it
+    /// lets Core Audio skip ten inactive filters during ordinary playback.
+    private var hasEffectiveEqualizerCorrection: Bool {
+        guard equalizer.isEnabled else { return false }
+        if abs(equalizer.preamp) >= 0.001 { return true }
+        return equalizer.bands.contains { abs($0) >= 0.001 }
     }
 
     /// Changing a graph connection requires stopping the engine. Preserve the
@@ -362,22 +441,28 @@ final class PlaybackController: NSObject, ObservableObject {
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
         guard shouldInstall else { return }
-        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4_096, format: nil) { [weak self] buffer, _ in
             guard let self,
                   let channels = buffer.floatChannelData else { return }
             let count = min(Int(buffer.frameLength), self.liveAnalysisSamples.count)
             guard count > 0 else { return }
+            let sourceOffset = max(0, Int(buffer.frameLength) - count)
             self.analysisSamplesLock.lock()
             let channelCount = Int(buffer.format.channelCount)
             if channelCount == 1 {
                 self.liveAnalysisSamples.withUnsafeMutableBufferPointer {
-                    $0.baseAddress!.update(from: channels[0], count: count)
+                    $0.baseAddress!.update(from: channels[0].advanced(by: sourceOffset), count: count)
                 }
             } else {
-                for sample in 0..<count {
-                    var mixed: Float = 0
-                    for channel in 0..<channelCount { mixed += channels[channel][sample] }
-                    self.liveAnalysisSamples[sample] = mixed / Float(channelCount)
+                self.liveAnalysisSamples.withUnsafeMutableBufferPointer { destination in
+                    let output = destination.baseAddress!
+                    output.update(from: channels[0].advanced(by: sourceOffset), count: count)
+                    for channel in 1..<channelCount {
+                        vDSP_vadd(output, 1, channels[channel].advanced(by: sourceOffset), 1,
+                                  output, 1, vDSP_Length(count))
+                    }
+                    var scale = Float(1) / Float(channelCount)
+                    vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(count))
                 }
             }
             self.liveAnalysisSampleCount = count
@@ -406,7 +491,7 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     /// PlaylistManager owns selection; the audio engine only opens the chosen URL.
-    func open(_ requestedURL: URL, bookmarkData: Data? = nil) {
+    func open(_ requestedURL: URL, bookmarkData: Data? = nil, displayTitle: String? = nil) {
         let url: URL
         if let bookmarkData {
             var isStale = false
@@ -423,6 +508,12 @@ final class PlaybackController: NSObject, ObservableObject {
             url = resolvedURL
         } else {
             url = requestedURL
+        }
+        let playlistTitle = displayTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let playlistTitle, !playlistTitle.isEmpty {
+            preferredDisplayTitle = playlistTitle
+        } else {
+            preferredDisplayTitle = url.deletingPathExtension().lastPathComponent.uppercased()
         }
         fileOpenGeneration &+= 1
         let generation = fileOpenGeneration
@@ -504,7 +595,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.hasSecurityScope = obtainedSecurityScope
             self.position = 0
             self.scheduledStartFrame = 0
-            self.title = url.deletingPathExtension().lastPathComponent.uppercased()
+            self.title = self.preferredDisplayTitle
             // Reading AVAudioFile.length can make AVFoundation scan a large
             // VBR file end-to-end, particularly on a network volume. Start
             // decoding first; duration remains unknown until it can be read
@@ -529,6 +620,17 @@ final class PlaybackController: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
             self?.startStreamingFallback(for: url, generation: generation)
         }
+    }
+
+    /// Metadata scanning may finish after playback has already started. This
+    /// keeps the main ticker synchronized with the live playlist row without
+    /// replacing OPENING or an error message prematurely.
+    func updateDisplayTitle(_ value: String) {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        preferredDisplayTitle = normalized
+        guard title != "OPENING…", !hasPlaybackError, currentURL != nil else { return }
+        title = normalized
     }
 
     private func startStreamingFallback(for url: URL, generation: Int) {
@@ -581,7 +683,7 @@ final class PlaybackController: NSObject, ObservableObject {
                         self.timer?.invalidate(); self.timer = nil
                         self.duration = item.duration.seconds.isFinite ? max(0, item.duration.seconds) : 0
                         self.position = 0
-                        self.title = url.deletingPathExtension().lastPathComponent.uppercased()
+                        self.title = self.preferredDisplayTitle
                         self.loadStreamingBitrate(for: url, generation: generation)
                         self.installStreamingTimeObserver(on: player)
                         player.play()
@@ -595,7 +697,7 @@ final class PlaybackController: NSObject, ObservableObject {
     private func installStreamingTimeObserver(on player: AVPlayer) {
         if let streamingTimeObserver { player.removeTimeObserver(streamingTimeObserver) }
         streamingTimeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
+            forInterval: CMTime(seconds: isInterfaceVisible ? 0.25 : 1.0, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             guard let self, self.streamingPlayer === player else { return }
             guard !self.isVisualUpdatesSuspended else { return }
@@ -821,8 +923,6 @@ final class PlaybackController: NSObject, ObservableObject {
         let now = Date()
         let needsAdaptiveAnalysis = equalizer.isEnabled && equalizer.isAdaptiveEnabled && now.timeIntervalSince(lastAdaptiveAnalysis) >= adaptiveAnalysisInterval
         if needsAdaptiveAnalysis { lastAdaptiveAnalysis = now }
-        let adaptiveWindow = fftWindow
-        let visualWindow = visualFFTWindow
         let analysisSize = needsAdaptiveAnalysis ? fftSize : visualFFTSize
         spectrumQueue.async { [weak self] in
             guard let self else { return }
@@ -830,20 +930,24 @@ final class PlaybackController: NSObject, ObservableObject {
             self.analysisSamplesLock.lock()
             let available = self.liveAnalysisSampleCount
             let sampleRate = self.liveAnalysisSampleRate
-            let samples = Array(self.liveAnalysisSamples.prefix(available))
+            if available > 0 {
+                self.analysisSnapshot.withUnsafeMutableBufferPointer { destination in
+                    self.liveAnalysisSamples.withUnsafeBufferPointer { source in
+                        destination.baseAddress!.update(from: source.baseAddress!, count: available)
+                    }
+                }
+            }
             self.analysisSamplesLock.unlock()
-            guard sampleRate > 0, samples.count >= analysisSize else { return }
-            let latestSamples = Array(samples.suffix(visualFFTSize))
-            // The two FFT passes are needed only by AUTO EQ. The visualizer
-            // uses its own lightweight band sampler, so do not pay for DSP
-            // that cannot affect playback while AUTO is disabled.
+            guard sampleRate > 0, available >= analysisSize else { return }
+            let samples = self.analysisSnapshot.prefix(available)
+            let latestSamples = samples.suffix(self.visualFFTSize)
             let decibels = needsAdaptiveAnalysis
-                ? self.bandDecibels(samples: samples, window: adaptiveWindow, sampleRate: sampleRate)
+                ? self.bandDecibels(samples: samples, sampleRate: sampleRate)
                 : []
             // The skin contains fifteen physical LED rows.  Quantize before
             // publishing so imperceptible floating-point changes do not cause
             // another complete SwiftUI update.
-            let levels = self.visualLevels(samples: latestSamples, window: visualWindow, sampleRate: sampleRate)
+            let levels = self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
                 .map { CGFloat(Int(($0 * 15).rounded(.down))) / 15 }
             let waveform: [CGFloat] = includesWaveform
                 ? (0..<76).map { CGFloat(min(1, max(-1, latestSamples[min(self.visualFFTSize - 1, $0 * (self.visualFFTSize - 1) / 75)]))) }
@@ -857,71 +961,38 @@ final class PlaybackController: NSObject, ObservableObject {
         }
     }
 
-    private func monoSamples(channels: UnsafePointer<UnsafeMutablePointer<Float>>, channelCount: Int, count: Int) -> [Float] {
-        guard channelCount > 1 else { return Array(UnsafeBufferPointer(start: channels[0], count: count)) }
-        var mono = [Float](repeating: 0, count: count)
-        for channelIndex in 0..<channelCount {
-            vDSP_vadd(mono, 1, channels[channelIndex], 1, &mono, 1, vDSP_Length(count))
-        }
-        var divisor = Float(1.0 / Double(channelCount))
-        vDSP_vsmul(mono, 1, &divisor, &mono, 1, vDSP_Length(count))
-        return mono
-    }
-
     /// The tap already receives the current decoded PCM window, so one FFT is
     /// enough for AUTO EQ; the former second pass only existed to compensate
     /// for repeatedly seeking through the source file.
-    private func bandDecibels(samples: [Float], window: [Float], sampleRate: Double) -> [Double] {
-        let power = fftPower(Array(samples.suffix(fftSize)), window: window)
+    private func bandDecibels(samples: ArraySlice<Float>, sampleRate: Double) -> [Double] {
         let frequencies = EqualizerController.frequencies.map(Double.init)
-        return frequencies.enumerated().map { index, frequency in
-            let lower = index == 0 ? frequency / sqrt(frequencies[1] / frequency) : sqrt(frequencies[index - 1] * frequency)
-            let upper = index == frequencies.count - 1 ? frequency * sqrt(frequency / frequencies[index - 1]) : sqrt(frequency * frequencies[index + 1])
-            let lowBin = max(1, Int(floor(lower * Double(fftSize) / sampleRate)))
-            let highBin = min(fftSize / 2 - 1, max(lowBin, Int(ceil(upper * Double(fftSize) / sampleRate))))
-            let meanPower = power[lowBin...highBin].reduce(0, +) / Double(highBin - lowBin + 1)
-            return 10 * log10(max(meanPower, 1e-12))
-        }
+        return adaptiveFFTWorkspace?.withPower(samples: samples) { power in
+            frequencies.enumerated().map { index, frequency in
+                let lower = index == 0 ? frequency / sqrt(frequencies[1] / frequency) : sqrt(frequencies[index - 1] * frequency)
+                let upper = index == frequencies.count - 1 ? frequency * sqrt(frequency / frequencies[index - 1]) : sqrt(frequency * frequencies[index + 1])
+                let lowBin = max(1, Int(floor(lower * Double(fftSize) / sampleRate)))
+                let highBin = min(fftSize / 2 - 1, max(lowBin, Int(ceil(upper * Double(fftSize) / sampleRate))))
+                var sum: Float = 0
+                for bin in lowBin...highBin { sum += power[bin] }
+                let meanPower = Double(sum) / Double(highBin - lowBin + 1)
+                return 10 * log10(max(meanPower, 1e-12))
+            }
+        } ?? Array(repeating: -120, count: frequencies.count)
     }
 
-    private func fftPower(_ samples: [Float], window: [Float]) -> [Double] {
-        var windowed = zip(samples, window).map(*)
-        let halfSize = fftSize / 2
-        var real = [Float](repeating: 0, count: halfSize)
-        var imaginary = [Float](repeating: 0, count: halfSize)
-        let log2Size = vDSP_Length(log2(Float(fftSize)))
-        guard let setup = adaptiveFFTSetup else { return Array(repeating: 0, count: halfSize) }
-        windowed.withUnsafeMutableBufferPointer { source in
-            real.withUnsafeMutableBufferPointer { realBuffer in
-                imaginary.withUnsafeMutableBufferPointer { imaginaryBuffer in
-                    var split = DSPSplitComplex(realp: realBuffer.baseAddress!, imagp: imaginaryBuffer.baseAddress!)
-                    source.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) {
-                        vDSP_ctoz($0, 2, &split, 1, vDSP_Length(halfSize))
-                    }
-                    vDSP_fft_zrip(setup, &split, 1, log2Size, FFTDirection(FFT_FORWARD))
-                }
+    /// A single 512-point FFT replaces sixteen independent Goertzel scans.
+    /// The classic display has only sixteen columns, so nearest-bin sampling
+    /// is both sufficient and substantially cheaper.
+    private func visualLevels(samples: ArraySlice<Float>, sampleRate: Double) -> [CGFloat] {
+        visualFFTWorkspace?.withPower(samples: samples) { power in
+            (0..<16).map { index in
+                let frequency = min(sampleRate / 2 - 1, 45 * pow(2, Double(index) * 8.7 / 15))
+                let bin = min(power.count - 1, max(1, Int((Double(visualFFTSize) * frequency / sampleRate).rounded())))
+                let magnitude = sqrt(Double(max(0, power[bin]))) / Double(visualFFTSize / 2)
+                let db = 20 * log10(max(magnitude, 0.000_000_1))
+                return CGFloat(min(1, max(0, (db + 65) / 65)))
             }
-        }
-        var power = zip(real, imaginary).map { Double($0 * $0 + $1 * $1) }
-        power[0] = Double(real[0] * real[0])
-        return power
-    }
-
-    private func visualLevels(samples: [Float], window: [Float], sampleRate: Double) -> [CGFloat] {
-        let sampleCount = samples.count
-        return (0..<16).map { index in
-            let frequency = min(sampleRate / 2 - 1, 45 * pow(2, Double(index) * 8.7 / 15))
-            let bin = max(1, Int((Double(sampleCount) * frequency / sampleRate).rounded()))
-            let coefficient = 2 * cos(2 * Double.pi * Double(bin) / Double(sampleCount))
-            var p1 = 0.0, p2 = 0.0
-            for sampleIndex in 0..<sampleCount {
-                let p0 = Double(samples[sampleIndex] * window[sampleIndex]) + coefficient * p1 - p2
-                p2 = p1; p1 = p0
-            }
-            let power = p2 * p2 + p1 * p1 - coefficient * p1 * p2
-            let db = 20 * log10(max(sqrt(max(0, power)) / Double(sampleCount / 2), 0.000_000_1))
-            return CGFloat(min(1, max(0, (db + 65) / 65)))
-        }
+        } ?? Array(repeating: 0, count: 16)
     }
 
     private func updateAdaptiveEqualizer(with levels: [Double]) {
