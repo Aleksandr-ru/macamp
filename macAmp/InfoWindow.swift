@@ -170,7 +170,7 @@ final class InfoPanelView: NSView {
     private var observation = Set<AnyCancellable>()
     private var closePressed = false
     private var isRebuilding = false
-    private var laidOutContentWidth: CGFloat = -.greatestFiniteMagnitude
+    private var laidOutContentSize = NSSize(width: -.greatestFiniteMagnitude, height: -.greatestFiniteMagnitude)
 
     init(model: InfoWindowModel, scale: InterfaceScale, fontScale: PlaylistFontScale, focus: WindowFocusState,
          onClose: @escaping () -> Void, onResize: @escaping (CGFloat, CGFloat) -> Void,
@@ -200,13 +200,13 @@ final class InfoPanelView: NSView {
             DispatchQueue.main.async {
                 self?.needsDisplay = true
                 self?.needsLayout = true
-                self?.laidOutContentWidth = -.greatestFiniteMagnitude
+                self?.laidOutContentSize = NSSize(width: -.greatestFiniteMagnitude, height: -.greatestFiniteMagnitude)
                 self?.rebuildContent(resetScrollPosition: true)
             }
         }.store(in: &observation)
         fontScale.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async {
-                self?.laidOutContentWidth = -.greatestFiniteMagnitude
+                self?.laidOutContentSize = NSSize(width: -.greatestFiniteMagnitude, height: -.greatestFiniteMagnitude)
                 self?.rebuildContent(resetScrollPosition: false)
             }
         }.store(in: &observation)
@@ -238,8 +238,13 @@ final class InfoPanelView: NSView {
     override func layout() {
         super.layout()
         scrollView.frame = contentRect
-        let width = scrollView.contentSize.width
-        if abs(width - laidOutContentWidth) > 0.5 { rebuildContent() }
+        let contentSize = scrollView.contentSize
+        // Height is part of the layout decision: a resize can cross the
+        // 3:2 threshold without changing the available width.
+        if abs(contentSize.width - laidOutContentSize.width) > 0.5
+            || abs(contentSize.height - laidOutContentSize.height) > 0.5 {
+            rebuildContent()
+        }
     }
 
     private func makeLabel(_ text: String, alignment: NSTextAlignment = .left,
@@ -277,17 +282,30 @@ final class InfoPanelView: NSView {
         defer { isRebuilding = false }
         documentView.subviews.forEach { $0.removeFromSuperview() }
 
-        let width = max(1, scrollView.contentSize.width)
-        laidOutContentWidth = width
+        let contentSize = scrollView.contentSize
+        let width = max(1, contentSize.width)
+        laidOutContentSize = contentSize
         let inset = 8 * pixelScale
         let usableWidth = max(1, width - inset * 2)
         let spacing = 8 * pixelScale
+        // A window at least 50% wider than its content area is rendered as
+        // two equal columns. This is evaluated for both initial display and
+        // every resize in `layout()`.
+        let usesTwoColumnLayout = contentSize.width >= contentSize.height * 1.5
+        let outerColumnGap = usesTwoColumnLayout ? spacing : 0
+        let columnWidth = usesTwoColumnLayout
+            ? max(1, (usableWidth - outerColumnGap) * 0.5)
+            : usableWidth
+        let leftColumnX = inset
+        let rightColumnX = leftColumnX + columnWidth + outerColumnGap
         var y = inset
+        var leftArtworkHeight: CGFloat = 0
         func addLabel(_ text: String, alignment: NSTextAlignment = .left,
-                      lineBreakMode: NSLineBreakMode = .byWordWrapping, height: CGFloat? = nil) {
+                      lineBreakMode: NSLineBreakMode = .byWordWrapping, height: CGFloat? = nil,
+                      x: CGFloat = inset, width: CGFloat = usableWidth) {
             let label = makeLabel(text, alignment: alignment, lineBreakMode: lineBreakMode)
-            let rowHeight = height ?? textHeight(text, width: usableWidth, lineBreakMode: lineBreakMode)
-            label.frame = NSRect(x: inset, y: y, width: usableWidth, height: rowHeight)
+            let rowHeight = height ?? textHeight(text, width: width, lineBreakMode: lineBreakMode)
+            label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
             documentView.addSubview(label)
             y += rowHeight + spacing
         }
@@ -299,36 +317,47 @@ final class InfoPanelView: NSView {
             // excluded), while a narrower live window still clips it to the
             // available width.
             let minimumWindowArtworkWidth = max(1, CGFloat(skin.genericMinimumWindowWidth(title: "Info") - 35) * pixelScale)
-            let imageWidth = min(artworkSize.width * pixelScale, usableWidth, minimumWindowArtworkWidth)
+            let imageWidth = min(artworkSize.width * pixelScale, columnWidth, minimumWindowArtworkWidth)
             let imageHeight = imageWidth * artworkSize.height / artworkSize.width
             let image = InfoArtworkView(image: artwork)
-            image.frame = NSRect(x: (width - imageWidth) * 0.5, y: y, width: imageWidth, height: imageHeight)
+            let imageX = usesTwoColumnLayout
+                ? leftColumnX + (columnWidth - imageWidth) * 0.5
+                : (width - imageWidth) * 0.5
+            image.frame = NSRect(x: imageX, y: y, width: imageWidth, height: imageHeight)
             documentView.addSubview(image)
-            y += imageHeight + spacing
+            if usesTwoColumnLayout {
+                leftArtworkHeight = imageHeight
+            } else {
+                y += imageHeight + spacing
+            }
         }
 
         let rating = InfoRatingView(rating: model.content.rating, font: NSFont.monospacedSystemFont(ofSize: 16 * pixelScale, weight: .regular), color: skin.playlistColors().normalText)
-        rating.frame = NSRect(x: 0, y: y, width: width, height: max(18 * pixelScale, rating.intrinsicContentSize.height))
+        rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
+                              width: usesTwoColumnLayout ? columnWidth : width,
+                              height: max(18 * pixelScale, rating.intrinsicContentSize.height))
         documentView.addSubview(rating)
         y += rating.frame.height + spacing
 
         let gap = 8 * pixelScale
-        let columnWidth = max(1, (usableWidth - gap) * 0.5)
+        let tableColumnWidth = max(1, (columnWidth - gap) * 0.5)
         let tableFont = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
         let tableColor = skin.playlistColors().normalText
         for field in model.content.fields {
             let key = InfoWrappedTextView(text: field.label, font: tableFont, color: tableColor, alignment: .right)
             let value = InfoWrappedTextView(text: field.value, font: tableFont, color: tableColor, alignment: .left)
-            let rowHeight = max(key.requiredHeight(for: columnWidth), value.requiredHeight(for: columnWidth))
-            key.frame = NSRect(x: inset, y: y, width: columnWidth, height: rowHeight)
-            value.frame = NSRect(x: inset + columnWidth + gap, y: y, width: columnWidth, height: rowHeight)
+            let rowHeight = max(key.requiredHeight(for: tableColumnWidth), value.requiredHeight(for: tableColumnWidth))
+            let tableX = usesTwoColumnLayout ? rightColumnX : inset
+            key.frame = NSRect(x: tableX, y: y, width: tableColumnWidth, height: rowHeight)
+            value.frame = NSRect(x: tableX + tableColumnWidth + gap, y: y, width: tableColumnWidth, height: rowHeight)
             documentView.addSubview(key); documentView.addSubview(value)
             y += rowHeight + spacing
         }
-        if let lyrics = model.content.lyrics { addLabel(lyrics, alignment: .center) }
-        if let comment = model.content.comment { addLabel(comment, alignment: .center) }
-        if let webURL = model.content.webURL { addLabel(webURL, alignment: .center) }
-        if let copyright = model.content.copyright { addLabel(copyright, alignment: .center) }
+        let detailX = usesTwoColumnLayout ? rightColumnX : inset
+        if let lyrics = model.content.lyrics { addLabel(lyrics, alignment: .center, x: detailX, width: columnWidth) }
+        if let comment = model.content.comment { addLabel(comment, alignment: .center, x: detailX, width: columnWidth) }
+        if let webURL = model.content.webURL { addLabel(webURL, alignment: .center, x: detailX, width: columnWidth) }
+        if let copyright = model.content.copyright { addLabel(copyright, alignment: .center, x: detailX, width: columnWidth) }
         if let filename = model.content.url?.lastPathComponent, !filename.isEmpty {
             let filenameView = InfoWrappedTextView(
                 text: filename,
@@ -336,16 +365,16 @@ final class InfoPanelView: NSView {
                 color: skin.playlistColors().normalText,
                 alignment: .center
             )
-            let filenameHeight = filenameView.requiredHeight(for: usableWidth)
-            filenameView.frame = NSRect(x: inset, y: y, width: usableWidth, height: filenameHeight)
+            let filenameHeight = filenameView.requiredHeight(for: columnWidth)
+            filenameView.frame = NSRect(x: detailX, y: y, width: columnWidth, height: filenameHeight)
             documentView.addSubview(filenameView)
             y += filenameHeight + spacing
         }
         if !model.content.technicalInfo.isEmpty {
-            addLabel(model.content.technicalInfo.joined(separator: "   "), alignment: .center)
+            addLabel(model.content.technicalInfo.joined(separator: "   "), alignment: .center, x: detailX, width: columnWidth)
         }
 
-        let height = max(scrollView.contentSize.height, y - spacing + inset)
+        let height = max(scrollView.contentSize.height, y - spacing + inset, leftArtworkHeight + inset * 2)
         documentView.frame = NSRect(x: 0, y: 0, width: width, height: height)
         if resetScrollPosition {
             // Info always begins with APIC (when present).  NSScrollView can

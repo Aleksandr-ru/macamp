@@ -495,17 +495,20 @@ final class PlaybackController: NSObject, ObservableObject {
         let url: URL
         if let bookmarkData {
             var isStale = false
-            guard let resolvedURL = try? URL(
+            if let resolvedURL = try? URL(
                 resolvingBookmarkData: bookmarkData,
                 options: .withSecurityScope,
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
-            ) else {
-                hasPlaybackError = true
-                title = "SOURCE UNAVAILABLE"
-                return
+            ) {
+                url = resolvedURL
+            } else {
+                // Invalid persistent access must not suppress the original
+                // URL. Unsandboxed Debug builds can still read it directly;
+                // sandboxed builds will report a real access failure from the
+                // normal AVAudioFile/AVPlayer opening path below.
+                url = requestedURL
             }
-            url = resolvedURL
         } else {
             url = requestedURL
         }

@@ -830,7 +830,33 @@ final class PlaylistManager: ObservableObject {
         activePlaylistID = snapshot.activePlaylistID
         focusedPlaylistID = snapshot.focusedPlaylistID
         playingEntryID = snapshot.playingEntryID
-        playlists = snapshot.playlists.map { p in let model = PlaylistModel(id: p.id, name: p.name, entries: p.entries.map { storedEntry in let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark) ?? storedEntry.url; return PlaylistEntry(id: storedEntry.id, url: resolvedURL, bookmarkData: storedEntry.bookmark, title: storedEntry.title, duration: storedEntry.duration, metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata) }, fileURL: p.fileURL); model.isVisible = p.visible; model.isWindowShaded = p.shaded; model.windowFrame = p.frame; model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }; model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }; model.selectedIDs = Set(p.selection ?? []); model.scrollPosition = p.scrollPosition ?? 0; model.lastPlayedEntryID = p.lastPlayedEntryID; return model }
+        playlists = snapshot.playlists.map { p in
+            let entries = p.entries.map { storedEntry in
+                let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark)
+                // Ad-hoc Debug signatures cannot retain an app-scoped
+                // bookmark across rebuilds. Keeping that now-invalid data
+                // would make playback reject an otherwise readable stored
+                // URL merely because `bookmarkData` is non-nil.
+                return PlaylistEntry(
+                    id: storedEntry.id,
+                    url: resolvedURL ?? storedEntry.url,
+                    bookmarkData: resolvedURL == nil ? nil : storedEntry.bookmark,
+                    title: storedEntry.title,
+                    duration: storedEntry.duration,
+                    metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata
+                )
+            }
+            let model = PlaylistModel(id: p.id, name: p.name, entries: entries, fileURL: p.fileURL)
+            model.isVisible = p.visible
+            model.isWindowShaded = p.shaded
+            model.windowFrame = p.frame
+            model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }
+            model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }
+            model.selectedIDs = Set(p.selection ?? [])
+            model.scrollPosition = p.scrollPosition ?? 0
+            model.lastPlayedEntryID = p.lastPlayedEntryID
+            return model
+        }
     }
 
     private func securityScopedBookmark(for url: URL) -> Data? {
