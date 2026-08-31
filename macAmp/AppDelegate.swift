@@ -315,6 +315,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AppDelegate.shared = self
         restorePersistentState()
         playback.onTrackFinished = { [weak self] in self?.advancePlaylistAfterTrackFinished() }
+        playback.onPlaybackError = { [weak self] url in
+            guard let self else { return }
+            self.playlistManager.markPlaybackErrorForActiveEntry(url: url)
+            self.advancePlaylistAfterTrackFinished()
+        }
+        playback.onPlaybackReady = { [weak self] url in
+            self?.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
+        }
         // Create the SwiftUI view that provides the window contents.
         let contentView = ContentView(
             playback: playback,
@@ -437,6 +445,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
+        if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
         if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
@@ -532,6 +541,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
         playlistManager.removeSelected(from: playlist)
+        return true
+    }
+
+    /// Option+Delete is local to the key Playlist Editor.  It must never
+    /// remove rows from another playlist merely because that playlist happens
+    /// to be the global playback source.
+    private func handlePlaylistErrorRemovalShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 51 || event.keyCode == 117, // Delete / Forward Delete
+              modifiers.contains(.option),
+              modifiers.intersection([.command, .control, .shift]).isEmpty,
+              let sourceWindow = event.window,
+              sourceWindow.isKeyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID) else {
+            return false
+        }
+        playlistManager.removePlaybackErrorEntries(from: playlist)
         return true
     }
 
@@ -1228,7 +1257,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel) {
         guard let entry else {
-            if playback.isRepeatEnabled, let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID }) {
+            if playback.isRepeatEnabled,
+               let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
                 playlistManager.play(current, in: playlist)
                 playback.open(current.url, bookmarkData: current.bookmarkData, displayTitle: current.title)
                 observePlayingEntryTitle(current)
@@ -1236,6 +1266,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
+        // Error-marked rows are retried only through a direct double-click in
+        // the Playlist Editor (playPlaylistEntryFromSelection below).
+        guard !entry.hasPlaybackError else { return }
         playlistManager.play(entry, in: playlist)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
@@ -1246,6 +1279,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// same Info Target reset semantics as every other transport command.
     func playPlaylistEntryFromSelection(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
         resetInfoTarget()
+        // A direct row activation is the sole retry route for a failed item.
+        // Keep its marker until PlaybackController confirms it opened.
         playlistManager.play(entry, in: playlist, revealIfNeeded: false)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
@@ -1283,7 +1318,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let next = playlistManager.entryToPlay(in: playlist, step: 1, shuffle: playback.isShuffleEnabled) {
             playPlaylistEntry(next, in: playlist)
         } else if playback.isRepeatEnabled,
-                  let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID }) {
+                  let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
             playPlaylistEntry(current, in: playlist)
         } else {
             playback.stop()
@@ -1331,6 +1366,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func removeSelectedFromActivePlaylist() {
         if let playlist = playlistManager.editingPlaylist { playlistManager.removeSelected(from: playlist) }
+    }
+
+    func removePlaybackErrorEntriesFromActivePlaylist() {
+        if let playlist = playlistManager.editingPlaylist {
+            playlistManager.removePlaybackErrorEntries(from: playlist)
+        }
     }
 
     func clearActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.clear(playlist) } }
@@ -2366,7 +2407,7 @@ private struct PlaylistView: View {
     private var playlistBottomControls: some View {
         ZStack(alignment: .topLeading) {
             playlistMenuHotspot(x: 25, index: 0, titles: ["Add Files…", "Add Folder…", "Add URL…"])
-            playlistMenuHotspot(x: 54, index: 1, titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove: Other…"])
+            playlistMenuHotspot(x: 54, index: 1, titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove with Error"])
             playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"])
             playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Sort…", "Misc…"])
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: ["New Playlist", "Load Playlist…", "Save Playlist As…", "Clear Playlist"])
@@ -2401,12 +2442,13 @@ private struct PlaylistView: View {
                         Button(action: { playlist.selectedIDs = [entry.id]; AppDelegate.shared?.selectInfoTarget(entry) }) {
                             let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
                             let isSelected = playlist.selectedIDs.contains(entry.id)
+                            let rowLabel = entry.hasPlaybackError ? "!" : String(index + 1)
                             HStack(spacing: 3) {
                                 // `Text` string interpolation is localised by
                                 // SwiftUI and can insert a thousands separator
                                 // (e.g. "1 000") for Int values. Playlist row
                                 // numbers are identifiers, not quantities.
-                                Text(verbatim: "\(index + 1). \(entry.title)").lineLimit(1)
+                                Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
                                 Spacer(minLength: 2)
                                 Text(entry.duration.map(formattedTime) ?? "--:--")
                             }
@@ -2673,6 +2715,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Add Files…": AppDelegate.shared?.addFilesToActivePlaylist()
         case "Add Folder…": AppDelegate.shared?.addFolderToActivePlaylist()
         case "Remove Selected": AppDelegate.shared?.removeSelectedFromActivePlaylist()
+        case "Remove with Error": AppDelegate.shared?.removePlaybackErrorEntriesFromActivePlaylist()
         case "Clear Playlist": AppDelegate.shared?.clearActivePlaylist()
         case "Crop": AppDelegate.shared?.cropActivePlaylist()
         case "Select All": AppDelegate.shared?.selectAllInActivePlaylist()

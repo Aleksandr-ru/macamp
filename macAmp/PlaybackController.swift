@@ -81,6 +81,10 @@ private final class FFTWorkspace {
 
 final class PlaybackController: NSObject, ObservableObject {
     var onTrackFinished: (() -> Void)?
+    /// These callbacks identify the source rather than relying on a global UI
+    /// flag, so PlaylistManager can update only the entry being attempted.
+    var onPlaybackError: ((URL) -> Void)?
+    var onPlaybackReady: ((URL) -> Void)?
     @Published private(set) var title = "MACAMP — READY"
     @Published private(set) var isPlaying = false
     @Published private(set) var isPaused = false
@@ -418,8 +422,7 @@ final class PlaybackController: NSObject, ObservableObject {
             scheduledStartFrame = resumeFrame
             if wasPlaying { start(at: resumeFrame) }
         } catch {
-            hasPlaybackError = true
-            title = "AUDIO ENGINE ERROR"
+            reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
         }
     }
 
@@ -575,8 +578,7 @@ final class PlaybackController: NSObject, ObservableObject {
                     return
                 }
                 guard case let .success(file) = result else {
-                    self.hasPlaybackError = true
-                    self.title = "UNSUPPORTED AUDIO FILE"
+                    self.reportPlaybackError(for: url, title: "UNSUPPORTED AUDIO FILE")
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
                     return
                 }
@@ -611,8 +613,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.loadFormatDetails(for: url, file: file, generation: generation)
                 } catch {
                     self.sourceFile = nil
-                    self.hasPlaybackError = true
-                    self.title = "UNSUPPORTED AUDIO FILE"
+                    self.reportPlaybackError(for: url, title: "UNSUPPORTED AUDIO FILE")
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
                 }
             }
@@ -677,8 +678,7 @@ final class PlaybackController: NSObject, ObservableObject {
                                 self.stopStreamingPlayback()
                                 if self.hasSecurityScope { self.scopedURL?.stopAccessingSecurityScopedResource() }
                                 self.scopedURL = nil; self.hasSecurityScope = false
-                                self.hasPlaybackError = true
-                                self.title = "SOURCE UNAVAILABLE"
+                                self.reportPlaybackError(for: url, title: "SOURCE UNAVAILABLE")
                             }
                             return
                         }
@@ -810,14 +810,20 @@ final class PlaybackController: NSObject, ObservableObject {
         }
         updateLiveAnalysisTap()
         do { if !engine.isRunning { try engine.start() } } catch {
-            hasPlaybackError = true
-            title = "AUDIO ENGINE ERROR"
+            reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
             return
         }
         playerNode.play()
         isPlaying = true
         isPaused = false
+        if let scopedURL { onPlaybackReady?(scopedURL) }
         startTimer()
+    }
+
+    private func reportPlaybackError(for url: URL?, title: String) {
+        hasPlaybackError = true
+        self.title = title
+        if let url { onPlaybackError?(url) }
     }
 
     private func currentPlayedFrames() -> AVAudioFramePosition {

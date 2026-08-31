@@ -14,6 +14,9 @@ final class PlaylistEntry: ObservableObject, Identifiable {
     @Published var title: String
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
+    /// Runtime-only result of an unsuccessful read/playback attempt.  This is
+    /// deliberately absent from StoredEntry: a fresh launch retries files.
+    @Published var hasPlaybackError = false
 
     init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
         self.id = id; self.url = url; self.title = title ?? url.deletingPathExtension().lastPathComponent
@@ -420,11 +423,11 @@ final class PlaylistManager: ObservableObject {
     func preferredEntryToPlay(in playlist: PlaylistModel) -> PlaylistEntry? {
         if activePlaylistID == playlist.id,
            let current = playingEntryID,
-           let entry = playlist.entries.first(where: { $0.id == current }) { return entry }
+           let entry = playlist.entries.first(where: { $0.id == current && !$0.hasPlaybackError }) { return entry }
         if let previous = playlist.lastPlayedEntryID,
-           let entry = playlist.entries.first(where: { $0.id == previous }) { return entry }
-        if let selected = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) }) { return selected }
-        return playlist.entries.first
+           let entry = playlist.entries.first(where: { $0.id == previous && !$0.hasPlaybackError }) { return entry }
+        if let selected = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) && !$0.hasPlaybackError }) { return selected }
+        return playlist.entries.first(where: { !$0.hasPlaybackError })
     }
 
     func entryToPlay(in playlist: PlaylistModel, step: Int, shuffle: Bool) -> PlaylistEntry? {
@@ -433,14 +436,41 @@ final class PlaylistManager: ObservableObject {
             // A shuffle transition must make progress.  Keep the only entry
             // eligible, but never immediately choose the currently playing
             // one when another track exists.
-            let alternatives = playlist.entries.filter { $0.id != playingEntryID }
-            return (alternatives.isEmpty ? playlist.entries : alternatives).randomElement()
+            let eligible = playlist.entries.filter { !$0.hasPlaybackError }
+            let alternatives = eligible.filter { $0.id != playingEntryID }
+            return (alternatives.isEmpty ? eligible : alternatives).randomElement()
         }
         guard let current = playingEntryID,
-              let index = playlist.entries.firstIndex(where: { $0.id == current }) else { return playlist.entries.first }
+              let index = playlist.entries.firstIndex(where: { $0.id == current }) else {
+            return playlist.entries.first(where: { !$0.hasPlaybackError })
+        }
+        // The next-track path advances past unavailable items.  Previous keeps
+        // its normal positional behaviour; an errored item can be retried only
+        // by directly activating its row in the Playlist Editor.
+        if step > 0 {
+            return playlist.entries.dropFirst(index + 1).first { !$0.hasPlaybackError }
+        }
         let candidate = index + step
         guard playlist.entries.indices.contains(candidate) else { return nil }
         return playlist.entries[candidate]
+    }
+
+    func markPlaybackErrorForActiveEntry(url: URL) {
+        guard let playlist = activePlaylist,
+              let id = playingEntryID,
+              let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
+        guard !entry.hasPlaybackError else { return }
+        entry.hasPlaybackError = true
+        playlist.metadataRevision &+= 1
+    }
+
+    func clearPlaybackErrorForActiveEntry(url: URL) {
+        guard let playlist = activePlaylist,
+              let id = playingEntryID,
+              let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
+        guard entry.hasPlaybackError else { return }
+        entry.hasPlaybackError = false
+        playlist.metadataRevision &+= 1
     }
 
     func focus(_ playlist: PlaylistModel) { focusedPlaylistID = playlist.id; save() }
@@ -494,6 +524,18 @@ final class PlaylistManager: ObservableObject {
         playlist.entries.removeAll { playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
         playlist.selectedIDs.removeAll(); playlist.isDirty = true
+        repairTrackReferences(in: playlist)
+        markEntriesDirty(in: playlist); save()
+    }
+
+    /// Error markers themselves are transient, but removing their rows is a
+    /// normal playlist edit and therefore must be persisted.
+    func removePlaybackErrorEntries(from playlist: PlaylistModel) {
+        guard playlist.entries.contains(where: \.hasPlaybackError) else { return }
+        playlist.entries.removeAll { $0.hasPlaybackError }
+        playlist.recalculateTotalDuration()
+        playlist.selectedIDs.formIntersection(Set(playlist.entries.map(\.id)))
+        playlist.isDirty = true
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
