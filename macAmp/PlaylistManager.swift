@@ -93,6 +93,11 @@ final class PlaylistManager: ObservableObject {
     private let folderQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.folder", qos: .utility)
     private let metadataQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.metadata", qos: .background, attributes: .concurrent)
     private let persistenceURL: URL
+    private let playlistEntriesDirectoryURL: URL
+    /// Only playlists whose elements changed are re-encoded. Window state,
+    /// selection and playback cursors remain in the small main snapshot.
+    private var dirtyPlaylistEntryIDs = Set<UUID>()
+    private var mainSnapshotNeedsRewrite = false
     private var pausedPlaylistIDs = Set<UUID>()
     private var cancelledFolderPlaylistIDs = Set<UUID>()
     private let scannerLock = NSLock()
@@ -149,14 +154,23 @@ final class PlaylistManager: ObservableObject {
         let directory = root.appendingPathComponent("macAmp", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         persistenceURL = directory.appendingPathComponent("playlists.json")
+        playlistEntriesDirectoryURL = directory.appendingPathComponent("playlists", isDirectory: true)
+        try? FileManager.default.createDirectory(at: playlistEntriesDirectoryURL, withIntermediateDirectories: true)
         let needsDisplayMetadataRefresh = UserDefaults.standard.integer(forKey: Self.displayMetadataFormatVersionKey) < Self.displayMetadataFormatVersion
         restore(invalidateMetadata: needsDisplayMetadataRefresh)
-        if playlists.isEmpty { playlists = [PlaylistModel(name: "Playlist")] }
-        if needsDisplayMetadataRefresh {
-            // Persist the invalidation before scheduling the low-priority
-            // reader, so a quit during the first refresh cannot leave old
-            // title-only rows permanently marked as complete.
+        if playlists.isEmpty {
+            let playlist = PlaylistModel(name: "Playlist")
+            playlists = [playlist]
+            activePlaylistID = playlist.id
+            focusedPlaylistID = playlist.id
+            dirtyPlaylistEntryIDs.insert(playlist.id)
+        }
+        if needsDisplayMetadataRefresh || mainSnapshotNeedsRewrite || !dirtyPlaylistEntryIDs.isEmpty {
+            // Persist repaired references and metadata invalidation before
+            // normal coalesced saves begin.
             writeSnapshot()
+        }
+        if needsDisplayMetadataRefresh {
             UserDefaults.standard.set(Self.displayMetadataFormatVersion, forKey: Self.displayMetadataFormatVersionKey)
         }
         DispatchQueue.main.async { [weak self] in self?.playlists.filter(\.isVisible).forEach { self?.scheduleMetadata(for: $0) } }
@@ -172,7 +186,8 @@ final class PlaylistManager: ObservableObject {
 
     @discardableResult func createPlaylist(name: String = "New Playlist") -> PlaylistModel {
         let playlist = PlaylistModel(name: name)
-        playlists.append(playlist); focusedPlaylistID = playlist.id; save(); return playlist
+        playlists.append(playlist); focusedPlaylistID = playlist.id
+        markEntriesDirty(in: playlist); save(); return playlist
     }
 
     /// Resolves symlinks before comparing paths, so every open route observes
@@ -183,7 +198,8 @@ final class PlaylistManager: ObservableObject {
             existing.isVisible = true; focusedPlaylistID = existing.id; return existing
         }
         let playlist = PlaylistModel(name: canonical.deletingPathExtension().lastPathComponent, fileURL: canonical)
-        playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }; save(); return playlist
+        playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }
+        markEntriesDirty(in: playlist); save(); return playlist
     }
 
     /// Creates the editor model immediately. Reading and parsing a large M3U
@@ -197,7 +213,8 @@ final class PlaylistManager: ObservableObject {
         }
         let playlist = PlaylistModel(name: canonical.deletingPathExtension().lastPathComponent, fileURL: canonical)
         playlist.scannerState = .scanningFolder(0)
-        playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }; save()
+        playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }
+        markEntriesDirty(in: playlist); save()
         beginWaitingCursor(for: playlist)
         folderQueue.async { [weak self, weak playlist] in
             guard let self, let playlist else { return }
@@ -235,6 +252,7 @@ final class PlaylistManager: ObservableObject {
         if playlist.entries.isEmpty { endWaitingCursor(for: playlist) }
         playlist.entries.append(contentsOf: entries)
         playlist.appendToTotalDuration(entries)
+        markEntriesDirty(in: playlist)
         playlist.scannerState = .scanningFolder(playlist.entries.count)
         // Start as soon as rows can actually be shown.  The state above stays
         // "Loading" until parsing finishes, even while metadata work runs.
@@ -310,6 +328,7 @@ final class PlaylistManager: ObservableObject {
         if let url = playlist.fileURL { addRecent(url) }
         let wasActive = activePlaylistID == playlist.id
         playlists.removeAll { $0.id == playlist.id }
+        dirtyPlaylistEntryIDs.remove(playlist.id)
         if wasActive {
             // Prefer an actually open window; fall back to a remaining hidden
             // model only when all editors are hidden.
@@ -338,6 +357,7 @@ final class PlaylistManager: ObservableObject {
         propagateBookmarks(from: entries)
         playlist.entries.append(contentsOf: entries)
         playlist.appendToTotalDuration(entries)
+        markEntriesDirty(in: playlist)
         playlist.isDirty = true; playlist.scannerState = .adding(playlist.entries.count); save(); finishEntryLoading(playlist)
     }
 
@@ -363,11 +383,13 @@ final class PlaylistManager: ObservableObject {
     func cancelFolderScans() { cancelledFolderPlaylistIDs.formUnion(playlists.map(\.id)) }
 
     func play(_ entry: PlaylistEntry, in playlist: PlaylistModel, revealIfNeeded: Bool = true) {
-        // Migrate entries from snapshots written before persistent file access
-        // was retained. If the current process can already read this URL, the
-        // resulting bookmark makes the next launch independent of that grant.
+        // If an entry has no persistent access yet and the current process can
+        // read its URL, retain that access for subsequent launches.
         if entry.bookmarkData == nil {
-            entry.bookmarkData = securityScopedBookmark(for: entry.url)
+            if let bookmark = securityScopedBookmark(for: entry.url) {
+                entry.bookmarkData = bookmark
+                markEntriesDirty(in: playlist)
+            }
         }
         activePlaylistID = playlist.id; focusedPlaylistID = playlist.id
         playlist.lastPlayedEntryID = entry.id; playingEntryID = entry.id
@@ -471,22 +493,24 @@ final class PlaylistManager: ObservableObject {
     func removeSelected(from playlist: PlaylistModel) {
         playlist.entries.removeAll { playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
-        playlist.selectedIDs.removeAll(); playlist.isDirty = true; save()
+        playlist.selectedIDs.removeAll(); playlist.isDirty = true
+        repairTrackReferences(in: playlist)
+        markEntriesDirty(in: playlist); save()
     }
 
     func clear(_ playlist: PlaylistModel) {
         playlist.entries.removeAll(); playlist.selectedIDs.removeAll(); playlist.isDirty = true
         playlist.clearTotalDuration()
-        if activePlaylistID == playlist.id { playingEntryID = nil }
-        save()
+        repairTrackReferences(in: playlist)
+        markEntriesDirty(in: playlist); save()
     }
 
     func cropToSelection(_ playlist: PlaylistModel) {
         playlist.entries.removeAll { !playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
         playlist.selectedIDs = Set(playlist.entries.map(\.id)); playlist.isDirty = true
-        if let playing = playingEntryID, !playlist.entries.contains(where: { $0.id == playing }) { playingEntryID = nil }
-        save()
+        repairTrackReferences(in: playlist)
+        markEntriesDirty(in: playlist); save()
     }
 
     func selectAll(in playlist: PlaylistModel) { playlist.selectedIDs = Set(playlist.entries.map(\.id)); save() }
@@ -541,7 +565,8 @@ final class PlaylistManager: ObservableObject {
                 return PlaylistEntry(url: itemURL, title: pendingTitle, duration: pendingDuration, metadataIsAvailable: pendingTitle != nil || pendingDuration != nil)
             }
             let playlist = PlaylistModel(name: canonical.deletingPathExtension().lastPathComponent, entries: entries, fileURL: canonical)
-            playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }; save(); scheduleMetadata(for: playlist)
+            playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }
+            markEntriesDirty(in: playlist); save(); scheduleMetadata(for: playlist)
             return playlist
         }
         throw CocoaError(.fileReadUnsupportedScheme)
@@ -575,6 +600,7 @@ final class PlaylistManager: ObservableObject {
             self.propagateBookmarks(from: entries)
             playlist.entries.append(contentsOf: entries)
             playlist.appendToTotalDuration(entries)
+            self.markEntriesDirty(in: playlist)
             playlist.isDirty = true; playlist.scannerState = .scanningFolder(playlist.entries.count)
             self.scheduleMetadata(for: playlist)
             self.save()
@@ -745,6 +771,7 @@ final class PlaylistManager: ObservableObject {
             // A timeout/error is still a completed attempt; retrying it forever
             // would prevent lower-priority entries from ever being scanned.
             work.entry.metadataIsAvailable = true
+            markEntriesDirty(in: work.playlist)
             let previous = metadataProgress[work.playlist.id] ?? (0, work.total)
             let progress = (previous.processed + 1, max(previous.total, work.total))
             metadataProgress[work.playlist.id] = progress
@@ -796,12 +823,65 @@ final class PlaylistManager: ObservableObject {
     }
     private func addRecent(_ url: URL) { recentPlaylistURLs.removeAll { $0 == url }; recentPlaylistURLs.insert(url, at: 0); recentPlaylistURLs = Array(recentPlaylistURLs.prefix(10)) }
 
-    private struct Snapshot: Codable { var recent: [URL]; var playlists: [StoredPlaylist]; var activePlaylistID: UUID?; var focusedPlaylistID: UUID?; var playingEntryID: UUID? }
-    private struct StoredPlaylist: Codable { var id: UUID; var name: String; var fileURL: URL?; var visible: Bool; var shaded: Bool; var frame: CGRect?; var unshadedWidth: Double?; var unshadedHeight: Double?; var entries: [StoredEntry]; var selection: [UUID]?; var scrollPosition: Int?; var lastPlayedEntryID: UUID? }
+    private static let splitPlaylistPersistenceVersion = 2
+
+    private struct Snapshot: Codable {
+        var version: Int
+        var recent: [URL]
+        var playlists: [StoredPlaylist]
+        var activePlaylistID: UUID?
+        var focusedPlaylistID: UUID?
+        var playingEntryID: UUID?
+    }
+
+    private struct StoredPlaylist: Codable {
+        var id: UUID
+        var name: String
+        var fileURL: URL?
+        var visible: Bool
+        var shaded: Bool
+        var frame: CGRect?
+        var unshadedWidth: Double?
+        var unshadedHeight: Double?
+        var selection: [UUID]?
+        var scrollPosition: Int?
+        var lastPlayedEntryID: UUID?
+    }
+
     private struct StoredEntry: Codable { var id: UUID; var url: URL; var bookmark: Data?; var title: String; var duration: TimeInterval?; var metadata: Bool }
+
+    private func markEntriesDirty(in playlist: PlaylistModel) {
+        dirtyPlaylistEntryIDs.insert(playlist.id)
+    }
+
+    /// Repairs every ID owned by the main snapshot after entry removal or a
+    /// partially missing persistence set. A stale non-nil cursor falls back
+    /// to the first surviving entry, while an intentionally nil cursor stays
+    /// nil. This keeps Stop semantics unchanged.
+    @discardableResult
+    private func repairTrackReferences(in playlist: PlaylistModel) -> Bool {
+        let validIDs = Set(playlist.entries.map(\.id))
+        let previousSelection = playlist.selectedIDs
+        let previousLastPlayed = playlist.lastPlayedEntryID
+        let previousPlaying = playingEntryID
+
+        playlist.selectedIDs.formIntersection(validIDs)
+        if let lastPlayed = playlist.lastPlayedEntryID, !validIDs.contains(lastPlayed) {
+            playlist.lastPlayedEntryID = playlist.entries.first?.id
+        }
+        if activePlaylistID == playlist.id,
+           let playing = playingEntryID,
+           !validIDs.contains(playing) {
+            playingEntryID = playlist.entries.first?.id
+        }
+        return previousSelection != playlist.selectedIDs
+            || previousLastPlayed != playlist.lastPlayedEntryID
+            || previousPlaying != playingEntryID
+    }
+
     /// Most calls happen in bursts (folder scans, metadata updates, scrolling).
-    /// Writing a full JSON snapshot for every one of them creates O(n²) disk
-    /// work for a playlist with n tracks.  Coalesce those mutations instead.
+    /// The main snapshot is small; only dirty entry files are encoded and
+    /// atomically replaced after the debounce interval.
     func save() {
         pendingSaveWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -819,24 +899,91 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func writeSnapshot() {
-        let stored = playlists.map { p in StoredPlaylist(id: p.id, name: p.name, fileURL: p.fileURL, visible: p.isVisible, shaded: p.isWindowShaded, frame: p.windowFrame, unshadedWidth: p.unshadedWindowWidth.map(Double.init), unshadedHeight: p.unshadedWindowHeight.map(Double.init), entries: p.entries.map { StoredEntry(id: $0.id, url: $0.url, bookmark: $0.bookmarkData, title: $0.title, duration: $0.duration, metadata: $0.metadataIsAvailable) }, selection: Array(p.selectedIDs), scrollPosition: p.scrollPosition, lastPlayedEntryID: p.lastPlayedEntryID) }
-        if let data = try? JSONEncoder().encode(Snapshot(recent: recentPlaylistURLs, playlists: stored, activePlaylistID: activePlaylistID, focusedPlaylistID: focusedPlaylistID, playingEntryID: playingEntryID)) {
-            try? data.write(to: persistenceURL, options: .atomic)
+        let currentIDs = Set(playlists.map(\.id))
+        dirtyPlaylistEntryIDs.formIntersection(currentIDs)
+        for playlist in playlists where !FileManager.default.fileExists(atPath: entriesURL(for: playlist.id).path) {
+            dirtyPlaylistEntryIDs.insert(playlist.id)
+        }
+
+        do {
+            try FileManager.default.createDirectory(at: playlistEntriesDirectoryURL, withIntermediateDirectories: true)
+            let dirtyPlaylists = playlists.filter { dirtyPlaylistEntryIDs.contains($0.id) }
+            for playlist in dirtyPlaylists {
+                let storedEntries = playlist.entries.map(storedEntry(from:))
+                let data = try JSONEncoder().encode(storedEntries)
+                try data.write(to: entriesURL(for: playlist.id), options: .atomic)
+            }
+
+            let stored = playlists.map { playlist in
+                StoredPlaylist(
+                    id: playlist.id,
+                    name: playlist.name,
+                    fileURL: playlist.fileURL,
+                    visible: playlist.isVisible,
+                    shaded: playlist.isWindowShaded,
+                    frame: playlist.windowFrame,
+                    unshadedWidth: playlist.unshadedWindowWidth.map(Double.init),
+                    unshadedHeight: playlist.unshadedWindowHeight.map(Double.init),
+                    selection: Array(playlist.selectedIDs),
+                    scrollPosition: playlist.scrollPosition,
+                    lastPlayedEntryID: playlist.lastPlayedEntryID
+                )
+            }
+            let snapshot = Snapshot(
+                version: Self.splitPlaylistPersistenceVersion,
+                recent: recentPlaylistURLs,
+                playlists: stored,
+                activePlaylistID: activePlaylistID,
+                focusedPlaylistID: focusedPlaylistID,
+                playingEntryID: playingEntryID
+            )
+            let data = try JSONEncoder().encode(snapshot)
+            try data.write(to: persistenceURL, options: .atomic)
+
+            dirtyPlaylistEntryIDs.subtract(dirtyPlaylists.map(\.id))
+            mainSnapshotNeedsRewrite = false
+            cleanupOrphanedEntryFiles(keeping: currentIDs)
+        } catch {
+            // Retain dirty IDs so the next coalesced save or termination flush
+            // retries the complete child-files-before-index transaction.
+            return
         }
     }
+
     private func restore(invalidateMetadata: Bool = false) {
-        guard let data = try? Data(contentsOf: persistenceURL), let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
+        guard let data = try? Data(contentsOf: persistenceURL) else { return }
+        let decoder = JSONDecoder()
+
+        guard let snapshot = try? decoder.decode(Snapshot.self, from: data),
+              snapshot.version == Self.splitPlaylistPersistenceVersion else { return }
         recentPlaylistURLs = snapshot.recent
         activePlaylistID = snapshot.activePlaylistID
         focusedPlaylistID = snapshot.focusedPlaylistID
         playingEntryID = snapshot.playingEntryID
-        playlists = snapshot.playlists.map { p in
-            let entries = p.entries.map { storedEntry in
+
+        var storedEntries: [UUID: [StoredEntry]] = [:]
+        for playlist in snapshot.playlists {
+            let url = entriesURL(for: playlist.id)
+            if let entryData = try? Data(contentsOf: url),
+               let decoded = try? decoder.decode([StoredEntry].self, from: entryData) {
+                storedEntries[playlist.id] = decoded
+            } else {
+                storedEntries[playlist.id] = []
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    dirtyPlaylistEntryIDs.insert(playlist.id)
+                }
+            }
+        }
+
+        playlists = snapshot.playlists.map { playlist in
+            var entriesNeedRewrite = invalidateMetadata
+            let entries = (storedEntries[playlist.id] ?? []).map { storedEntry in
                 let resolvedURL = resolvedBookmarkURL(storedEntry.bookmark)
                 // Ad-hoc Debug signatures cannot retain an app-scoped
                 // bookmark across rebuilds. Keeping that now-invalid data
                 // would make playback reject an otherwise readable stored
                 // URL merely because `bookmarkData` is non-nil.
+                if storedEntry.bookmark != nil, resolvedURL == nil { entriesNeedRewrite = true }
                 return PlaylistEntry(
                     id: storedEntry.id,
                     url: resolvedURL ?? storedEntry.url,
@@ -846,16 +993,58 @@ final class PlaylistManager: ObservableObject {
                     metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata
                 )
             }
-            let model = PlaylistModel(id: p.id, name: p.name, entries: entries, fileURL: p.fileURL)
-            model.isVisible = p.visible
-            model.isWindowShaded = p.shaded
-            model.windowFrame = p.frame
-            model.unshadedWindowWidth = p.unshadedWidth.map { CGFloat($0) }
-            model.unshadedWindowHeight = p.unshadedHeight.map { CGFloat($0) }
-            model.selectedIDs = Set(p.selection ?? [])
-            model.scrollPosition = p.scrollPosition ?? 0
-            model.lastPlayedEntryID = p.lastPlayedEntryID
+            let model = PlaylistModel(id: playlist.id, name: playlist.name, entries: entries, fileURL: playlist.fileURL)
+            model.isVisible = playlist.visible
+            model.isWindowShaded = playlist.shaded
+            model.windowFrame = playlist.frame
+            model.unshadedWindowWidth = playlist.unshadedWidth.map { CGFloat($0) }
+            model.unshadedWindowHeight = playlist.unshadedHeight.map { CGFloat($0) }
+            model.selectedIDs = Set(playlist.selection ?? [])
+            model.scrollPosition = playlist.scrollPosition ?? 0
+            model.lastPlayedEntryID = playlist.lastPlayedEntryID
+            if entriesNeedRewrite { dirtyPlaylistEntryIDs.insert(playlist.id) }
             return model
+        }
+
+        if !playlists.contains(where: { $0.id == activePlaylistID }) {
+            activePlaylistID = playlists.first?.id
+            mainSnapshotNeedsRewrite = true
+        }
+        if !playlists.contains(where: { $0.id == focusedPlaylistID }) {
+            focusedPlaylistID = activePlaylistID ?? playlists.first?.id
+            mainSnapshotNeedsRewrite = true
+        }
+        for playlist in playlists {
+            if repairTrackReferences(in: playlist) { mainSnapshotNeedsRewrite = true }
+        }
+        cleanupOrphanedEntryFiles(keeping: Set(playlists.map(\.id)))
+    }
+
+    private func storedEntry(from entry: PlaylistEntry) -> StoredEntry {
+        StoredEntry(
+            id: entry.id,
+            url: entry.url,
+            bookmark: entry.bookmarkData,
+            title: entry.title,
+            duration: entry.duration,
+            metadata: entry.metadataIsAvailable
+        )
+    }
+
+    private func entriesURL(for playlistID: UUID) -> URL {
+        playlistEntriesDirectoryURL.appendingPathComponent("\(playlistID.uuidString).json", isDirectory: false)
+    }
+
+    private func cleanupOrphanedEntryFiles(keeping playlistIDs: Set<UUID>) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: playlistEntriesDirectoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let expectedNames = Set(playlistIDs.map { "\($0.uuidString).json" })
+        for file in files where file.pathExtension.lowercased() == "json"
+            && !expectedNames.contains(file.lastPathComponent) {
+            try? FileManager.default.removeItem(at: file)
         }
     }
 
@@ -893,9 +1082,14 @@ final class PlaylistManager: ObservableObject {
         }
         guard !bookmarksByPath.isEmpty else { return }
         for playlist in playlists {
+            var entriesChanged = false
             for entry in playlist.entries where entry.bookmarkData == nil {
-                entry.bookmarkData = bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path]
+                if let bookmark = bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path] {
+                    entry.bookmarkData = bookmark
+                    entriesChanged = true
+                }
             }
+            if entriesChanged { markEntriesDirty(in: playlist) }
         }
     }
 }
