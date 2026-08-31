@@ -800,7 +800,7 @@ private struct TickerDisplay: View {
             if magnitude == 0 { return "BALANCE: CENTER" }
             return "BALANCE: \(playback.balance < 0 ? "L" : "R") \(magnitude)%"
         }
-        return playback.title
+        return playback.title.uppercased()
     }
 
     private var tickerDisplayText: String {

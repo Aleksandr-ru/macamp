@@ -435,6 +435,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
+        if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
         if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
         // Those identify the hardware key; only real shortcut modifiers
@@ -491,6 +493,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             playback.volume = min(1, playback.volume + 0.05)
         default: return false
         }
+        return true
+    }
+
+    /// ⌘A belongs to the Playlist Editor alone. Route it from the source
+    /// panel, rather than the active playlist, so another player window can
+    /// never select rows in a background editor.
+    private func handlePlaylistSelectionShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 0, // physical A key
+              modifiers.contains(.command),
+              modifiers.intersection([.option, .control, .shift]).isEmpty,
+              let sourceWindow = event.window,
+              sourceWindow.isKeyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID) else {
+            return false
+        }
+        playlistManager.selectAll(in: playlist)
+        return true
+    }
+
+    /// Delete mirrors Playlist Editor's Remove → Remove Selected command. It
+    /// is deliberately scoped to the source key panel, like ⌘A above.
+    private func handlePlaylistRemovalShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 51 || event.keyCode == 117, // Delete / Forward Delete
+              modifiers.intersection([.command, .option, .control, .shift]).isEmpty,
+              let sourceWindow = event.window,
+              sourceWindow.isKeyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID) else {
+            return false
+        }
+        playlistManager.removeSelected(from: playlist)
         return true
     }
 
@@ -2099,7 +2139,7 @@ private struct PlaylistStatusField: View {
         let color = colors.normalText.usingColorSpace(.deviceRGB) ?? colors.normalText
         return HStack(spacing: 2) {
             if playlist.scannerState == .idle, !indicator.isEmpty { Text(indicator) }
-            Text(manager.statusText(for: playlist, playbackIndicator: nil))
+            Text(verbatim: manager.statusText(for: playlist, playbackIndicator: nil).uppercased())
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
             if let counter,
@@ -2345,8 +2385,12 @@ private struct PlaylistView: View {
                         .id(entry.id)
                     }
                 }
-                .background(GeometryReader { proxy in
-                    Color.clear.preference(key: PlaylistScrollOffsetKey.self, value: proxy.frame(in: .named("playlistEntries")).minY)
+                .background(PlaylistScrollPositionObserver { offset in
+                    manager.visibleRangeChanged(
+                        for: playlist,
+                        firstEntry: Int(max(0, (offset / entryHeight).rounded(.down))),
+                        visibleCount: visiblePlaylistEntryCount
+                    )
                 })
             }
             .coordinateSpace(name: "playlistEntries")
@@ -2373,14 +2417,6 @@ private struct PlaylistView: View {
                 let position = min(max(0, playlist.scrollPosition), max(0, playlist.entries.count - 1))
                 guard playlist.entries.indices.contains(position) else { return }
                 DispatchQueue.main.async { proxy.scrollTo(playlist.entries[position].id, anchor: .top) }
-            }
-            .onPreferenceChange(PlaylistScrollOffsetKey.self) { offset in
-                let visibleRows = visiblePlaylistEntryCount
-                manager.visibleRangeChanged(
-                    for: playlist,
-                    firstEntry: Int(max(0, (-offset / entryHeight).rounded(.down))),
-                    visibleCount: visibleRows
-                )
             }
             .onChange(of: fontScale.percent) { _ in
                 manager.visibleRangeChanged(
@@ -2444,8 +2480,7 @@ private struct PlaylistView: View {
     private var playlistTimeDisplay: some View {
         let wholeSeconds = max(0, Int(playlist.totalDuration.rounded(.down)))
         let image = skin.playlistTimeImage(
-            minutes: min(999, wholeSeconds / 60),
-            seconds: wholeSeconds % 60,
+            totalSeconds: wholeSeconds,
             isRemaining: false
         )
         return Group {
@@ -2477,9 +2512,72 @@ private struct PlaylistView: View {
     }
 }
 
-private struct PlaylistScrollOffsetKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+/// Reports the real AppKit clip-view offset. Unlike a SwiftUI geometry
+/// preference attached to a LazyVStack, this keeps emitting while the top
+/// rows are no longer materialised and therefore gives metadata scheduling an
+/// exact viewport after every scroll.
+private struct PlaylistScrollPositionObserver: NSViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> PlaylistScrollPositionNSView {
+        let view = PlaylistScrollPositionNSView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaylistScrollPositionNSView, context: Context) {
+        nsView.onChange = onChange
+        nsView.attachToEnclosingScrollViewIfNeeded()
+    }
+
+    static func dismantleNSView(_ nsView: PlaylistScrollPositionNSView, coordinator: ()) {
+        nsView.detach()
+    }
+}
+
+private final class PlaylistScrollPositionNSView: NSView {
+    var onChange: ((CGFloat) -> Void)?
+    private weak var observedClipView: NSClipView?
+    private var boundsObserver: NSObjectProtocol?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in
+            self?.attachToEnclosingScrollViewIfNeeded()
+        }
+    }
+
+    func attachToEnclosingScrollViewIfNeeded() {
+        guard let clipView = enclosingScrollView?.contentView else { return }
+        guard observedClipView !== clipView else {
+            publishPosition()
+            return
+        }
+        detach()
+        observedClipView = clipView
+        clipView.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.publishPosition()
+        }
+        publishPosition()
+    }
+
+    func detach() {
+        if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
+        boundsObserver = nil
+        observedClipView = nil
+    }
+
+    private func publishPosition() {
+        guard let clipView = observedClipView else { return }
+        onChange?(max(0, clipView.bounds.origin.y))
+    }
+
+    deinit { detach() }
 }
 
 /// AppKit receives the original mouse-down event, which is required to open a

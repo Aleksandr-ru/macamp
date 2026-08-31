@@ -553,13 +553,16 @@ final class WinampSkinStore: ObservableObject {
         return image
     }
 
-    /// Draws the Playlist Editor counter exactly as classic Winamp does: its
-    /// digits, minus sign and colon all come from `TEXT.BMP`, not a system font.
-    /// The layout deliberately keeps the narrow sign and the original gaps.
-    func playlistTimeImage(minutes: Int, seconds: Int, isRemaining: Bool) -> NSImage? {
-        let clampedMinutes = max(0, min(999, minutes))
-        let clampedSeconds = max(0, min(59, seconds))
-        let key = "\(clampedMinutes):\(clampedSeconds):\(isRemaining)"
+    /// Draws the Playlist Editor counter using the skin font. Durations below
+    /// one hour use MM:SS, 1…9:59:59 use H:MM:SS, and longer durations use
+    /// Winamp's minute counter extended to MMMM:SS without leading zeroes.
+    func playlistTimeImage(totalSeconds: Int, isRemaining: Bool) -> NSImage? {
+        let safeTotalSeconds = max(0, totalSeconds)
+        let usesHourFormat = safeTotalSeconds >= 60 * 60 && safeTotalSeconds < 10 * 60 * 60
+        let minutes = safeTotalSeconds / 60
+        let seconds = safeTotalSeconds % 60
+        let clampedMinutes = max(0, min(9_999, minutes))
+        let key = "\(safeTotalSeconds):\(usesHourFormat):\(isRemaining)"
         if let cached = playlistTimeCache[key] { return cached }
         guard let sheet = bitmap(named: "TEXT.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -576,21 +579,33 @@ final class WinampSkinStore: ObservableObject {
         let image = NSImage(size: NSSize(width: 32, height: 6))
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .none
-        // draw_pe_timedisp() leaves the colon embedded in PLEDIT.BMP untouched.
-        // Only the sign and numeric cells are refreshed, preserving the native gap.
-        draw(glyph(142, 0, 4), at: 0, width: 4)
-        draw(glyph(isRemaining ? 75 : 142, isRemaining ? 6 : 0, 3), at: 4, width: 3)
-
-        // TEXT.BMP row 6: 0...9 at x = 0...45, minus at 75.  The
-        // PLEDIT counter is MMM:SS (not MM:SS): draw_pe_timedisp() places
-        // the hundreds-of-minutes cell at x+4 whenever it is non-zero.
-        if clampedMinutes >= 100 {
-            draw(glyph(((clampedMinutes / 100) % 10) * 5), at: 4, width: 5)
+        if usesHourFormat {
+            // The original colon in PLEDIT.BMP remains at x=19…21. Draw the
+            // extra separator from TEXT.BMP to form H:MM:SS in the same 32 px
+            // field without introducing a system font or wider layout.
+            let hours = safeTotalSeconds / 3_600
+            let minuteRemainder = (safeTotalSeconds / 60) % 60
+            draw(glyph(hours * 5), at: 0, width: 5)
+            draw(glyph(60, 6, 3), at: 5, width: 3)
+            draw(glyph((minuteRemainder / 10) * 5), at: 8, width: 5)
+            draw(glyph((minuteRemainder % 10) * 5), at: 13, width: 5)
+        } else {
+            // PLEDIT's colon is embedded in the frame. The original narrow
+            // sign cell at x=0 is reused for the thousands-of-minutes digit;
+            // leaving it blank below 1000 avoids a leading zero.
+            draw(glyph(142, 0, 4), at: 0, width: 4)
+            draw(glyph(isRemaining ? 75 : 142, isRemaining ? 6 : 0, 3), at: 4, width: 3)
+            if clampedMinutes >= 1_000 {
+                draw(glyph(((clampedMinutes / 1_000) % 10) * 5), at: 0, width: 4)
+            }
+            if clampedMinutes >= 100 {
+                draw(glyph(((clampedMinutes / 100) % 10) * 5), at: 4, width: 5)
+            }
+            draw(glyph(((clampedMinutes / 10) % 10) * 5), at: 9, width: 5)
+            draw(glyph((clampedMinutes % 10) * 5), at: 14, width: 5)
         }
-        draw(glyph(((clampedMinutes / 10) % 10) * 5), at: 9, width: 5)
-        draw(glyph((clampedMinutes % 10) * 5), at: 14, width: 5)
-        draw(glyph((clampedSeconds / 10) * 5), at: 22, width: 5)
-        draw(glyph((clampedSeconds % 10) * 5), at: 27, width: 5)
+        draw(glyph((seconds / 10) * 5), at: 22, width: 5)
+        draw(glyph((seconds % 10) * 5), at: 27, width: 5)
         image.unlockFocus()
         playlistTimeCache[key] = image
         return image

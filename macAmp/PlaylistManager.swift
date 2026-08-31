@@ -64,7 +64,9 @@ final class PlaylistModel: ObservableObject, Identifiable {
     func appendToTotalDuration(_ newEntries: [PlaylistEntry]) {
         cachedTotalDuration += newEntries.compactMap(\.duration).reduce(0, +)
     }
-    func addToTotalDuration(_ duration: TimeInterval?) { cachedTotalDuration += duration ?? 0 }
+    func replaceTotalDuration(_ previous: TimeInterval?, with updated: TimeInterval?) {
+        cachedTotalDuration += (updated ?? 0) - (previous ?? 0)
+    }
     func clearTotalDuration() { cachedTotalDuration = 0 }
 }
 
@@ -101,8 +103,10 @@ final class PlaylistManager: ObservableObject {
     private let maximumMetadataOperations = 1
     private var metadataWorkersRunning = 0
     private var metadataProgress: [UUID: (processed: Int, total: Int)] = [:]
-    /// Accessed only on the main queue, alongside playlist models.
-    private var metadataInFlightEntryIDs = Set<UUID>()
+    /// Accessed only on the main queue. The request token makes a completion
+    /// single-use: only the currently registered request may mutate its row.
+    private var metadataInFlightRequests: [UUID: UInt64] = [:]
+    private var nextMetadataRequestID: UInt64 = 1
     /// AVFoundation loads can otherwise occupy both workers long after the
     /// user scrolls to another part of a large playlist.  This lock protects
     /// the assets while they are owned by metadata worker threads.
@@ -111,6 +115,10 @@ final class PlaylistManager: ObservableObject {
     private var cancelledMetadataEntryIDs = Set<UUID>()
     private var pendingMetadataReprioritization: DispatchWorkItem?
     private var pendingMetadataResume: DispatchWorkItem?
+    /// Main-thread generation of the visible metadata work set. A worker that
+    /// finishes after scrolling skips its normal pacing delay and immediately
+    /// chooses again from the new viewport.
+    private var metadataPriorityRevision = 0
     /// Starting a remote track takes precedence over cosmetic tag discovery.
     /// AVFoundation otherwise opens the same file in two metadata workers and
     /// competes with the audio decoder for the network volume.
@@ -315,7 +323,10 @@ final class PlaylistManager: ObservableObject {
 
     func setVisible(_ visible: Bool, for playlist: PlaylistModel) {
         playlist.isVisible = visible
-        if visible { pausedPlaylistIDs.remove(playlist.id); scheduleMetadata(for: playlist) }
+        if visible {
+            pausedPlaylistIDs.remove(playlist.id)
+            scheduleMetadata(for: playlist)
+        }
         else { pausedPlaylistIDs.insert(playlist.id); playlist.scannerState = .paused }
         save()
     }
@@ -439,6 +450,11 @@ final class PlaylistManager: ObservableObject {
         guard playlist.scrollPosition != position || playlist.visibleEntryCount != count else { return }
         playlist.scrollPosition = position
         playlist.visibleEntryCount = count
+        metadataPriorityRevision &+= 1
+        // Rows that finished while off-screen were intentionally coalesced.
+        // Publish once as the viewport changes so the newly visible range is
+        // rendered immediately with all metadata already available there.
+        playlist.metadataRevision &+= 1
         requestMetadataReprioritization()
     }
 
@@ -628,7 +644,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func processNextMetadata() {
-        var work: (playlist: PlaylistModel, entry: PlaylistEntry, total: Int)?
+        var work: (playlist: PlaylistModel, entry: PlaylistEntry, total: Int, priorityRevision: Int, requestID: UInt64)?
         DispatchQueue.main.sync {
             guard Date() >= metadataHoldUntil else { return }
             let eligible = playlists
@@ -643,24 +659,30 @@ final class PlaylistManager: ObservableObject {
             // so a changed track or scroll position takes effect immediately.
             if let active = eligible.first(where: { $0.id == activePlaylistID }),
                let playingID = playingEntryID,
-               let entry = active.entries.first(where: { $0.id == playingID && !$0.metadataIsAvailable && !metadataInFlightEntryIDs.contains($0.id) }) {
-                metadataInFlightEntryIDs.insert(entry.id)
-                work = (active, entry, active.entries.count)
+               let entry = active.entries.first(where: { $0.id == playingID && !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+                let requestID = nextMetadataRequestID
+                nextMetadataRequestID &+= 1
+                metadataInFlightRequests[entry.id] = requestID
+                work = (active, entry, active.entries.count, metadataPriorityRevision, requestID)
                 return
             }
             for playlist in eligible {
                 let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
                 let end = min(playlist.entries.count, start + playlist.visibleEntryCount)
-                if let entry = playlist.entries[start..<end].first(where: { !$0.metadataIsAvailable && !metadataInFlightEntryIDs.contains($0.id) }) {
-                    metadataInFlightEntryIDs.insert(entry.id)
-                    work = (playlist, entry, playlist.entries.count)
+                if let entry = playlist.entries[start..<end].first(where: { !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+                    let requestID = nextMetadataRequestID
+                    nextMetadataRequestID &+= 1
+                    metadataInFlightRequests[entry.id] = requestID
+                    work = (playlist, entry, playlist.entries.count, metadataPriorityRevision, requestID)
                     return
                 }
             }
             for playlist in eligible {
-                if let entry = playlist.entries.first(where: { !$0.metadataIsAvailable && !metadataInFlightEntryIDs.contains($0.id) }) {
-                    metadataInFlightEntryIDs.insert(entry.id)
-                    work = (playlist, entry, playlist.entries.count)
+                if let entry = playlist.entries.first(where: { !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+                    let requestID = nextMetadataRequestID
+                    nextMetadataRequestID &+= 1
+                    metadataInFlightRequests[entry.id] = requestID
+                    work = (playlist, entry, playlist.entries.count, metadataPriorityRevision, requestID)
                     return
                 }
             }
@@ -702,10 +724,12 @@ final class PlaylistManager: ObservableObject {
             loadingMetadataAssets.removeValue(forKey: work.entry.id)
             let wasCancelled = cancelledMetadataEntryIDs.remove(work.entry.id) != nil
             metadataAssetLock.unlock()
-            metadataInFlightEntryIDs.remove(work.entry.id)
+            guard metadataInFlightRequests[work.entry.id] == work.requestID else { return }
+            metadataInFlightRequests.removeValue(forKey: work.entry.id)
             guard !wasCancelled, !pausedPlaylistIDs.contains(work.playlist.id), !work.entry.metadataIsAvailable else { return }
+            let previousDuration = work.entry.duration
             work.entry.duration = result.duration
-            work.playlist.addToTotalDuration(result.duration)
+            work.playlist.replaceTotalDuration(previousDuration, with: result.duration)
             let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
             let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
@@ -724,17 +748,28 @@ final class PlaylistManager: ObservableObject {
             let previous = metadataProgress[work.playlist.id] ?? (0, work.total)
             let progress = (previous.processed + 1, max(previous.total, work.total))
             metadataProgress[work.playlist.id] = progress
-            // The status field does not need a full SwiftUI invalidation for
-            // every single file.  Updating it in small batches keeps scrolling
-            // smooth while the displayed counter still advances regularly.
+            // A visible row must update as soon as its metadata arrives. Keep
+            // background rows batched, however, so a large off-screen scan
+            // does not invalidate the playlist editor for every file.
+            let visibleStart = min(max(0, work.playlist.scrollPosition), work.playlist.entries.count)
+            let visibleEnd = min(work.playlist.entries.count, visibleStart + work.playlist.visibleEntryCount)
+            let completedEntryIsVisible = work.playlist.entries[visibleStart..<visibleEnd]
+                .contains { $0.id == work.entry.id }
+            let shouldPublishUpdate = completedEntryIsVisible
+                || progress.0 == progress.1
+                || progress.0.isMultiple(of: 8)
             if !isLoadingEntries(work.playlist),
-               (progress.0 == progress.1 || progress.0.isMultiple(of: 8)) {
+               shouldPublishUpdate {
                 work.playlist.scannerState = .readingMetadata(processed: progress.0, total: progress.1)
             }
-            if progress.0.isMultiple(of: 8) { work.playlist.metadataRevision &+= 1 }
+            if shouldPublishUpdate { work.playlist.metadataRevision &+= 1 }
         }
         DispatchQueue.main.async(execute: applyResult)
-        metadataQueue.asyncAfter(deadline: .now() + metadataWorkInterval) { [weak self] in
+        let priorityChanged = DispatchQueue.main.sync {
+            metadataPriorityRevision != work.priorityRevision
+        }
+        let nextDelay = priorityChanged ? 0 : metadataWorkInterval
+        metadataQueue.asyncAfter(deadline: .now() + nextDelay) { [weak self] in
             self?.processNextMetadata()
         }
     }
