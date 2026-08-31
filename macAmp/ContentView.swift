@@ -1198,9 +1198,9 @@ private final class SkinWindowDragNSView: NSView {
                                       y: origin.y + location.y - start.y)
             AppDelegate.shared?.beginMainDragFrame()
             window.setFrame(NSRect(origin: frameOrigin, size: window.frame.size), display: false)
-            // Keep the group in lockstep. Snapping is intentionally deferred
-            // to mouse-up, so no neighbour/screen search delays drag events.
-            AppDelegate.shared?.moveAttachedWindowsWithMain()
+            // Apply the same complete magnet pass that runs at mouse-up, so
+            // releasing the button cannot visibly change the settled group.
+            AppDelegate.shared?.magnetWindowWhileDragging(window)
         }
     }
 }

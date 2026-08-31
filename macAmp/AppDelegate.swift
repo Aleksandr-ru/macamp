@@ -258,6 +258,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // single "docked playlist": every Playlist Editor is an equal window and
     // can be connected through another editor.
     private var mainDragGroupWindows: [NSWindow] = []
+    private var mainDragExternalWindows: [NSWindow] = []
     private var mainDragWindowOffsets: [ObjectIdentifier: NSPoint] = [:]
     private var mainDragLastOrigin: NSPoint?
     private var mainDragShadowStates: [ObjectIdentifier: Bool] = [:]
@@ -848,18 +849,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mainTop = window.frame.maxY
         window.setContentSize(size)
         window.setFrameOrigin(NSPoint(x: window.frame.minX, y: mainTop - window.frame.height))
-        window.minSize = size
-        window.maxSize = size
+        alignFrameToBackingPixels(window, preservingTop: true)
+        window.minSize = window.frame.size
+        window.maxSize = window.frame.size
         if let equalizerWindow {
             let equalizerSize = NSSize(width: 275 * scale, height: (equalizerShade.isEnabled ? 14 : 116) * scale)
             let equalizerTop = equalizerWindow.frame.maxY
             equalizerWindow.setContentSize(equalizerSize)
             equalizerWindow.setFrameOrigin(NSPoint(x: equalizerWindow.frame.minX, y: equalizerTop - equalizerWindow.frame.height))
+            alignFrameToBackingPixels(equalizerWindow, preservingTop: true)
             if isEqualizerDocked && !scaleChanged {
                 equalizerDockOffset = NSPoint(x: equalizerWindow.frame.minX - window.frame.minX, y: equalizerWindow.frame.minY - window.frame.minY)
             }
-            equalizerWindow.minSize = equalizerSize
-            equalizerWindow.maxSize = equalizerSize
+            equalizerWindow.minSize = equalizerWindow.frame.size
+            equalizerWindow.maxSize = equalizerWindow.frame.size
             moveDockedEqualizer()
         }
         if let playlistWindow {
@@ -873,14 +876,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             playlistWindow.setContentSize(playlistSize)
             playlistWindow.setFrameOrigin(NSPoint(x: playlistWindow.frame.minX, y: playlistTop - playlistWindow.frame.height))
+            alignFrameToBackingPixels(playlistWindow, preservingTop: true)
             if isPlaylistDocked && !scaleChanged {
                 playlistDockOffset = NSPoint(x: playlistWindow.frame.minX - window.frame.minX, y: playlistWindow.frame.minY - window.frame.minY)
             }
             if playlistShade.isEnabled {
-                playlistWindow.minSize = NSSize(width: 275 * scale, height: 14 * scale)
-                playlistWindow.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: 14 * scale)
+                playlistWindow.minSize = NSSize(width: backingCeiling(275 * scale, for: playlistWindow.frame), height: playlistWindow.frame.height)
+                playlistWindow.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: playlistWindow.frame.height)
             } else {
-                playlistWindow.minSize = NSSize(width: 275 * scale, height: 116 * scale)
+                playlistWindow.minSize = NSSize(width: backingCeiling(275 * scale, for: playlistWindow.frame), height: backingFloor(116 * scale, for: playlistWindow.frame))
             }
             moveDockedPlaylist()
         }
@@ -893,8 +897,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let height = (context.shade.isEnabled ? 14 : context.layout.height) * scale
             playlistPanel.setContentSize(NSSize(width: context.layout.width * scale, height: height))
             playlistPanel.setFrameOrigin(NSPoint(x: playlistPanel.frame.minX, y: top - playlistPanel.frame.height))
-            playlistPanel.minSize = NSSize(width: 275 * scale, height: context.shade.isEnabled ? 14 * scale : 116 * scale)
-            playlistPanel.maxSize = context.shade.isEnabled ? NSSize(width: CGFloat.greatestFiniteMagnitude, height: 14 * scale) : NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            alignFrameToBackingPixels(playlistPanel, preservingTop: true)
+            playlistPanel.minSize = NSSize(width: backingCeiling(275 * scale, for: playlistPanel.frame),
+                                           height: context.shade.isEnabled ? playlistPanel.frame.height : backingFloor(116 * scale, for: playlistPanel.frame))
+            playlistPanel.maxSize = context.shade.isEnabled
+                ? NSSize(width: CGFloat.greatestFiniteMagnitude, height: playlistPanel.frame.height)
+                : NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
             context.model.windowFrame = playlistPanel.frame
         }
         if let infoWindow {
@@ -904,7 +912,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             infoLogicalSize.height = max(116, infoLogicalSize.height)
             infoWindow.setContentSize(NSSize(width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale))
             infoWindow.setFrameOrigin(NSPoint(x: infoWindow.frame.minX, y: top - infoWindow.frame.height))
-            infoWindow.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
+            alignFrameToBackingPixels(infoWindow, preservingTop: true)
+            infoWindow.minSize = NSSize(width: backingCeiling(minimumWidth * scale, for: infoWindow.frame),
+                                        height: backingFloor(116 * scale, for: infoWindow.frame))
         }
         if scaleChanged {
             restoreAttachedWindowScaleGroups(attachedScaleGroups, scaleRatio: scaleRatio)
@@ -913,6 +923,55 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         lastAppliedInterfaceScale = scale
+    }
+
+    /// Keep window origins on the screen's physical-pixel grid. The rendered
+    /// SwiftUI skin retains its exact scaled height; rounding that height would
+    /// enlarge the hosting view and introduce a transparent strip at its bottom.
+    private func alignFrameToBackingPixels(_ panel: NSWindow, preservingTop: Bool) {
+        let frame = panel.frame
+        let backingScale = backingScale(for: frame)
+        let width = ceil(frame.width * backingScale) / backingScale
+        let height = frame.height
+        let x = (frame.minX * backingScale).rounded() / backingScale
+        let y: CGFloat
+        if preservingTop {
+            let top = (frame.maxY * backingScale).rounded() / backingScale
+            y = top - height
+        } else {
+            y = (frame.minY * backingScale).rounded() / backingScale
+        }
+        let aligned = NSRect(x: x, y: y, width: width, height: height)
+        guard aligned != frame else { return }
+        panel.setFrame(aligned, display: false)
+    }
+
+    private func backingScale(for frame: NSRect) -> CGFloat {
+        let centre = NSPoint(x: frame.midX, y: frame.midY)
+        return (NSScreen.screens.first(where: { $0.frame.contains(centre) }) ?? NSScreen.main)?.backingScaleFactor ?? 1
+    }
+
+    private func backingAlignedOrigin(_ origin: NSPoint, for frame: NSRect) -> NSPoint {
+        let scale = backingScale(for: frame)
+        return NSPoint(x: (origin.x * scale).rounded() / scale,
+                       y: (origin.y * scale).rounded() / scale)
+    }
+
+    private func backingCeiling(_ value: CGFloat, for frame: NSRect) -> CGFloat {
+        let scale = backingScale(for: frame)
+        return ceil(value * scale) / scale
+    }
+
+    private func backingFloor(_ value: CGFloat, for frame: NSRect) -> CGFloat {
+        let scale = backingScale(for: frame)
+        return floor(value * scale) / scale
+    }
+
+    private func oneBackingPixel(for frame: NSRect) -> CGFloat {
+        // Both adjoining bitmap skins can end with a partially covered device
+        // pixel after non-integer scaling. Reserve one pixel for each surface
+        // at a horizontal seam, so the compositor never exposes the desktop.
+        2 / backingScale(for: frame)
     }
 
     /// Build connected components from the pre-scale geometry.  A group can
@@ -958,14 +1017,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let anchorOrigin = group.anchor.frame.origin
             for member in group.members where member !== group.anchor {
                 guard let offset = group.offsets[ObjectIdentifier(member)] else { continue }
-                member.setFrameOrigin(NSPoint(
+                let origin = NSPoint(
                     x: anchorOrigin.x + offset.x * scaleRatio,
                     y: anchorOrigin.y + offset.y * scaleRatio
-                ))
+                )
+                member.setFrameOrigin(backingAlignedOrigin(origin, for: member.frame))
             }
-            // Restore the one-backing-pixel seam compensation for fractional
-            // scales without letting a nearby screen edge pull one member out
-            // of its just-restored group.
+            // Restore exact common edges without letting a nearby screen edge
+            // pull one member out of its just-restored group.
             for member in group.members where member !== group.anchor {
                 magnet(member, against: group.members.filter { $0 !== member }, includeScreenEdges: false)
             }
@@ -1819,14 +1878,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isMovingMainDragGroup = false
             playback.setVisualUpdatesSuspended(false)
         }
-        let group = Set(mainDragGroupWindows.map(ObjectIdentifier.init))
-        magnet(window, against: ([equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values)
-            .filter { !group.contains(ObjectIdentifier($0)) })
-        moveMainDragGroup(by: NSPoint(
-            x: window.frame.minX - (mainDragLastOrigin?.x ?? window.frame.minX),
-            y: window.frame.minY - (mainDragLastOrigin?.y ?? window.frame.minY)
-        ))
+        // The complete magnet pass is performed for every drag event. Do not
+        // repeat it here: a second pass after mouse-up can resolve another
+        // nearby edge and make the already settled group visibly jump.
         mainDragGroupWindows.removeAll()
+        mainDragExternalWindows.removeAll()
         mainDragWindowOffsets.removeAll()
         mainDragLastOrigin = nil
         restoreMainDragShadows()
@@ -1862,8 +1918,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         mainDragGroupWindows = group.filter { $0 !== window }
+        let groupIDs = Set(group.map(ObjectIdentifier.init))
+        mainDragExternalWindows = ([equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values)
+            .filter { $0.isVisible && !groupIDs.contains(ObjectIdentifier($0)) }
         mainDragWindowOffsets = Dictionary(uniqueKeysWithValues: mainDragGroupWindows.map {
-            (ObjectIdentifier($0), NSPoint(x: $0.frame.minX - window.frame.minX, y: $0.frame.minY - window.frame.minY))
+            return (ObjectIdentifier($0), NSPoint(
+                x: $0.frame.minX - window.frame.minX,
+                y: $0.frame.minY - window.frame.minY
+            ))
         })
         mainDragLastOrigin = window.frame.origin
         // A group of transparent borderless windows makes the compositor
@@ -1915,33 +1977,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainDragLastOrigin = window.frame.origin
     }
 
-    private func moveMainDragGroup(by delta: NSPoint) {
-        guard delta != .zero else { return }
-        for panel in mainDragGroupWindows {
-            panel.setFrame(NSRect(x: panel.frame.minX + delta.x, y: panel.frame.minY + delta.y,
-                                  width: panel.frame.width, height: panel.frame.height), display: false)
-            if let id = playlistWindows.first(where: { $0.value === panel })?.key,
-               let model = playlistManager.playlist(id: id) {
-                model.windowFrame = panel.frame
-            }
-        }
-    }
-
     /// Called for every drag event, rather than only on mouse-up, so the
     /// attraction is visible while the user is moving a skin window.
     func magnetWindowWhileDragging(_ movingWindow: NSWindow) {
-        let allPlaylistWindows = playlistWindows.values.filter { $0 !== movingWindow }
-        let visibleInfo = infoWindow?.isVisible == true && infoWindow !== movingWindow ? [infoWindow!] : []
         if movingWindow === window {
-            let group = Set(mainDragGroupWindows.map(ObjectIdentifier.init))
-            magnet(movingWindow, against: ([equalizerWindow].compactMap { $0 } + visibleInfo + allPlaylistWindows)
-                .filter { !group.contains(ObjectIdentifier($0)) })
+            magnet(movingWindow, against: mainDragExternalWindows, includeScreenEdges: false)
             moveAttachedWindowsWithMain()
             magnetMainDragGroupToScreen()
-        } else if movingWindow === equalizerWindow {
-            magnet(movingWindow, against: [window].compactMap { $0 } + visibleInfo + allPlaylistWindows)
         } else {
-            magnet(movingWindow, against: [window, equalizerWindow].compactMap { $0 } + visibleInfo + allPlaylistWindows)
+            let allPlaylistWindows = playlistWindows.values.filter { $0 !== movingWindow }
+            let visibleInfo = infoWindow?.isVisible == true && infoWindow !== movingWindow ? [infoWindow!] : []
+            if movingWindow === equalizerWindow {
+                magnet(movingWindow, against: [window].compactMap { $0 } + visibleInfo + allPlaylistWindows)
+            } else {
+                magnet(movingWindow, against: [window, equalizerWindow].compactMap { $0 } + visibleInfo + allPlaylistWindows)
+            }
         }
     }
 
@@ -1954,7 +2004,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ) {
         let threshold: CGFloat = 12
         var frame = movingWindow.frame
-        let seamOverlap = compositorSeamOverlap(for: frame)
+        let verticalSeamOverlap = oneBackingPixel(for: frame)
         for neighbour in neighbours {
             let other = neighbour.frame
             // Snap to a neighbouring playlist even while the windows have not
@@ -1963,12 +2013,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let verticallyClose = frame.maxY >= other.minY - threshold && frame.minY <= other.maxY + threshold
             let horizontallyClose = frame.maxX >= other.minX - threshold && frame.minX <= other.maxX + threshold
             if verticallyClose {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
             }
             if horizontallyClose {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - verticalSeamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + verticalSeamOverlap }
             }
             // Side-by-side windows also align to a common top or bottom edge.
             if abs(frame.maxY - other.maxY) <= threshold { frame.origin.y = other.maxY - frame.height }
@@ -1977,12 +2027,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if abs(frame.minX - other.minX) <= threshold { frame.origin.x = other.minX }
             if abs(frame.maxX - other.maxX) <= threshold { frame.origin.x = other.maxX - frame.width }
             if frame.maxY > other.minY && frame.minY < other.maxY {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
             }
             if frame.maxX > other.minX && frame.minX < other.maxX {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - verticalSeamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + verticalSeamOverlap }
             }
         }
         // Screen edges have the final priority over window-to-window alignment.
@@ -1992,23 +2042,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if abs(frame.minY - screen.minY) <= threshold { frame.origin.y = screen.minY }
             if abs(frame.maxY - screen.maxY) <= threshold { frame.origin.y = screen.maxY - frame.height }
         }
+        frame.origin = backingAlignedOrigin(frame.origin, for: frame)
         if movingWindow.frame.origin != frame.origin {
             movingWindow.setFrameOrigin(frame.origin)
         }
-    }
-
-    /// Window backing stores must start and end on whole device pixels. A
-    /// fractional interface scale (for example, 130%) can place adjacent
-    /// borderless windows on opposite sides of one backing pixel. Overlap the
-    /// two surfaces by that one pixel only in this case; integer pixel scales
-    /// retain exact edge-to-edge classic Winamp geometry.
-    private func compositorSeamOverlap(for frame: NSRect) -> CGFloat {
-        let centre = NSPoint(x: frame.midX, y: frame.midY)
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(centre) }) ?? NSScreen.main
-        let backingScale = screen?.backingScaleFactor ?? 1
-        let scaledPixels = CGFloat(interfaceScale.factor) * backingScale
-        guard abs(scaledPixels - scaledPixels.rounded()) > 0.000_1 else { return 0 }
-        return 1 / backingScale
     }
 
     private func magnetDockedGroupToScreen() {
@@ -2030,8 +2067,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func magnetMainDragGroupToScreen() {
         var groupFrame = window.frame
-        for panel in mainDragGroupWindows { groupFrame = groupFrame.union(panel.frame) }
-        guard let screen = screenFrame(containing: window.frame) ?? NSScreen.main?.visibleFrame else { return }
+        for panel in mainDragGroupWindows {
+            guard let offset = mainDragWindowOffsets[ObjectIdentifier(panel)] else { continue }
+            groupFrame = groupFrame.union(NSRect(
+                origin: NSPoint(x: window.frame.minX + offset.x, y: window.frame.minY + offset.y),
+                size: panel.frame.size
+            ))
+        }
+        guard let screen = screenFrame(containing: groupFrame) ?? screenFrame(containing: window.frame)
+            ?? NSScreen.main?.visibleFrame else { return }
         let threshold: CGFloat = 12
         var delta = NSPoint.zero
         if abs(groupFrame.minX - screen.minX) <= threshold { delta.x = screen.minX - groupFrame.minX }
@@ -2040,8 +2084,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if abs(groupFrame.maxY - screen.maxY) <= threshold { delta.y = screen.maxY - groupFrame.maxY }
         guard delta != .zero else { return }
         window.setFrameOrigin(NSPoint(x: window.frame.minX + delta.x, y: window.frame.minY + delta.y))
-        moveMainDragGroup(by: delta)
-        mainDragLastOrigin = window.frame.origin
+        moveAttachedWindowsWithMain()
     }
 
     private func screenFrame(containing frame: NSRect) -> NSRect? {
@@ -2050,7 +2093,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func isMagneticallyAttached(_ frame: NSRect, to other: NSRect) -> Bool {
-        let epsilon = max(CGFloat(0.5), compositorSeamOverlap(for: frame))
+        let epsilon: CGFloat = 0.5
         return abs(frame.minX - other.minX) <= epsilon || abs(frame.maxX - other.maxX) <= epsilon ||
             abs(frame.minX - other.maxX) <= epsilon || abs(frame.maxX - other.minX) <= epsilon ||
             abs(frame.minY - other.minY) <= epsilon || abs(frame.maxY - other.maxY) <= epsilon ||
