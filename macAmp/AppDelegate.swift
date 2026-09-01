@@ -444,6 +444,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
@@ -503,6 +504,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             playback.volume = min(1, playback.volume + 0.05)
         default: return false
         }
+        return true
+    }
+
+    /// ⌘C is deliberately local to the Info panel: it copies the panel's
+    /// metadata summary without changing copy behaviour in the player or a
+    /// Playlist Editor.
+    private func handleInfoSummaryShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 8, // physical C key
+              modifiers.contains(.command),
+              modifiers.intersection([.option, .control, .shift]).isEmpty,
+              event.window === infoWindow,
+              infoWindow?.isKeyWindow == true,
+              let panel = infoWindow?.contentView as? InfoPanelView else {
+            return false
+        }
+        panel.copySummary()
         return true
     }
 

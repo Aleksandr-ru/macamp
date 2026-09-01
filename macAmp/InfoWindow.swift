@@ -6,6 +6,58 @@ import Combine
 /// not decode artwork or long text frames merely because a row is visible.
 final class InfoWindowModel: ObservableObject {
     struct Content {
+        enum CopyableTag: Int, CaseIterable {
+            case artwork, artist, title, album, year, genre, lyrics, comment, url, copyright, filename, folder, fullPath
+
+            var menuTitle: String {
+                switch self {
+                case .artwork: "Copy Image"
+                case .artist: "Copy Artist"
+                case .title: "Copy Title"
+                case .album: "Copy Album"
+                case .year: "Copy Year"
+                case .genre: "Copy Genre"
+                case .lyrics: "Copy Lyrics"
+                case .comment: "Copy Comment"
+                case .url: "Copy URL"
+                case .copyright: "Copy Copyright"
+                case .filename: "Copy Filename"
+                case .folder: "Copy Folder"
+                case .fullPath: "Copy Full Path"
+                }
+            }
+
+            func value(in content: Content) -> String? {
+                switch self {
+                case .artwork: return nil
+                case .artist: return content.fieldValue(label: "Artist:")
+                case .title: return content.fieldValue(label: "Title:")
+                case .album: return content.fieldValue(label: "Album:")
+                case .year: return content.fieldValue(label: "Year:")
+                case .genre: return content.fieldValue(label: "Genre:")
+                case .lyrics: return content.lyrics
+                case .comment: return content.comment
+                case .url: return content.webURL
+                case .copyright: return content.copyright
+                case .filename:
+                    guard let value = content.url?.lastPathComponent, !value.isEmpty else { return nil }
+                    return value
+                case .folder:
+                    guard let value = content.url?.deletingLastPathComponent().path, !value.isEmpty else { return nil }
+                    return value
+                case .fullPath:
+                    guard let value = content.url?.path, !value.isEmpty else { return nil }
+                    return value
+                }
+            }
+
+            func isAvailable(in content: Content) -> Bool {
+                if self == .artwork { return content.artwork != nil }
+                guard let value = value(in: content) else { return false }
+                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+
         var url: URL?
         var artwork: NSImage?
         var rating = 0
@@ -14,7 +66,14 @@ final class InfoWindowModel: ObservableObject {
         var comment: String?
         var webURL: String?
         var copyright: String?
+        var bitrate: String?
+        var duration: String?
+        var fileSize: String?
         var technicalInfo: [String] = []
+
+        private func fieldValue(label: String) -> String? {
+            fields.first(where: { $0.label == label })?.value
+        }
     }
 
     @Published private(set) var content = Content()
@@ -129,15 +188,23 @@ final class InfoWindowModel: ObservableObject {
 
         var technical: [String] = []
         let duration = asset.duration.seconds
-        if duration.isFinite, duration > 0 { technical.append(formattedDuration(duration)) }
+        if duration.isFinite, duration > 0 {
+            result.duration = formattedDuration(duration)
+            technical.append(result.duration!)
+        }
         let fileSize = fileSize(for: url)
         let rate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
         if rate > 0 {
-            technical.insert("\(Int((rate / 1_000).rounded())) kbps", at: 0)
+            result.bitrate = "\(Int((rate / 1_000).rounded())) kbps"
+            technical.insert(result.bitrate!, at: 0)
         } else if let fileSize, duration.isFinite, duration > 0 {
-            technical.insert("\(Int((Double(fileSize) * 8 / duration / 1_000).rounded())) kbps", at: 0)
+            result.bitrate = "\(Int((Double(fileSize) * 8 / duration / 1_000).rounded())) kbps"
+            technical.insert(result.bitrate!, at: 0)
         }
-        if let fileSize { technical.append(ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)) }
+        if let fileSize {
+            result.fileSize = ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)
+            technical.append(result.fileSize!)
+        }
         result.technicalInfo = technical
         return result
     }
@@ -281,6 +348,8 @@ final class InfoPanelView: NSView {
         isRebuilding = true
         defer { isRebuilding = false }
         documentView.subviews.forEach { $0.removeFromSuperview() }
+        let copyMenu = makeCopyMenu()
+        documentView.menu = copyMenu
 
         let contentSize = scrollView.contentSize
         let width = max(1, contentSize.width)
@@ -304,6 +373,7 @@ final class InfoPanelView: NSView {
                       lineBreakMode: NSLineBreakMode = .byWordWrapping, height: CGFloat? = nil,
                       x: CGFloat = inset, width: CGFloat = usableWidth) {
             let label = makeLabel(text, alignment: alignment, lineBreakMode: lineBreakMode)
+            label.menu = copyMenu
             let rowHeight = height ?? textHeight(text, width: width, lineBreakMode: lineBreakMode)
             label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
             documentView.addSubview(label)
@@ -320,6 +390,7 @@ final class InfoPanelView: NSView {
             let imageWidth = min(artworkSize.width * pixelScale, columnWidth, minimumWindowArtworkWidth)
             let imageHeight = imageWidth * artworkSize.height / artworkSize.width
             let image = InfoArtworkView(image: artwork)
+            image.menu = copyMenu
             let imageX = usesTwoColumnLayout
                 ? leftColumnX + (columnWidth - imageWidth) * 0.5
                 : (width - imageWidth) * 0.5
@@ -333,6 +404,7 @@ final class InfoPanelView: NSView {
         }
 
         let rating = InfoRatingView(rating: model.content.rating, font: NSFont.monospacedSystemFont(ofSize: 16 * pixelScale, weight: .regular), color: skin.playlistColors().normalText)
+        rating.menu = copyMenu
         rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
                               width: usesTwoColumnLayout ? columnWidth : width,
                               height: max(18 * pixelScale, rating.intrinsicContentSize.height))
@@ -346,6 +418,8 @@ final class InfoPanelView: NSView {
         for field in model.content.fields {
             let key = InfoWrappedTextView(text: field.label, font: tableFont, color: tableColor, alignment: .right)
             let value = InfoWrappedTextView(text: field.value, font: tableFont, color: tableColor, alignment: .left)
+            key.menu = copyMenu
+            value.menu = copyMenu
             let rowHeight = max(key.requiredHeight(for: tableColumnWidth), value.requiredHeight(for: tableColumnWidth))
             let tableX = usesTwoColumnLayout ? rightColumnX : inset
             key.frame = NSRect(x: tableX, y: y, width: tableColumnWidth, height: rowHeight)
@@ -365,6 +439,7 @@ final class InfoPanelView: NSView {
                 color: skin.playlistColors().normalText,
                 alignment: .center
             )
+            filenameView.menu = copyMenu
             let filenameHeight = filenameView.requiredHeight(for: columnWidth)
             filenameView.frame = NSRect(x: detailX, y: y, width: columnWidth, height: filenameHeight)
             documentView.addSubview(filenameView)
@@ -383,6 +458,70 @@ final class InfoPanelView: NSView {
             scrollView.contentView.scroll(to: .zero)
             scrollView.reflectScrolledClipView(scrollView.contentView)
         }
+    }
+
+    private func makeCopyMenu() -> NSMenu {
+        let menu = NSMenu()
+        for tag in InfoWindowModel.Content.CopyableTag.allCases {
+            guard tag.isAvailable(in: model.content) else { continue }
+            let item = NSMenuItem(title: tag.menuTitle, action: #selector(copyTag(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tag.rawValue
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let summary = NSMenuItem(title: "Copy Summary", action: #selector(copySummaryMenuItem(_:)), keyEquivalent: "c")
+        summary.keyEquivalentModifierMask = [.command]
+        summary.target = self
+        summary.isEnabled = !summaryText.isEmpty
+        menu.addItem(summary)
+        return menu
+    }
+
+    @objc private func copyTag(_ sender: NSMenuItem) {
+        guard let tag = InfoWindowModel.Content.CopyableTag(rawValue: sender.tag) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if tag == .artwork, let artwork = model.content.artwork {
+            pasteboard.writeObjects([artwork])
+            return
+        }
+        guard let value = tag.value(in: model.content) else { return }
+        pasteboard.setString(value, forType: .string)
+    }
+
+    /// Available to AppDelegate's local key-event router so ⌘C remains local
+    /// to the Info panel instead of becoming a global application shortcut.
+    func copySummary() {
+        guard !summaryText.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(summaryText, forType: .string)
+    }
+
+    @objc private func copySummaryMenuItem(_ sender: NSMenuItem) {
+        copySummary()
+    }
+
+    private var summaryText: String {
+        let content = model.content
+        var lines = content.fields.compactMap { field -> String? in
+            let value = field.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return nil }
+            return "\(field.label.dropLast()): \(value)"
+        }
+        func append(_ label: String, _ value: String?) {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
+            lines.append("\(label): \(value)")
+        }
+        append("URL", content.webURL)
+        append("Copyright", content.copyright)
+        append("Filename", content.url?.lastPathComponent)
+        append("Folder", content.url?.deletingLastPathComponent().path)
+        append("Bitrate", content.bitrate)
+        append("Duration", content.duration)
+        append("Size", content.fileSize)
+        return lines.joined(separator: "\n")
     }
 
     private var closeRect: NSRect { let scale = pixelScale; return NSRect(x: bounds.width - 11 * scale, y: bounds.height - 12 * scale, width: 9 * scale, height: 9 * scale) }
