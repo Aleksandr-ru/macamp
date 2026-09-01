@@ -446,12 +446,16 @@ final class InfoPanelView: NSView {
         if let comment = model.content.comment { addLabel(comment, alignment: .center, x: detailX, width: columnWidth, detectsLinks: true) }
         if let webURL = model.content.webURL { addLabel(webURL, alignment: .center, x: detailX, width: columnWidth, detectsLinks: true) }
         if let copyright = model.content.copyright { addLabel(copyright, alignment: .center, x: detailX, width: columnWidth) }
-        if let filename = model.content.url?.lastPathComponent, !filename.isEmpty {
+        if let fileURL = model.content.url,
+           let filename = fileURL.lastPathComponent.nilIfEmpty {
             let filenameView = InfoWrappedTextView(
                 text: filename,
                 font: NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular),
                 color: skin.playlistColors().normalText,
-                alignment: .center
+                alignment: .center,
+                onClick: fileURL.isFileURL ? {
+                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                } : nil
             )
             filenameView.menu = copyMenu
             let filenameHeight = filenameView.requiredHeight(for: columnWidth)
@@ -575,6 +579,24 @@ final class InfoPanelView: NSView {
             onResize((startFrame.width + point.x - start.x) / scale, (startFrame.height - point.y + start.y) / scale)
         }
     }
+
+    /// Cursor-update events can be delivered to the enclosing scroll view
+    /// when this non-activating panel is not key. AppDelegate forwards those
+    /// events here so interactive text remains discoverable in every state.
+    func updateHoverCursor(at windowPoint: NSPoint) {
+        let point = convert(windowPoint, from: nil)
+        guard contentRect.contains(point) else { return }
+        let documentPoint = documentView.convert(point, from: self)
+        if let target = documentView.hitTest(documentPoint) as? InfoCursorTarget {
+            target.updateCursor(atWindowPoint: windowPoint)
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+}
+
+private protocol InfoCursorTarget: AnyObject {
+    func updateCursor(atWindowPoint: NSPoint)
 }
 
 private final class InfoDocumentView: NSView {
@@ -611,15 +633,25 @@ private final class InfoArtworkView: NSView {
 /// and rendering intentionally share this single stack. Word wrapping keeps
 /// normal names readable; TextKit falls back to a character break only when a
 /// single word is wider than the available line.
-private final class InfoWrappedTextView: NSView {
+private final class InfoWrappedTextView: NSView, InfoCursorTarget {
     private let storage: NSTextStorage
     private let layoutManager = NSLayoutManager()
     private let container = NSTextContainer(size: .zero)
     private let font: NSFont
     private let links: [(range: NSRange, url: URL)]
+    private let onClick: (() -> Void)?
+    private var cursorTrackingArea: NSTrackingArea?
 
-    init(text: String, font: NSFont, color: NSColor, alignment: NSTextAlignment, detectsLinks: Bool = false) {
+    init(
+        text: String,
+        font: NSFont,
+        color: NSColor,
+        alignment: NSTextAlignment,
+        detectsLinks: Bool = false,
+        onClick: (() -> Void)? = nil
+    ) {
         self.font = font
+        self.onClick = onClick
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = alignment
         paragraph.lineBreakMode = .byWordWrapping
@@ -644,6 +676,13 @@ private final class InfoWrappedTextView: NSView {
             }
         } else {
             links = []
+        }
+        if onClick != nil {
+            attributedText.addAttributes([
+                .foregroundColor: color,
+                .underlineColor: color,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: NSRange(text.startIndex..., in: text))
         }
         storage = NSTextStorage(attributedString: attributedText)
         super.init(frame: .zero)
@@ -671,6 +710,7 @@ private final class InfoWrappedTextView: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
+        if onClick != nil { addCursorRect(bounds, cursor: .pointingHand) }
         guard !links.isEmpty else { return }
         container.containerSize = bounds.size
         layoutManager.ensureLayout(for: container)
@@ -686,10 +726,41 @@ private final class InfoWrappedTextView: NSView {
         }
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let cursorTrackingArea { removeTrackingArea(cursorTrackingArea) }
+        cursorTrackingArea = nil
+        guard onClick != nil || !links.isEmpty else { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.cursorUpdate, .inVisibleRect, .activeAlways],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        cursorTrackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        updateCursor(atWindowPoint: event.locationInWindow)
+    }
+
+    func updateCursor(atWindowPoint windowPoint: NSPoint) {
+        let point = convert(windowPoint, from: nil)
+        if onClick != nil || link(at: point) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+
     override func mouseUp(with event: NSEvent) {
-        guard event.type == .leftMouseUp,
-              let url = link(at: convert(event.locationInWindow, from: nil)) else { return }
-        NSWorkspace.shared.open(url)
+        guard event.type == .leftMouseUp else { return }
+        if let url = link(at: convert(event.locationInWindow, from: nil)) {
+            NSWorkspace.shared.open(url)
+        } else {
+            onClick?()
+        }
     }
 
     private func link(at point: NSPoint) -> URL? {
@@ -702,6 +773,10 @@ private final class InfoWrappedTextView: NSView {
         )
         return links.first(where: { NSLocationInRange(characterIndex, $0.range) })?.url
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 private final class InfoRatingView: NSView {

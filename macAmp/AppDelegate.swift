@@ -434,10 +434,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func installPlaybackShortcuts() {
-        keyboardShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        keyboardShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .mouseMoved]) { [weak self] event in
             guard let self else { return event }
+            if event.type == .mouseMoved {
+                self.updateInfoHoverCursor(event)
+                return event
+            }
             return self.handleLocalPlaybackShortcut(event) ? nil : event
         }
+    }
+
+    private func updateInfoHoverCursor(_ event: NSEvent) {
+        guard event.window === infoWindow,
+              let panel = infoWindow?.contentView as? InfoPanelView else { return }
+        panel.updateHoverCursor(at: event.locationInWindow)
     }
 
     /// Local monitoring is the only AppKit path that consistently carries the
