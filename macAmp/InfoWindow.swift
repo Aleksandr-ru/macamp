@@ -371,12 +371,26 @@ final class InfoPanelView: NSView {
         var leftArtworkHeight: CGFloat = 0
         func addLabel(_ text: String, alignment: NSTextAlignment = .left,
                       lineBreakMode: NSLineBreakMode = .byWordWrapping, height: CGFloat? = nil,
-                      x: CGFloat = inset, width: CGFloat = usableWidth) {
-            let label = makeLabel(text, alignment: alignment, lineBreakMode: lineBreakMode)
-            label.menu = copyMenu
+                      x: CGFloat = inset, width: CGFloat = usableWidth,
+                      detectsLinks: Bool = false) {
             let rowHeight = height ?? textHeight(text, width: width, lineBreakMode: lineBreakMode)
-            label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
-            documentView.addSubview(label)
+            if detectsLinks {
+                let label = InfoWrappedTextView(
+                    text: text,
+                    font: NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular),
+                    color: skin.playlistColors().normalText,
+                    alignment: alignment,
+                    detectsLinks: true
+                )
+                label.menu = copyMenu
+                label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
+                documentView.addSubview(label)
+            } else {
+                let label = makeLabel(text, alignment: alignment, lineBreakMode: lineBreakMode)
+                label.menu = copyMenu
+                label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
+                documentView.addSubview(label)
+            }
             y += rowHeight + spacing
         }
 
@@ -429,8 +443,8 @@ final class InfoPanelView: NSView {
         }
         let detailX = usesTwoColumnLayout ? rightColumnX : inset
         if let lyrics = model.content.lyrics { addLabel(lyrics, alignment: .center, x: detailX, width: columnWidth) }
-        if let comment = model.content.comment { addLabel(comment, alignment: .center, x: detailX, width: columnWidth) }
-        if let webURL = model.content.webURL { addLabel(webURL, alignment: .center, x: detailX, width: columnWidth) }
+        if let comment = model.content.comment { addLabel(comment, alignment: .center, x: detailX, width: columnWidth, detectsLinks: true) }
+        if let webURL = model.content.webURL { addLabel(webURL, alignment: .center, x: detailX, width: columnWidth, detectsLinks: true) }
         if let copyright = model.content.copyright { addLabel(copyright, alignment: .center, x: detailX, width: columnWidth) }
         if let filename = model.content.url?.lastPathComponent, !filename.isEmpty {
             let filenameView = InfoWrappedTextView(
@@ -602,17 +616,36 @@ private final class InfoWrappedTextView: NSView {
     private let layoutManager = NSLayoutManager()
     private let container = NSTextContainer(size: .zero)
     private let font: NSFont
+    private let links: [(range: NSRange, url: URL)]
 
-    init(text: String, font: NSFont, color: NSColor, alignment: NSTextAlignment) {
+    init(text: String, font: NSFont, color: NSColor, alignment: NSTextAlignment, detectsLinks: Bool = false) {
         self.font = font
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = alignment
         paragraph.lineBreakMode = .byWordWrapping
-        storage = NSTextStorage(string: text, attributes: [
+        let attributedText = NSMutableAttributedString(string: text, attributes: [
             .font: font,
             .foregroundColor: color,
             .paragraphStyle: paragraph
         ])
+        if detectsLinks,
+           let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            links = detector.matches(in: text, options: [], range: NSRange(text.startIndex..., in: text)).compactMap { match in
+                guard let url = match.url else { return nil }
+                // Keep the skin's normal text colour. The `.link` attribute
+                // lets AppKit substitute the system link tint, while our own
+                // hit testing already supplies the interactive behaviour.
+                attributedText.addAttributes([
+                    .foregroundColor: color,
+                    .underlineColor: color,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ], range: match.range)
+                return (match.range, url)
+            }
+        } else {
+            links = []
+        }
+        storage = NSTextStorage(attributedString: attributedText)
         super.init(frame: .zero)
         container.lineFragmentPadding = 0
         container.lineBreakMode = .byWordWrapping
@@ -634,6 +667,40 @@ private final class InfoWrappedTextView: NSView {
         container.containerSize = bounds.size
         layoutManager.ensureLayout(for: container)
         layoutManager.drawGlyphs(forGlyphRange: layoutManager.glyphRange(for: container), at: .zero)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard !links.isEmpty else { return }
+        container.containerSize = bounds.size
+        layoutManager.ensureLayout(for: container)
+        for link in links {
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: link.range, actualCharacterRange: nil)
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphRange,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: container
+            ) { [weak self] rect, _ in
+                self?.addCursorRect(rect, cursor: .pointingHand)
+            }
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard event.type == .leftMouseUp,
+              let url = link(at: convert(event.locationInWindow, from: nil)) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func link(at point: NSPoint) -> URL? {
+        container.containerSize = bounds.size
+        layoutManager.ensureLayout(for: container)
+        let characterIndex = layoutManager.characterIndex(
+            for: point,
+            in: container,
+            fractionOfDistanceBetweenInsertionPoints: nil
+        )
+        return links.first(where: { NSLocationInRange(characterIndex, $0.range) })?.url
     }
 }
 
