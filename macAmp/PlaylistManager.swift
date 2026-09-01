@@ -31,6 +31,10 @@ final class PlaylistModel: ObservableObject, Identifiable {
     @Published var name: String
     @Published var entries: [PlaylistEntry]
     @Published var selectedIDs = Set<UUID>()
+    /// The fixed end of a Shift-click range. This is deliberately transient:
+    /// selection itself is restored, while Finder-style range gestures begin
+    /// from the first currently selected row after an app relaunch.
+    var selectionAnchorID: UUID?
     /// Remembers this editor's playback cursor independently from the global
     /// active source, so it can be resumed after another playlist was active.
     @Published var lastPlayedEntryID: UUID?
@@ -475,6 +479,46 @@ final class PlaylistManager: ObservableObject {
 
     func focus(_ playlist: PlaylistModel) { focusedPlaylistID = playlist.id; save() }
 
+    /// Applies the same row-selection rules used by Finder:
+    /// - click selects one row;
+    /// - Command-click toggles one row without disturbing the rest;
+    /// - Shift-click selects the inclusive range from the selection anchor;
+    /// - Command-Shift-click adds that range to the existing selection.
+    ///
+    /// The anchor is held separately from the selected set so a Command-click
+    /// can deselect its row yet still be the start of the next Shift-click.
+    func selectEntry(
+        _ entry: PlaylistEntry,
+        in playlist: PlaylistModel,
+        extending: Bool,
+        toggling: Bool
+    ) {
+        guard let targetIndex = playlist.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+
+        if extending {
+            let anchorID = playlist.selectionAnchorID
+                ?? playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) })?.id
+                ?? entry.id
+            let anchorIndex = playlist.entries.firstIndex(where: { $0.id == anchorID }) ?? targetIndex
+            let range = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+            let rangeIDs = Set(playlist.entries[range].map(\.id))
+            playlist.selectedIDs = toggling ? playlist.selectedIDs.union(rangeIDs) : rangeIDs
+            playlist.selectionAnchorID = playlist.entries[anchorIndex].id
+            return
+        }
+
+        if toggling {
+            if playlist.selectedIDs.contains(entry.id) {
+                playlist.selectedIDs.remove(entry.id)
+            } else {
+                playlist.selectedIDs.insert(entry.id)
+            }
+        } else {
+            playlist.selectedIDs = [entry.id]
+        }
+        playlist.selectionAnchorID = entry.id
+    }
+
     /// Moves the single keyboard selection without triggering persistence or
     /// playlist-wide work. The visible editor decides how to reveal the row.
     @discardableResult
@@ -493,6 +537,7 @@ final class PlaylistManager: ObservableObject {
         let target = min(max(0, anchor + offset), playlist.entries.count - 1)
         let entry = playlist.entries[target]
         playlist.selectedIDs = [entry.id]
+        playlist.selectionAnchorID = entry.id
         return entry
     }
 
@@ -523,7 +568,7 @@ final class PlaylistManager: ObservableObject {
     func removeSelected(from playlist: PlaylistModel) {
         playlist.entries.removeAll { playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
-        playlist.selectedIDs.removeAll(); playlist.isDirty = true
+        playlist.selectedIDs.removeAll(); playlist.selectionAnchorID = nil; playlist.isDirty = true
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
@@ -535,13 +580,17 @@ final class PlaylistManager: ObservableObject {
         playlist.entries.removeAll { $0.hasPlaybackError }
         playlist.recalculateTotalDuration()
         playlist.selectedIDs.formIntersection(Set(playlist.entries.map(\.id)))
+        if let anchor = playlist.selectionAnchorID,
+           !playlist.entries.contains(where: { $0.id == anchor }) {
+            playlist.selectionAnchorID = nil
+        }
         playlist.isDirty = true
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
 
     func clear(_ playlist: PlaylistModel) {
-        playlist.entries.removeAll(); playlist.selectedIDs.removeAll(); playlist.isDirty = true
+        playlist.entries.removeAll(); playlist.selectedIDs.removeAll(); playlist.selectionAnchorID = nil; playlist.isDirty = true
         playlist.clearTotalDuration()
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()

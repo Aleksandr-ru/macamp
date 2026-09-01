@@ -2407,10 +2407,23 @@ private struct PlaylistView: View {
     private var playlistBottomControls: some View {
         ZStack(alignment: .topLeading) {
             playlistMenuHotspot(x: 25, index: 0, titles: ["Add Files…", "Add Folder…", "Add URL…"])
-            playlistMenuHotspot(x: 54, index: 1, titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove with Error"])
-            playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"])
+            playlistMenuHotspot(x: 54, index: 1, titles: [
+                "Remove Selected", "Crop", "Clear Playlist", "Remove with Error"
+            ], shortcuts: [
+                "Remove Selected": .delete,
+                "Remove with Error": .optionDelete
+            ])
+            playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"], shortcuts: [
+                "Select All": .commandA
+            ])
             playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Sort…", "Misc…"])
-            playlistMenuHotspot(x: layout.width - 33, index: 4, titles: ["New Playlist", "Load Playlist…", "Save Playlist As…", "Clear Playlist"])
+            playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
+                "New Playlist", "Load Playlist…", "Save Playlist As…", "Clear Playlist"
+            ], shortcuts: [
+                "New Playlist": .commandN,
+                "Load Playlist…": .commandO,
+                "Save Playlist As…": .commandShiftS
+            ])
 
             PlaylistStatusField(skin: skin, playback: playback, manager: manager, playlist: playlist)
                 .frame(width: 90, height: 8, alignment: .leading)
@@ -2439,7 +2452,16 @@ private struct PlaylistView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(playlist.entries.indices, id: \.self) { index in
                         let entry = playlist.entries[index]
-                        Button(action: { playlist.selectedIDs = [entry.id]; AppDelegate.shared?.selectInfoTarget(entry) }) {
+                        Button(action: {
+                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                            manager.selectEntry(
+                                entry,
+                                in: playlist,
+                                extending: modifiers.contains(.shift),
+                                toggling: modifiers.contains(.command)
+                            )
+                            AppDelegate.shared?.selectInfoTarget(entry)
+                        }) {
                             let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
                             let isSelected = playlist.selectedIDs.contains(entry.id)
                             let rowLabel = entry.hasPlaybackError ? "!" : String(index + 1)
@@ -2590,8 +2612,13 @@ private struct PlaylistView: View {
         return String(format: "%02d:%02d:%02d", value / 3600, (value / 60) % 60, value % 60)
     }
 
-    private func playlistMenuHotspot(x: CGFloat, index: Int, titles: [String]) -> some View {
-        PlaylistMenuHotspot(titles: titles, pressedImage: skin.playlistMenuButtonPressedImage(index: index))
+    private func playlistMenuHotspot(
+        x: CGFloat,
+        index: Int,
+        titles: [String],
+        shortcuts: [String: PlaylistMenuShortcut] = [:]
+    ) -> some View {
+        PlaylistMenuHotspot(titles: titles, shortcuts: shortcuts, pressedImage: skin.playlistMenuButtonPressedImage(index: index))
             .frame(width: 22, height: 18)
             .position(x: x, y: layout.height - 21)
     }
@@ -2669,23 +2696,39 @@ private final class PlaylistScrollPositionNSView: NSView {
 /// native popup menu. SwiftUI Button actions occur too late (on mouse-up).
 private struct PlaylistMenuHotspot: NSViewRepresentable {
     let titles: [String]
+    let shortcuts: [String: PlaylistMenuShortcut]
     let pressedImage: NSImage?
 
     func makeNSView(context: Context) -> PlaylistMenuHotspotNSView {
         let view = PlaylistMenuHotspotNSView()
         view.titles = titles
+        view.shortcuts = shortcuts
         view.pressedImage = pressedImage
         return view
     }
 
     func updateNSView(_ nsView: PlaylistMenuHotspotNSView, context: Context) {
         nsView.titles = titles
+        nsView.shortcuts = shortcuts
         nsView.pressedImage = pressedImage
     }
 }
 
+private struct PlaylistMenuShortcut {
+    let keyEquivalent: String
+    let modifierFlags: NSEvent.ModifierFlags
+
+    static let delete = Self(keyEquivalent: "\u{8}", modifierFlags: [])
+    static let optionDelete = Self(keyEquivalent: "\u{8}", modifierFlags: [.option])
+    static let commandA = Self(keyEquivalent: "a", modifierFlags: [.command])
+    static let commandN = Self(keyEquivalent: "n", modifierFlags: [.command])
+    static let commandO = Self(keyEquivalent: "o", modifierFlags: [.command])
+    static let commandShiftS = Self(keyEquivalent: "s", modifierFlags: [.command, .shift])
+}
+
 private final class PlaylistMenuHotspotNSView: NSView {
     var titles: [String] = []
+    var shortcuts: [String: PlaylistMenuShortcut] = [:]
     var pressedImage: NSImage? { didSet { needsDisplay = true } }
     private var isPressed = false { didSet { needsDisplay = true } }
 
@@ -2702,7 +2745,13 @@ private final class PlaylistMenuHotspotNSView: NSView {
 
         let menu = NSMenu()
         for title in titles {
-            let item = NSMenuItem(title: title, action: #selector(selectMenuItem(_:)), keyEquivalent: "")
+            let shortcut = shortcuts[title]
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(selectMenuItem(_:)),
+                keyEquivalent: shortcut?.keyEquivalent ?? ""
+            )
+            item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
             menu.addItem(item)
         }
