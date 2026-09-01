@@ -622,18 +622,23 @@
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <menu key="submenu" title="Window" systemMenu="window" id="Td7-aD-5lo">
                                     <items>
+                                        <menuItem title="Always on Top" keyEquivalent="a" id="dwy-F5-h1a">
+                                            <modifierMask key="keyEquivalentModifierMask" option="YES"/>
+                                        </menuItem>
                                         <menuItem title="Minimize" keyEquivalent="m" id="OY7-WF-poV">
                                             <connections>
                                                 <action selector="performMiniaturize:" target="Ady-hI-5gd" id="VwT-WD-YPe"/>
                                             </connections>
                                         </menuItem>
-                                        <menuItem title="Zoom in" id="R4o-n2-Eq4">
-                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                        <menuItem title="Zoom in" keyEquivalent="+" id="R4o-n2-Eq4">
+                                            <modifierMask key="keyEquivalentModifierMask" command="YES"/>
                                             <connections>
                                                 <action selector="performZoom:" target="Ady-hI-5gd" id="DIl-cC-cCs"/>
                                             </connections>
                                         </menuItem>
-                                        <menuItem title="Zoom out" id="vCF-JB-5dC"/>
+                                        <menuItem title="Zoom out" keyEquivalent="-" id="vCF-JB-5dC">
+                                            <modifierMask key="keyEquivalentModifierMask" command="YES"/>
+                                        </menuItem>
                                         <menuItem title="Windowshade" keyEquivalent="w" id="Vrb-7A-kNu"/>
                                         <menuItem title="Close" keyEquivalent="w" id="DVo-aG-piG">
                                             <modifierMask key="keyEquivalentModifierMask" option="YES"/>

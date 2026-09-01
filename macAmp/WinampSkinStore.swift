@@ -907,6 +907,27 @@ final class WinampSkinStore: ObservableObject {
         return image
     }
 
+    /// Individual persistent Clutterbar indicators are separate sprites in
+    /// TITLEBAR.BMP. This lets AOT and Info remain visible simultaneously.
+    func clutterbarSelectedButtonImage(_ button: Int) -> NSImage? {
+        let buttonMetrics: [(x: Int, y: Int, height: Int)] = [
+            (304, 47, 8), (312, 55, 7), (320, 62, 7),
+            (328, 69, 8), (336, 77, 7)
+        ]
+        guard buttonMetrics.indices.contains(button) else { return nil }
+        let key = "selected-\(button)"
+        if let cached = clutterbarCache[key] { return cached }
+        let metric = buttonMetrics[button]
+        guard let sheet = bitmap(named: "TITLEBAR.BMP"),
+              let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let cropped = source.cropping(to: CGRect(x: metric.x, y: metric.y, width: 8, height: metric.height)) else {
+            return nil
+        }
+        let image = NSImage(cgImage: cropped, size: NSSize(width: 8, height: metric.height))
+        clutterbarCache[key] = image
+        return image
+    }
+
     func playbackIndicatorImage(_ indicator: PlaybackIndicator) -> NSImage? {
         if let cached = playbackIndicatorCache[indicator.rawValue] { return cached }
         let mainX: Int

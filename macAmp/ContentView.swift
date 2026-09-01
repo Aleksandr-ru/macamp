@@ -22,6 +22,8 @@ struct ContentView: View {
     @ObservedObject var equalizerState: EqualizerWindowState
     @ObservedObject var playlistState: PlaylistWindowState
     @ObservedObject var infoState: InfoWindowState
+    @ObservedObject var alwaysOnTopState: AlwaysOnTopState
+    @ObservedObject var settingsWindowState: SettingsWindowState
     @State private var isAdjustingVolume = false
     @State private var isAdjustingBalance = false
     @State private var isEqualizerPressed = false
@@ -30,6 +32,8 @@ struct ContentView: View {
     @State private var isShufflePressed = false
     @State private var isRepeatPressed = false
     @State private var pressedClutterbarButton: Int?
+    @State private var isDoubleSizeIndicatorActive = false
+    @State private var isVisualizationIndicatorActive = false
     @State private var pressedWindowShadeControl: Int?
     @State private var visualizationMode: VisualizationMode = .spectrum
 
@@ -511,8 +515,7 @@ extension ContentView {
     private var visualizationModeButtons: some View {
         ZStack(alignment: .top) {
             Group {
-                let highlightedButton = pressedClutterbarButton ?? (infoState.isVisible ? 2 : nil)
-                if let image = skin.clutterbarImage(pressedButton: highlightedButton) {
+                if let image = skin.clutterbarImage(pressedButton: pressedClutterbarButton) {
                     Image(nsImage: image)
                         .interpolation(.none)
                 } else {
@@ -520,25 +523,68 @@ extension ContentView {
                 }
             }
             .frame(width: 8, height: 43)
+            if settingsWindowState.isVisible, pressedClutterbarButton != 0,
+               let image = skin.clutterbarSelectedButtonImage(0) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .frame(width: 8, height: 8)
+                    .position(x: 4, y: 7)
+            }
+            if alwaysOnTopState.isEnabled, pressedClutterbarButton != 1,
+               let image = skin.clutterbarSelectedButtonImage(1) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .frame(width: 8, height: 7)
+                    .position(x: 4, y: 14.5)
+            }
+            if infoState.isVisible, pressedClutterbarButton != 2,
+               let image = skin.clutterbarSelectedButtonImage(2) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .frame(width: 8, height: 7)
+                    .position(x: 4, y: 21.5)
+            }
+            if isDoubleSizeIndicatorActive, pressedClutterbarButton != 3,
+               let image = skin.clutterbarSelectedButtonImage(3) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .frame(width: 8, height: 8)
+                    .position(x: 4, y: 29)
+            }
+            if isVisualizationIndicatorActive, pressedClutterbarButton != 4,
+               let image = skin.clutterbarSelectedButtonImage(4) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .frame(width: 8, height: 7)
+                    .position(x: 4, y: 36.5)
+            }
 
         }
         .frame(width: 8, height: 43)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    // The 8 px top row in the titlebar sprite is padding; button rows begin below it.
-                    let index = min(4, max(0, Int((value.location.y - 8) / 8)))
-                    pressedClutterbarButton = index
-                }
-                .onEnded { _ in
-                    // Winamp's clutterbar rows are Options, AOT, Info,
-                    // Double-size and Visualization.  The third row is I.
-                    if pressedClutterbarButton == 2 { AppDelegate.shared?.toggleInfo(nil) }
-                    pressedClutterbarButton = nil
-                }
+        .overlay(
+            ClutterbarHitTarget(
+                onPressed: { pressedClutterbarButton = $0 },
+                onActivate: activateClutterbarButton(_:)
+            )
         )
         .position(x: 14, y: 43.5)
+    }
+
+    private func activateClutterbarButton(_ button: Int) {
+        switch button {
+        case 0:
+            AppDelegate.shared?.togglePreferences(nil)
+        case 1:
+            AppDelegate.shared?.toggleAlwaysOnTop(nil)
+        case 2:
+            AppDelegate.shared?.toggleInfo(nil)
+        case 3:
+            isDoubleSizeIndicatorActive.toggle()
+        case 4:
+            isVisualizationIndicatorActive.toggle()
+        default:
+            break
+        }
     }
 
     private var controls: some View {
@@ -748,8 +794,73 @@ struct ContentView_Previews: PreviewProvider {
             windowShade: WindowShadeState(),
             equalizerState: EqualizerWindowState(),
             playlistState: PlaylistWindowState(),
-            infoState: InfoWindowState()
+            infoState: InfoWindowState(),
+            alwaysOnTopState: AlwaysOnTopState(),
+            settingsWindowState: SettingsWindowState()
         )
+    }
+}
+
+/// AppKit handles the Clutterbar's first click directly. SwiftUI gestures can
+/// be cancelled when the non-activating player panel becomes key mid-gesture.
+private struct ClutterbarHitTarget: NSViewRepresentable {
+    let onPressed: (Int?) -> Void
+    let onActivate: (Int) -> Void
+
+    func makeNSView(context: Context) -> ClutterbarHitTargetNSView {
+        let view = ClutterbarHitTargetNSView()
+        view.onPressed = onPressed
+        view.onActivate = onActivate
+        return view
+    }
+
+    func updateNSView(_ nsView: ClutterbarHitTargetNSView, context: Context) {
+        nsView.onPressed = onPressed
+        nsView.onActivate = onActivate
+    }
+}
+
+private final class ClutterbarHitTargetNSView: NSView {
+    var onPressed: ((Int?) -> Void)?
+    var onActivate: ((Int) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        let pressedButton = clutterbarButton(at: clutterbarPoint(for: event))
+        guard let pressedButton else { return }
+        onPressed?(pressedButton)
+
+        var releasedButton: Int?
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp {
+                releasedButton = clutterbarButton(at: clutterbarPoint(for: next))
+                break
+            }
+        }
+        onPressed?(nil)
+        if releasedButton == pressedButton { onActivate?(pressedButton) }
+    }
+
+    private func clutterbarPoint(for event: NSEvent) -> CGPoint {
+        let point = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: point.x, y: bounds.height - point.y)
+    }
+
+    /// TITLEBAR.BMP is drawn at (10, 22). The original Winamp hit regions
+    /// are intentionally uneven: O is 8 px high, A/I/D are 7 px, and V is
+    /// 6 px. Keeping their source coordinates prevents adjacent buttons from
+    /// stealing clicks at the row boundaries.
+    private func clutterbarButton(at point: CGPoint) -> Int? {
+        guard point.x >= 1, point.x <= 8 else { return nil }
+        switch point.y {
+        case 2...9: return 0
+        case 10...17: return 1
+        case 18...25: return 2
+        case 26...33: return 3
+        case 34...40: return 4
+        default: return nil
+        }
     }
 }
 

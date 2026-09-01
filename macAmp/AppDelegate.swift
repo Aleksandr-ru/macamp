@@ -129,6 +129,14 @@ final class InfoWindowState: ObservableObject {
     @Published var isVisible = false
 }
 
+final class AlwaysOnTopState: ObservableObject {
+    @Published var isEnabled = false
+}
+
+final class SettingsWindowState: ObservableObject {
+    @Published var isVisible = false
+}
+
 final class EqualizerFocusState: ObservableObject { @Published var isKey = false }
 final class EqualizerShadeState: ObservableObject { @Published var isEnabled = false }
 final class PlaylistFocusState: ObservableObject { @Published var isKey = false }
@@ -226,6 +234,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let equalizerState = EqualizerWindowState()
     private let playlistState = PlaylistWindowState()
     private let infoState = InfoWindowState()
+    private let alwaysOnTopState = AlwaysOnTopState()
+    private let settingsWindowState = SettingsWindowState()
     private let equalizerFocus = EqualizerFocusState()
     private let equalizerShade = EqualizerShadeState()
     private let playlistFocus = PlaylistFocusState()
@@ -333,7 +343,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             windowShade: windowShade,
             equalizerState: equalizerState,
             playlistState: playlistState,
-            infoState: infoState
+            infoState: infoState,
+            alwaysOnTopState: alwaysOnTopState,
+            settingsWindowState: settingsWindowState
         )
 
         // Create the window and set the content view. 
@@ -402,6 +414,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.moveDockedPlaylist()
             self.schedulePersistentStateSave()
         }
+        removeFormatMenu()
         connectFileMenu()
         connectPreferencesMenu()
         connectQuitMenu()
@@ -550,8 +563,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ event: NSEvent,
         modifiers: NSEvent.ModifierFlags
     ) -> Bool {
-        guard modifiers == [.option],
-              let sourceWindow = event.window,
+        guard modifiers == [.option] else { return false }
+        if event.keyCode == 0 { // physical A key — Always on Top
+            toggleAlwaysOnTop(nil)
+            return true
+        }
+        guard let sourceWindow = event.window,
               sourceWindow === window
                 || sourceWindow === equalizerWindow
                 || sourceWindow === infoWindow
@@ -1162,14 +1179,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func removeFormatMenu() {
+        guard let mainMenu = NSApp.mainMenu,
+              let formatItem = mainMenu.item(withTitle: "Format") else { return }
+        mainMenu.removeItem(formatItem)
+    }
+
     private func connectControlsMenu() {
         guard let mainMenu = NSApp.mainMenu else { return }
-        if let existing = mainMenu.item(withTitle: "Controls")?.submenu {
+        if let existingItem = mainMenu.item(withTitle: "Playback") ?? mainMenu.item(withTitle: "Controls"),
+           let existing = existingItem.submenu {
+            existingItem.title = "Playback"
+            existing.title = "Playback"
             controlsMenu = existing
             existing.removeAllItems()
         } else {
-            let item = NSMenuItem(title: "Controls", action: nil, keyEquivalent: "")
-            let menu = NSMenu(title: "Controls")
+            let item = NSMenuItem(title: "Playback", action: nil, keyEquivalent: "")
+            let menu = NSMenu(title: "Playback")
             item.submenu = menu
             let insertionIndex = mainMenu.items.firstIndex(where: { $0.title == "Window" }) ?? mainMenu.items.count
             mainMenu.insertItem(item, at: insertionIndex)
@@ -1202,6 +1228,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func configureWindowMenu(_ menu: NSMenu) {
+        if let alwaysOnTopItem = menu.items.first(where: { $0.title == "Always on Top" }) {
+            alwaysOnTopItem.target = self
+            alwaysOnTopItem.action = #selector(toggleAlwaysOnTop(_:))
+            alwaysOnTopItem.keyEquivalent = "a"
+            alwaysOnTopItem.keyEquivalentModifierMask = [.option]
+            alwaysOnTopItem.state = alwaysOnTopState.isEnabled ? .on : .off
+            alwaysOnTopItem.isEnabled = true
+        }
         if let minimizeItem = menu.items.first(where: { $0.title == "Minimize" }) {
             // The borderless player panels cannot use AppKit's standard
             // `performMiniaturize:` action. Route the existing ⌘M menu item
@@ -1225,6 +1259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.insertItem(zoomOutItem, at: index + 1)
             }
         }
+        configureZoomShortcutLabels(in: menu)
         let infoItem = menu.items.first(where: { $0.title == "Info" })
             ?? NSMenuItem(title: "Info", action: nil, keyEquivalent: "")
         if infoItem.menu == nil { menu.addItem(infoItem) }
@@ -1263,6 +1298,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistItem.keyEquivalent = "e"
         playlistItem.keyEquivalentModifierMask = [.option]
         playlistItem.isEnabled = true
+        updateWindowMenuState(in: menu)
 
         // Keep the panel toggles next to their related Info command.
         for item in [windowshadeItem, equalizerItem, playlistItem] {
@@ -1298,9 +1334,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         if menu === windowMenu {
             removeUnsupportedWindowMenuItems(from: menu)
+            placeMenuItem("Always on Top", before: "Center", in: menu)
             placePlayerWindowCommands(after: "Center", in: menu)
             placeMenuItem("Windowshade", after: "Zoom out", in: menu)
             placeMenuItem("Close", after: "Windowshade", in: menu)
+            configureZoomShortcutLabels(in: menu)
+            updateWindowMenuState(in: menu)
         }
         if menu === controlsMenu { updateControlsMenuState() }
     }
@@ -1344,6 +1383,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         menu.insertItem(item, at: anchorIndex + 1)
+    }
+
+    private func placeMenuItem(_ itemTitle: String, before anchorTitle: String, in menu: NSMenu) {
+        guard let item = menu.items.first(where: { $0.title == itemTitle }),
+              itemTitle != anchorTitle else { return }
+        menu.removeItem(item)
+        guard let anchorIndex = menu.items.firstIndex(where: { $0.title == anchorTitle }) else {
+            menu.insertItem(item, at: 0)
+            return
+        }
+        menu.insertItem(item, at: anchorIndex)
+    }
+
+    private func updateWindowMenuState(in menu: NSMenu) {
+        menu.items.first(where: { $0.title == "Always on Top" })?.state = alwaysOnTopState.isEnabled ? .on : .off
+        menu.items.first(where: { $0.title == "Equalizer" })?.state = equalizerState.isVisible ? .on : .off
+        let isPlaylistVisible = playlistState.isVisible || playlistWindows.values.contains(where: \.isVisible)
+        menu.items.first(where: { $0.title == "Playlist(s)" })?.state = isPlaylistVisible ? .on : .off
+        menu.items.first(where: { $0.title == "Info" })?.state = infoState.isVisible ? .on : .off
+    }
+
+    private func configureZoomShortcutLabels(in menu: NSMenu) {
+        if let zoomInItem = menu.items.first(where: { $0.title == "Zoom in" }) {
+            zoomInItem.keyEquivalent = "+"
+            zoomInItem.keyEquivalentModifierMask = [.command]
+            if #available(macOS 12.0, *) {
+                zoomInItem.allowsAutomaticKeyEquivalentLocalization = false
+            }
+            menu.itemChanged(zoomInItem)
+        }
+        if let zoomOutItem = menu.items.first(where: { $0.title == "Zoom out" }) {
+            zoomOutItem.keyEquivalent = "-"
+            zoomOutItem.keyEquivalentModifierMask = [.command]
+            if #available(macOS 12.0, *) {
+                zoomOutItem.allowsAutomaticKeyEquivalentLocalization = false
+            }
+            menu.itemChanged(zoomOutItem)
+        }
     }
 
     private func updateControlsMenuState() {
@@ -1667,6 +1744,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showPreferences(_ sender: Any?) {
         if let preferencesWindow {
             preferencesWindow.makeKeyAndOrderFront(nil)
+            settingsWindowState.isVisible = true
             NSApp.activate(ignoringOtherApps: true)
             return
         }
@@ -1679,6 +1757,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         preferences.title = "Settings"
         preferences.isReleasedWhenClosed = false
+        applyAlwaysOnTopLevel(to: preferences)
         preferences.contentView = NSHostingView(rootView: SettingsView(
             interfaceScale: interfaceScale,
             playlistFontScale: playlistFontScale,
@@ -1687,7 +1766,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
         preferencesWindow = preferences
+        settingsWindowState.isVisible = true
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                               object: preferences,
+                                               queue: .main) { [weak self] _ in
+            self?.settingsWindowState.isVisible = false
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func togglePreferences(_ sender: Any?) {
+        if settingsWindowState.isVisible {
+            preferencesWindow?.performClose(nil)
+        } else {
+            showPreferences(sender)
+        }
+    }
+
+    @objc func toggleAlwaysOnTop(_ sender: Any?) {
+        alwaysOnTopState.isEnabled.toggle()
+        [window, preferencesWindow, equalizerWindow, infoWindow]
+            .compactMap { $0 }
+            .forEach(applyAlwaysOnTopLevel(to:))
+        playlistWindows.values.forEach(applyAlwaysOnTopLevel(to:))
+        windowMenu?.items.first(where: { $0.title == "Always on Top" })?.state = alwaysOnTopState.isEnabled ? .on : .off
+    }
+
+    private func applyAlwaysOnTopLevel(to panel: NSWindow) {
+        panel.level = alwaysOnTopState.isEnabled ? .floating : .normal
     }
 
     @objc func toggleWindowShade(_ sender: Any?) {
@@ -1810,6 +1916,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         infoLogicalSize.width = max(minimumWidth, infoLogicalSize.width)
         let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
+        applyAlwaysOnTopLevel(to: panel)
         panel.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
         panel.contentView = InfoPanelView(model: infoModel, scale: interfaceScale, fontScale: playlistFontScale, focus: infoFocus,
             onClose: { [weak self, weak panel] in panel?.orderOut(nil); self?.infoState.isVisible = false; self?.schedulePersistentStateSave() },
@@ -1864,6 +1971,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let initialHeight = (context.shade.isEnabled ? 14 : context.layout.height) * scale
         let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: context.layout.width * scale, height: initialHeight), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
+        applyAlwaysOnTopLevel(to: panel)
         panel.contentView = NSHostingView(rootView: PlaylistView(interfaceScale: interfaceScale, fontScale: playlistFontScale, focus: context.focus, shade: context.shade, layout: context.layout, playback: playback, timeDisplayPreference: timeDisplayPreference, manager: playlistManager, playlist: model, onClose: { [weak self] in self?.closePlaylistWindow(for: model) }, onToggleShade: { [weak self] in self?.toggleFloatingPlaylistShade(panel, context: context) }, onDragEnded: { [weak self] in self?.finishFloatingPlaylistGesture(panel, model: model) }, onResize: { [weak self] width, height in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: height) }, onShadeResize: { [weak self] width in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: 14) }))
         let activeWindow = lastActivePlaylistWindow ?? playlistWindows.values.first(where: { $0.isKeyWindow }) ?? playlistWindows.values.first
         let origin = model.windowFrame.map { NSPoint(x: $0.minX, y: $0.minY) } ?? activeWindow.map { NSPoint(x: $0.frame.minX + 25 * scale, y: $0.frame.minY - 29 * scale) } ?? NSPoint(x: window.frame.maxX, y: window.frame.maxY - panel.frame.height)
@@ -1916,6 +2024,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlist.backgroundColor = .clear
         playlist.hasShadow = true
         playlist.isMovableByWindowBackground = false
+        applyAlwaysOnTopLevel(to: playlist)
         playlist.contentView = NSHostingView(rootView: PlaylistView(
             interfaceScale: interfaceScale,
             fontScale: playlistFontScale,
@@ -2155,6 +2264,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         equalizer.backgroundColor = .clear
         equalizer.hasShadow = true
         equalizer.isMovableByWindowBackground = false
+        applyAlwaysOnTopLevel(to: equalizer)
         equalizer.contentView = NSHostingView(rootView: EqualizerView(
             interfaceScale: interfaceScale,
             focus: equalizerFocus,
