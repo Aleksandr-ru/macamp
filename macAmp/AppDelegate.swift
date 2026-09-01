@@ -278,6 +278,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mediaKeyMonitor: Any?
     private var keyboardShortcutMonitor: Any?
     private var controlsMenu: NSMenu?
+    private weak var windowMenu: NSMenu?
     private let persistentStateKey = "macAmp.applicationPersistentState.v1"
 
     private struct PersistentState: Codable {
@@ -454,11 +455,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if handleWindowShadeShortcut(event, modifiers: modifiers) { return true }
+        if handleFileCloseShortcut(event, modifiers: modifiers) { return true }
         if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
         if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
+        if handleWindowToggleShortcut(event, modifiers: modifiers) { return true }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
         // Those identify the hardware key; only real shortcut modifiers
         // should bypass context-sensitive Winamp bindings.
@@ -513,6 +517,56 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case 126: // ↑ — Volume up
             playback.volume = min(1, playback.volume + 0.05)
         default: return false
+        }
+        return true
+    }
+
+    /// Windowshade is assigned to the physical W key so ⌘W remains stable
+    /// across keyboard layouts. Windows without a compact skin fall back to
+    /// the main player's Windowshade, matching classic Winamp behaviour.
+    private func handleWindowShadeShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers == [.command], event.keyCode == 13 else { return false }
+        toggleWindowShade(for: event.window)
+        return true
+    }
+
+    /// File → Close uses the physical W key so ⌥W works in every input
+    /// source, while its menu item remains the single source of the command.
+    private func handleFileCloseShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers == [.option], event.keyCode == 13 else { return false }
+        closeActiveWindow(event.window ?? NSApp.keyWindow)
+        return true
+    }
+
+    /// Window shortcuts use physical keys, not the character emitted by the
+    /// active input source. This keeps ⌥E, ⌥G and ⌥I stable across layouts.
+    private func handleWindowToggleShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers == [.option],
+              let sourceWindow = event.window,
+              sourceWindow === window
+                || sourceWindow === equalizerWindow
+                || sourceWindow === infoWindow
+                || playlistWindows.values.contains(where: { $0 === sourceWindow }) else {
+            return false
+        }
+        switch event.keyCode {
+        case 14: // physical E key — Playlist(s)
+            togglePlaylist(nil)
+        case 5: // physical G key — Equalizer
+            toggleEqualizer(nil)
+        case 34: // physical I key — Info
+            toggleInfo(nil)
+        default:
+            return false
         }
         return true
     }
@@ -616,6 +670,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
         guard let sourceWindow = event.window else { return false }
+        return adjustInterfaceScale(for: sourceWindow, by: delta)
+    }
+
+    /// Zoom commands are scoped to the key player panel.  This is shared by
+    /// the local Winamp-style shortcuts and the Window menu, so both input
+    /// paths preserve the same per-window routing.
+    private func adjustInterfaceScale(for sourceWindow: NSWindow, by delta: Double) -> Bool {
         if sourceWindow === window || sourceWindow === equalizerWindow {
             interfaceScale.percent += delta
             return true
@@ -1094,7 +1155,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let fileMenu = NSApp.mainMenu?.item(withTitle: "File")?.submenu else { return }
         configureFileItem("New Playlist", action: #selector(newPlaylist(_:)), in: fileMenu)
         configureFileItem("Open…", action: #selector(openDocument(_:)), in: fileMenu)
-        configureFileItem("Close", action: #selector(closeFocusedPlaylist(_:)), in: fileMenu)
         configureFileItem("Save…", action: #selector(savePlaylist(_:)), in: fileMenu)
         configureFileItem("Save As…", action: #selector(savePlaylistAs(_:)), in: fileMenu)
         if let recent = fileMenu.items.first(where: { $0.title == "Open Recent" })?.submenu {
@@ -1136,11 +1196,92 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func connectWindowMenu() {
         guard let menu = NSApp.mainMenu?.item(withTitle: "Window")?.submenu else { return }
-        let item = menu.items.first(where: { $0.title == "Info" }) ?? NSMenuItem(title: "Info", action: nil, keyEquivalent: "")
-        if item.menu == nil { menu.addItem(item) }
-        item.target = self
-        item.action = #selector(toggleInfo(_:))
-        item.isEnabled = true
+        windowMenu = menu
+        menu.delegate = self
+        configureWindowMenu(menu)
+    }
+
+    private func configureWindowMenu(_ menu: NSMenu) {
+        if let minimizeItem = menu.items.first(where: { $0.title == "Minimize" }) {
+            // The borderless player panels cannot use AppKit's standard
+            // `performMiniaturize:` action. Route the existing ⌘M menu item
+            // through the same group-hide path as the main title-bar button.
+            minimizeItem.target = self
+            minimizeItem.action = #selector(hideMainPlayer(_:))
+            minimizeItem.isEnabled = true
+        }
+        if let zoomInItem = menu.items.first(where: { $0.title == "Zoom" || $0.title == "Zoom in" }) {
+            zoomInItem.title = "Zoom in"
+            zoomInItem.target = self
+            zoomInItem.action = #selector(zoomIn(_:))
+            zoomInItem.isEnabled = true
+            let zoomOutItem = menu.items.first(where: { $0.title == "Zoom out" })
+                ?? NSMenuItem(title: "Zoom out", action: #selector(zoomOut(_:)), keyEquivalent: "-")
+            zoomOutItem.target = self
+            zoomOutItem.action = #selector(zoomOut(_:))
+            zoomOutItem.isEnabled = true
+            if zoomOutItem.menu == nil, let index = menu.items.firstIndex(of: zoomInItem) {
+                zoomOutItem.keyEquivalentModifierMask = [.command]
+                menu.insertItem(zoomOutItem, at: index + 1)
+            }
+        }
+        let infoItem = menu.items.first(where: { $0.title == "Info" })
+            ?? NSMenuItem(title: "Info", action: nil, keyEquivalent: "")
+        if infoItem.menu == nil { menu.addItem(infoItem) }
+        infoItem.target = self
+        infoItem.action = #selector(toggleInfo(_:))
+        infoItem.keyEquivalent = "i"
+        infoItem.keyEquivalentModifierMask = [.option]
+        infoItem.isEnabled = true
+
+        let windowshadeItem = menu.items.first(where: { $0.title == "Windowshade" })
+            ?? NSMenuItem(title: "Windowshade", action: #selector(toggleActiveWindowShade(_:)), keyEquivalent: "")
+        windowshadeItem.target = self
+        windowshadeItem.action = #selector(toggleActiveWindowShade(_:))
+        windowshadeItem.isEnabled = true
+
+        if let closeItem = menu.items.first(where: { $0.title == "Close" }) {
+            closeItem.target = self
+            closeItem.action = #selector(closeFocusedPlaylist(_:))
+            closeItem.keyEquivalent = "w"
+            closeItem.keyEquivalentModifierMask = [.option]
+            closeItem.isEnabled = true
+        }
+
+        let equalizerItem = menu.items.first(where: { $0.title == "Equalizer" })
+            ?? NSMenuItem(title: "Equalizer", action: #selector(toggleEqualizer(_:)), keyEquivalent: "")
+        equalizerItem.target = self
+        equalizerItem.action = #selector(toggleEqualizer(_:))
+        equalizerItem.keyEquivalent = "g"
+        equalizerItem.keyEquivalentModifierMask = [.option]
+        equalizerItem.isEnabled = true
+
+        let playlistItem = menu.items.first(where: { $0.title == "Playlist(s)" })
+            ?? NSMenuItem(title: "Playlist(s)", action: #selector(togglePlaylist(_:)), keyEquivalent: "")
+        playlistItem.target = self
+        playlistItem.action = #selector(togglePlaylist(_:))
+        playlistItem.keyEquivalent = "e"
+        playlistItem.keyEquivalentModifierMask = [.option]
+        playlistItem.isEnabled = true
+
+        // Keep the panel toggles next to their related Info command.
+        for item in [windowshadeItem, equalizerItem, playlistItem] {
+            if item.menu != nil { menu.removeItem(item) }
+        }
+        guard let infoIndex = menu.items.firstIndex(of: infoItem) else { return }
+        menu.insertItem(windowshadeItem, at: infoIndex)
+        menu.insertItem(equalizerItem, at: infoIndex + 1)
+        menu.insertItem(playlistItem, at: infoIndex + 2)
+    }
+
+    @objc private func zoomIn(_ sender: Any?) {
+        guard let keyWindow = NSApp.keyWindow else { return }
+        _ = adjustInterfaceScale(for: keyWindow, by: 10)
+    }
+
+    @objc private func zoomOut(_ sender: Any?) {
+        guard let keyWindow = NSApp.keyWindow else { return }
+        _ = adjustInterfaceScale(for: keyWindow, by: -10)
     }
 
     private func addControlMenuItem(_ title: String, action: Selector, key: String, to menu: NSMenu) {
@@ -1155,7 +1296,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        if menu === windowMenu {
+            removeUnsupportedWindowMenuItems(from: menu)
+            placePlayerWindowCommands(after: "Center", in: menu)
+            placeMenuItem("Windowshade", after: "Zoom out", in: menu)
+            placeMenuItem("Close", after: "Windowshade", in: menu)
+        }
         if menu === controlsMenu { updateControlsMenuState() }
+    }
+
+    /// These AppKit window-management commands do not apply to the skinned,
+    /// independently positioned player panels. They may be inserted by the
+    /// system Window menu after application launch, so remove them on display.
+    private func removeUnsupportedWindowMenuItems(from menu: NSMenu) {
+        let titles: Set<String> = [
+            "Remove from Set", "Remove From Set", "Remove Window from Set",
+            "Bring All to Front",
+            "Fill",
+            "Enter Full Screen", "Exit Full Screen",
+            "Full Screen Tile", "Full Screen Tiled"
+        ]
+        menu.items
+            .filter { titles.contains($0.title) }
+            .forEach(menu.removeItem(_:))
+    }
+
+    private func placePlayerWindowCommands(after title: String, in menu: NSMenu) {
+        guard menu.items.contains(where: { $0.title == title }) else { return }
+        let commandTitles = ["Minimize", "Zoom in", "Zoom out"]
+        let commands = commandTitles.compactMap { commandTitle in
+            menu.items.first(where: { $0.title == commandTitle })
+        }
+        guard !commands.isEmpty else { return }
+        commands.forEach(menu.removeItem(_:))
+        guard let insertionIndex = menu.items.firstIndex(where: { $0.title == title }) else { return }
+        for (offset, command) in commands.enumerated() {
+            menu.insertItem(command, at: insertionIndex + offset + 1)
+        }
+    }
+
+    private func placeMenuItem(_ itemTitle: String, after anchorTitle: String, in menu: NSMenu) {
+        guard let item = menu.items.first(where: { $0.title == itemTitle }),
+              itemTitle != anchorTitle else { return }
+        menu.removeItem(item)
+        guard let anchorIndex = menu.items.firstIndex(where: { $0.title == anchorTitle }) else {
+            menu.addItem(item)
+            return
+        }
+        menu.insertItem(item, at: anchorIndex + 1)
     }
 
     private func updateControlsMenuState() {
@@ -1237,7 +1425,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func closeFocusedPlaylist(_ sender: Any?) {
-        if let playlist = playlistManager.editingPlaylist { closePlaylistWindow(for: playlist) }
+        closeActiveWindow(NSApp.keyWindow)
+    }
+
+    /// Routes File → Close to the panel which currently owns the command.
+    /// Non-player windows retain AppKit's standard close behaviour.
+    private func closeActiveWindow(_ sourceWindow: NSWindow?) {
+        guard let sourceWindow else { return }
+        if sourceWindow === window {
+            hideMainPlayer(nil)
+        } else if sourceWindow === equalizerWindow {
+            hideEqualizer(nil)
+        } else if sourceWindow === infoWindow {
+            sourceWindow.orderOut(nil)
+            infoState.isVisible = false
+            schedulePersistentStateSave()
+        } else if let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+                  let playlist = playlistManager.playlist(id: playlistID) {
+            closePlaylistWindow(for: playlist)
+        } else {
+            sourceWindow.performClose(nil)
+        }
     }
 
     @objc func savePlaylist(_ sender: Any?) {
@@ -1412,12 +1620,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showMainPlayer(_ sender: Any?) {
         window.orderFrontRegardless()
+        raiseVisiblePlayerWindows()
         NSApp.activate(ignoringOtherApps: true)
         refreshInterfaceVisibility()
     }
 
     @objc func hideMainPlayer(_ sender: Any?) {
         window.orderOut(nil)
+        equalizerWindow?.orderOut(nil)
+        playlistWindows.values.forEach { $0.orderOut(nil) }
+        infoWindow?.orderOut(nil)
         refreshInterfaceVisibility()
     }
 
@@ -1442,7 +1654,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// automatically join the application's activation ordering, so Info must
     /// be raised explicitly alongside Main, EQ and Playlist windows.
     private func raiseVisiblePlayerWindows() {
-        if window.isVisible { window.orderFrontRegardless() }
+        // A minimized main panel owns the visibility of the complete player
+        // surface.  Activation notifications must not reveal auxiliary panels
+        // until the player itself is explicitly restored.
+        guard window.isVisible else { return }
+        window.orderFrontRegardless()
         if equalizerState.isVisible { equalizerWindow?.orderFrontRegardless() }
         if playlistState.isVisible { playlistWindows.values.forEach { $0.orderFrontRegardless() } }
         if infoState.isVisible { infoWindow?.orderFrontRegardless() }
@@ -1479,6 +1695,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyInterfaceScale()
     }
 
+    @objc private func toggleActiveWindowShade(_ sender: Any?) {
+        toggleWindowShade(for: NSApp.keyWindow)
+    }
+
+    private func toggleWindowShade(for sourceWindow: NSWindow?) {
+        if sourceWindow === equalizerWindow {
+            toggleEqualizerWindowShade(nil)
+            return
+        }
+        if let sourceWindow,
+           let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key {
+            if sourceWindow === playlistWindow {
+                togglePlaylistWindowShade(nil)
+                return
+            } else if let context = playlistWindowContexts[playlistID] {
+                toggleFloatingPlaylistShade(sourceWindow, context: context)
+                return
+            }
+        }
+        toggleWindowShade(nil)
+    }
+
     @objc func toggleEqualizer(_ sender: Any?) {
         if equalizerState.isVisible {
             equalizerWindow?.orderOut(nil)
@@ -1486,8 +1724,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        let isFirstPresentation = equalizerWindow == nil
         let equalizer = makeEqualizerWindowIfNeeded()
-        if !equalizerWasMoved { dockEqualizerBelowPlayer() }
+        if isFirstPresentation { dockEqualizerBelowPlayer() }
         equalizer.makeKeyAndOrderFront(nil)
         equalizerState.isVisible = true
     }
