@@ -52,6 +52,10 @@ final class PlaylistModel: ObservableObject, Identifiable {
     /// read while the status must remain "Loading", so scannerState cannot be
     /// used to refresh the row text in that phase.
     @Published var metadataRevision = 0
+    /// Changes only when rows are inserted or removed. The playlist editor
+    /// uses it to discard LazyVStack's cached row hosts after an index shift;
+    /// selection and metadata updates do not touch it.
+    @Published var structureRevision = 0
     /// Logical (unshaded) editor dimensions.  A shaded frame is only 14 px
     /// high and therefore cannot be used to restore the expanded height.
     @Published var unshadedWindowWidth: CGFloat?
@@ -80,6 +84,12 @@ final class PlaylistModel: ObservableObject, Identifiable {
 /// Single authority for opening, saving and scanning playlists.  Its queues are
 /// serial by design: network folders cannot create an unbounded number of jobs.
 final class PlaylistManager: ObservableObject {
+    struct KeyboardSelectionReveal: Equatable {
+        let playlistID: UUID
+        let entryID: UUID
+        let alignToBottom: Bool
+        let revision: UInt
+    }
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
     /// Bump when a stored display-title format needs one background refresh.
     /// Existing snapshots contained title-only metadata, so they must be
@@ -95,6 +105,10 @@ final class PlaylistManager: ObservableObject {
     /// represents the command itself and lets the editor reveal an off-screen
     /// current row on every transport start.
     @Published private(set) var playbackRevealRevision = 0
+    /// A keyboard-only reveal request. Keeping it separate from playback
+    /// avoids changing the user's scroll position for ordinary selection.
+    @Published private(set) var keyboardSelectionReveal: KeyboardSelectionReveal?
+    private var keyboardSelectionRevealRevision: UInt = 0
     @Published private(set) var recentPlaylistURLs: [URL] = []
 
     private let folderQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.folder", qos: .utility)
@@ -258,6 +272,7 @@ final class PlaylistManager: ObservableObject {
         guard playlists.contains(where: { $0.id == playlist.id }) else { return }
         if playlist.entries.isEmpty { endWaitingCursor(for: playlist) }
         playlist.entries.append(contentsOf: entries)
+        playlist.structureRevision &+= 1
         playlist.appendToTotalDuration(entries)
         markEntriesDirty(in: playlist)
         playlist.scannerState = .scanningFolder(playlist.entries.count)
@@ -363,6 +378,7 @@ final class PlaylistManager: ObservableObject {
         let entries = audio.map { PlaylistEntry(url: $0, bookmarkData: securityScopedBookmark(for: $0)) }
         propagateBookmarks(from: entries)
         playlist.entries.append(contentsOf: entries)
+        playlist.structureRevision &+= 1
         playlist.appendToTotalDuration(entries)
         markEntriesDirty(in: playlist)
         playlist.isDirty = true; playlist.scannerState = .adding(playlist.entries.count); save(); finishEntryLoading(playlist)
@@ -541,6 +557,23 @@ final class PlaylistManager: ObservableObject {
         return entry
     }
 
+    /// Scroll only when keyboard navigation moved the selected row beyond the
+    /// current viewport. This is deliberately based on the editor's measured
+    /// visible range, not a fixed row count.
+    func revealKeyboardSelectionIfNeeded(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
+        guard let index = playlist.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        let first = playlist.scrollPosition
+        let end = min(playlist.entries.count, first + max(1, playlist.visibleEntryCount))
+        guard index < first || index >= end else { return }
+        keyboardSelectionRevealRevision &+= 1
+        keyboardSelectionReveal = KeyboardSelectionReveal(
+            playlistID: playlist.id,
+            entryID: entry.id,
+            alignToBottom: index >= end,
+            revision: keyboardSelectionRevealRevision
+        )
+    }
+
     func visibleRangeChanged(for playlist: PlaylistModel, firstEntry: Int, visibleCount: Int) {
         let position = max(0, min(firstEntry, max(0, playlist.entries.count - 1)))
         let count = max(1, visibleCount)
@@ -566,9 +599,11 @@ final class PlaylistManager: ObservableObject {
     }
 
     func removeSelected(from playlist: PlaylistModel) {
+        let previousCount = playlist.entries.count
         playlist.entries.removeAll { playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
         playlist.selectedIDs.removeAll(); playlist.selectionAnchorID = nil; playlist.isDirty = true
+        if playlist.entries.count != previousCount { playlist.structureRevision &+= 1 }
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
@@ -578,6 +613,7 @@ final class PlaylistManager: ObservableObject {
     func removePlaybackErrorEntries(from playlist: PlaylistModel) {
         guard playlist.entries.contains(where: \.hasPlaybackError) else { return }
         playlist.entries.removeAll { $0.hasPlaybackError }
+        playlist.structureRevision &+= 1
         playlist.recalculateTotalDuration()
         playlist.selectedIDs.formIntersection(Set(playlist.entries.map(\.id)))
         if let anchor = playlist.selectionAnchorID,
@@ -590,16 +626,20 @@ final class PlaylistManager: ObservableObject {
     }
 
     func clear(_ playlist: PlaylistModel) {
+        let hadEntries = !playlist.entries.isEmpty
         playlist.entries.removeAll(); playlist.selectedIDs.removeAll(); playlist.selectionAnchorID = nil; playlist.isDirty = true
+        if hadEntries { playlist.structureRevision &+= 1 }
         playlist.clearTotalDuration()
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
 
     func cropToSelection(_ playlist: PlaylistModel) {
+        let previousCount = playlist.entries.count
         playlist.entries.removeAll { !playlist.selectedIDs.contains($0.id) }
         playlist.recalculateTotalDuration()
         playlist.selectedIDs = Set(playlist.entries.map(\.id)); playlist.isDirty = true
+        if playlist.entries.count != previousCount { playlist.structureRevision &+= 1 }
         repairTrackReferences(in: playlist)
         markEntriesDirty(in: playlist); save()
     }
@@ -690,6 +730,7 @@ final class PlaylistManager: ObservableObject {
             let entries = batch.map { PlaylistEntry(url: $0, bookmarkData: self.securityScopedBookmark(for: $0)) }
             self.propagateBookmarks(from: entries)
             playlist.entries.append(contentsOf: entries)
+            playlist.structureRevision &+= 1
             playlist.appendToTotalDuration(entries)
             self.markEntriesDirty(in: playlist)
             playlist.isDirty = true; playlist.scannerState = .scanningFolder(playlist.entries.count)

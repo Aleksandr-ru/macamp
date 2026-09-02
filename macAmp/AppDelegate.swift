@@ -708,6 +708,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func movePlaylistSelection(in playlist: PlaylistModel, by offset: Int) {
         guard let entry = playlistManager.moveSelection(in: playlist, by: offset) else { return }
         selectInfoTarget(entry)
+        playlistManager.revealKeyboardSelectionIfNeeded(entry, in: playlist)
     }
 
     private func installMediaKeyHandling() {
@@ -2829,10 +2830,13 @@ private struct PlaylistView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(playlist.entries.indices, id: \.self) { index in
-                        let entry = playlist.entries[index]
+                    // Indices shift after a removal.  They must not be the
+                    // row identity: otherwise LazyVStack may reuse a middle
+                    // button with the action captured for the old entry.
+                    ForEach(Array(playlist.entries.enumerated()), id: \.element.id) { index, entry in
                         Button(action: {
-                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                            let event = NSApp.currentEvent
+                            let modifiers = event?.modifierFlags ?? []
                             manager.selectEntry(
                                 entry,
                                 in: playlist,
@@ -2840,6 +2844,14 @@ private struct PlaylistView: View {
                                 toggling: modifiers.contains(.command)
                             )
                             AppDelegate.shared?.selectInfoTarget(entry)
+                            // Keep double-click playback in the button action
+                            // itself. A separate simultaneous recognizer can
+                            // retain stale tap state when LazyVStack recycles
+                            // rows after removal, causing later single clicks
+                            // to be lost.
+                            if event?.clickCount == 2 {
+                                AppDelegate.shared?.playPlaylistEntryFromSelection(entry, in: playlist)
+                            }
                         }) {
                             let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
                             let isSelected = playlist.selectedIDs.contains(entry.id)
@@ -2859,23 +2871,30 @@ private struct PlaylistView: View {
                             // background.  A selected current entry is white
                             // on the skin's SelectedBG, never black or green.
                             .foregroundColor(playlistColor(isPlayingEntry ? colors.currentText : colors.normalText))
-                            .padding(.horizontal, 2).frame(height: entryHeight)
+                            .padding(.horizontal, 2)
+                            // A vertical ScrollView does not guarantee that
+                            // its lazy children receive the viewport width.
+                            // Make the whole visual row — not only its text —
+                            // the button's hit target after list mutations.
+                            .frame(maxWidth: .infinity, minHeight: entryHeight, alignment: .leading)
                             .background(playlistColor(isSelected ? colors.selectedBackground : colors.background))
-                        }.buttonStyle(PlainButtonStyle())
-                        // Classic PLEDIT selects on a single click.  Playback
-                        // is an explicit double-click action, so browsing a
-                        // large list never accidentally interrupts audio.
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            AppDelegate.shared?.playPlaylistEntryFromSelection(entry, in: playlist)
-                        })
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .id(entry.id)
                     }
                 }
-                .background(PlaylistScrollPositionObserver { offset in
-                    manager.visibleRangeChanged(
-                        for: playlist,
-                        firstEntry: Int(max(0, (offset / entryHeight).rounded(.down))),
-                        visibleCount: visiblePlaylistEntryCount
+                // Stable entry IDs preserve normal row updates, while this
+                // coarse identity changes only after insertion/removal. It
+                // prevents LazyVStack from retaining stale drawing hosts for
+                // rows that moved to another index after deletion.
+                .id(playlist.structureRevision)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: PlaylistScrollOffsetKey.self,
+                        value: geometry.frame(in: .named("playlistEntries")).minY
                     )
                 })
             }
@@ -2899,10 +2918,23 @@ private struct PlaylistView: View {
                     DispatchQueue.main.async { proxy.scrollTo(id, anchor: .center) }
                 }
             }
+            .onChange(of: manager.keyboardSelectionReveal) { request in
+                guard let request, request.playlistID == playlist.id else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(request.entryID, anchor: request.alignToBottom ? .bottom : .top)
+                }
+            }
             .onAppear {
                 let position = min(max(0, playlist.scrollPosition), max(0, playlist.entries.count - 1))
                 guard playlist.entries.indices.contains(position) else { return }
                 DispatchQueue.main.async { proxy.scrollTo(playlist.entries[position].id, anchor: .top) }
+            }
+            .onPreferenceChange(PlaylistScrollOffsetKey.self) { offset in
+                manager.visibleRangeChanged(
+                    for: playlist,
+                    firstEntry: Int(max(0, (-offset / entryHeight).rounded(.down))),
+                    visibleCount: visiblePlaylistEntryCount
+                )
             }
             .onChange(of: fontScale.percent) { _ in
                 manager.visibleRangeChanged(
@@ -3003,72 +3035,11 @@ private struct PlaylistView: View {
     }
 }
 
-/// Reports the real AppKit clip-view offset. Unlike a SwiftUI geometry
-/// preference attached to a LazyVStack, this keeps emitting while the top
-/// rows are no longer materialised and therefore gives metadata scheduling an
-/// exact viewport after every scroll.
-private struct PlaylistScrollPositionObserver: NSViewRepresentable {
-    let onChange: (CGFloat) -> Void
-
-    func makeNSView(context: Context) -> PlaylistScrollPositionNSView {
-        let view = PlaylistScrollPositionNSView()
-        view.onChange = onChange
-        return view
+private struct PlaylistScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
-
-    func updateNSView(_ nsView: PlaylistScrollPositionNSView, context: Context) {
-        nsView.onChange = onChange
-        nsView.attachToEnclosingScrollViewIfNeeded()
-    }
-
-    static func dismantleNSView(_ nsView: PlaylistScrollPositionNSView, coordinator: ()) {
-        nsView.detach()
-    }
-}
-
-private final class PlaylistScrollPositionNSView: NSView {
-    var onChange: ((CGFloat) -> Void)?
-    private weak var observedClipView: NSClipView?
-    private var boundsObserver: NSObjectProtocol?
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        DispatchQueue.main.async { [weak self] in
-            self?.attachToEnclosingScrollViewIfNeeded()
-        }
-    }
-
-    func attachToEnclosingScrollViewIfNeeded() {
-        guard let clipView = enclosingScrollView?.contentView else { return }
-        guard observedClipView !== clipView else {
-            publishPosition()
-            return
-        }
-        detach()
-        observedClipView = clipView
-        clipView.postsBoundsChangedNotifications = true
-        boundsObserver = NotificationCenter.default.addObserver(
-            forName: NSView.boundsDidChangeNotification,
-            object: clipView,
-            queue: .main
-        ) { [weak self] _ in
-            self?.publishPosition()
-        }
-        publishPosition()
-    }
-
-    func detach() {
-        if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
-        boundsObserver = nil
-        observedClipView = nil
-    }
-
-    private func publishPosition() {
-        guard let clipView = observedClipView else { return }
-        onChange?(max(0, clipView.bounds.origin.y))
-    }
-
-    deinit { detach() }
 }
 
 /// AppKit receives the original mouse-down event, which is required to open a
