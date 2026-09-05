@@ -28,6 +28,20 @@ struct AdaptiveEQConfiguration {
     var minimumAdaptivePreamp = -3.0
 }
 
+enum AdaptiveEQCorrectionRange: Int, CaseIterable, Identifiable {
+    case `default` = 4
+    case extended = 6
+
+    var id: Int { rawValue }
+    var maximumCorrection: Double { Double(rawValue) }
+    var title: String {
+        switch self {
+        case .default: return "±4 dB (default)"
+        case .extended: return "±6 dB"
+        }
+    }
+}
+
 struct EqualizerPreset: Identifiable, Equatable, Codable {
     let name: String
     let preamp: Double
@@ -65,6 +79,18 @@ final class EqualizerController: ObservableObject {
             onChange?()
         }
     }
+    @Published var adaptiveCorrectionRange: AdaptiveEQCorrectionRange = .default {
+        didSet {
+            adaptiveConfiguration.maximumCorrection = adaptiveCorrectionRange.maximumCorrection
+            let maximum = adaptiveConfiguration.maximumCorrection
+            adaptiveBands = adaptiveBands.map { min(maximum, max(-maximum, $0)) }
+            pendingAdaptiveBands = pendingAdaptiveBands.map { min(maximum, max(-maximum, $0)) }
+            UserDefaults.standard.set(adaptiveCorrectionRange.rawValue, forKey: adaptiveCorrectionRangeDefaultsKey)
+            // The range applies to automatic band correction only. Keep the
+            // current adaptive Preamp component untouched when it changes.
+            refreshFinalValues()
+        }
+    }
     @Published private(set) var preamp = 0.0
     @Published private(set) var bands = Array(repeating: 0.0, count: 10)
     @Published private(set) var selectedPresetName = "Flat"
@@ -85,6 +111,7 @@ final class EqualizerController: ObservableObject {
     private var presetPreampReturnTimer: Timer?
     private let customPresetsKey = "macAmp.equalizer.customPresets"
     private let adaptiveEnabledDefaultsKey = "macAmp.equalizer.adaptiveEnabled"
+    private let adaptiveCorrectionRangeDefaultsKey = "macAmp.equalizer.adaptiveCorrectionRange"
 
     static let factoryPresets: [EqualizerPreset] = [
         preset("Classical", [31,31,31,31,31,31,44,44,44,48]),
@@ -113,6 +140,11 @@ final class EqualizerController: ObservableObject {
         // survive every restart and schema migration.
         if UserDefaults.standard.object(forKey: adaptiveEnabledDefaultsKey) != nil {
             isAdaptiveEnabled = UserDefaults.standard.bool(forKey: adaptiveEnabledDefaultsKey)
+        }
+        if let storedRange = UserDefaults.standard.object(forKey: adaptiveCorrectionRangeDefaultsKey) as? Int,
+           let range = AdaptiveEQCorrectionRange(rawValue: storedRange) {
+            adaptiveCorrectionRange = range
+            adaptiveConfiguration.maximumCorrection = range.maximumCorrection
         }
         if let data = UserDefaults.standard.data(forKey: customPresetsKey),
            let decoded = try? JSONDecoder().decode([EqualizerPreset].self, from: data) {

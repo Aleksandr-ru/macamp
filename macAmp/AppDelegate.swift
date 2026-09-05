@@ -1811,7 +1811,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let preferences = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 340),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1823,7 +1823,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             interfaceScale: interfaceScale,
             playlistFontScale: playlistFontScale,
             timeDisplayPreference: timeDisplayPreference,
-            trackNotifications: trackNotifications
+            trackNotifications: trackNotifications,
+            equalizer: playback.equalizer
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -2689,6 +2690,7 @@ private struct SettingsView: View {
     @ObservedObject var playlistFontScale: PlaylistFontScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var trackNotifications: TrackNotificationController
+    @ObservedObject var equalizer: EqualizerController
     @State private var selectedTab: Tab = .general
 
     var body: some View {
@@ -2714,7 +2716,7 @@ private struct SettingsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(width: 300, height: 300, alignment: .topLeading)
+        .frame(width: 300, height: 340, alignment: .topLeading)
     }
 
     private var generalSettings: some View {
@@ -2737,6 +2739,11 @@ private struct SettingsView: View {
             }
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
             Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
+            Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
+                ForEach(AdaptiveEQCorrectionRange.allCases) { range in
+                    Text(range.title).tag(range)
+                }
+            }
             if !trackNotifications.permissionMessage.isEmpty {
                 Text(trackNotifications.permissionMessage)
                     .font(.caption)
