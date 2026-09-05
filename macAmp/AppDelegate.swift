@@ -2679,12 +2679,45 @@ private struct PlaylistStatusField: View {
 }
 
 private struct SettingsView: View {
+    private enum Tab: Hashable {
+        case general
+        case skin
+        case output
+    }
+
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var playlistFontScale: PlaylistFontScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var trackNotifications: TrackNotificationController
+    @State private var selectedTab: Tab = .general
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("Settings section", selection: $selectedTab) {
+                Text("General").tag(Tab.general)
+                Text("Skin").tag(Tab.skin)
+                Text("Output").tag(Tab.output)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            Group {
+                switch selectedTab {
+                case .general:
+                    generalSettings
+                case .skin, .output:
+                    Color.clear
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(width: 300, height: 300, alignment: .topLeading)
+    }
+
+    private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Interface")
                 .font(.headline)
@@ -2712,7 +2745,6 @@ private struct SettingsView: View {
             }
         }
         .padding(20)
-        .frame(width: 300, height: 300, alignment: .topLeading)
     }
 }
 
