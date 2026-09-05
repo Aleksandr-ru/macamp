@@ -133,6 +133,7 @@ final class PlaybackController: NSObject, ObservableObject {
     /// visualizer (or AUTO EQ) actually needs it.
     private var streamingAudioTrack: AVAssetTrack?
     private var streamingStatusObservation: NSKeyValueObservation?
+    private var streamingEndObserver: Any?
     private var streamingTimeObserver: Any?
     private var streamingOpenGeneration: Int?
     /// Once a volume has demonstrated that AVAudioFile indexing is slow, do
@@ -206,6 +207,7 @@ final class PlaybackController: NSObject, ObservableObject {
 
     deinit {
         timer?.invalidate()
+        if let streamingEndObserver { NotificationCenter.default.removeObserver(streamingEndObserver) }
         if let streamingTimeObserver { streamingPlayer?.removeTimeObserver(streamingTimeObserver) }
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()
@@ -669,6 +671,13 @@ final class PlaybackController: NSObject, ObservableObject {
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
                 self.updateLiveAnalysisTap()
+                self.streamingEndObserver = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+                ) { [weak self] _ in
+                    guard let self, self.fileOpenGeneration == generation,
+                          self.streamingOpenGeneration == generation else { return }
+                    self.onTrackFinished?()
+                }
                 self.streamingStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
                     DispatchQueue.main.async {
                         guard let self, self.fileOpenGeneration == generation,
@@ -691,6 +700,7 @@ final class PlaybackController: NSObject, ObservableObject {
                         self.installStreamingTimeObserver(on: player)
                         player.play()
                         self.isPlaying = true; self.isPaused = false
+                        self.onPlaybackReady?(url)
                     }
                 }
             }
@@ -714,6 +724,8 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private func stopStreamingPlayback() {
+        if let streamingEndObserver { NotificationCenter.default.removeObserver(streamingEndObserver) }
+        streamingEndObserver = nil
         if let streamingTimeObserver { streamingPlayer?.removeTimeObserver(streamingTimeObserver) }
         streamingTimeObserver = nil
         streamingStatusObservation?.invalidate(); streamingStatusObservation = nil

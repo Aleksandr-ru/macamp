@@ -12,14 +12,21 @@ final class PlaylistEntry: ObservableObject, Identifiable {
     /// sandbox bookmark alongside the playlist entry for later launches.
     var bookmarkData: Data?
     @Published var title: String
+    /// Kept separately from the playlist label (which remains “Artist - Title”)
+    /// so system integrations do not have to parse user-visible text.
+    @Published var artist: String?
+    @Published var trackTitle: String?
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
     /// Runtime-only result of an unsuccessful read/playback attempt.  This is
     /// deliberately absent from StoredEntry: a fresh launch retries files.
     @Published var hasPlaybackError = false
 
-    init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
+    init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil,
+         artist: String? = nil, trackTitle: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
         self.id = id; self.url = url; self.title = title ?? url.deletingPathExtension().lastPathComponent
+        self.artist = artist
+        self.trackTitle = trackTitle
         self.bookmarkData = bookmarkData
         self.duration = duration; self.metadataIsAvailable = metadataIsAvailable
     }
@@ -92,10 +99,10 @@ final class PlaylistManager: ObservableObject {
     }
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
     /// Bump when a stored display-title format needs one background refresh.
-    /// Existing snapshots contained title-only metadata, so they must be
-    /// revisited once to obtain the Artist component as well.
+    /// Existing snapshots did not retain separate artist/title fields, so they
+    /// must be revisited once for system notification presentation.
     private static let displayMetadataFormatVersionKey = "macAmp.playlist.displayMetadataFormatVersion"
-    private static let displayMetadataFormatVersion = 1
+    private static let displayMetadataFormatVersion = 2
     @Published private(set) var playlists: [PlaylistModel] = []
     @Published private(set) var activePlaylistID: UUID?
     @Published private(set) var focusedPlaylistID: UUID?
@@ -892,12 +899,20 @@ final class PlaylistManager: ObservableObject {
             let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
             case let (.some(artist), .some(title)):
+                work.entry.artist = artist
+                work.entry.trackTitle = title
                 work.entry.title = "\(artist) - \(title)"
             case let (.some(artist), nil):
+                work.entry.artist = artist
+                work.entry.trackTitle = nil
                 work.entry.title = artist
             case let (nil, .some(title)):
+                work.entry.artist = nil
+                work.entry.trackTitle = title
                 work.entry.title = title
             case (nil, nil):
+                work.entry.artist = nil
+                work.entry.trackTitle = nil
                 break
             }
             // A timeout/error is still a completed attempt; retrying it forever
@@ -980,7 +995,11 @@ final class PlaylistManager: ObservableObject {
         var lastPlayedEntryID: UUID?
     }
 
-    private struct StoredEntry: Codable { var id: UUID; var url: URL; var bookmark: Data?; var title: String; var duration: TimeInterval?; var metadata: Bool }
+    private struct StoredEntry: Codable {
+        var id: UUID; var url: URL; var bookmark: Data?; var title: String
+        var artist: String?; var trackTitle: String?
+        var duration: TimeInterval?; var metadata: Bool
+    }
 
     private func markEntriesDirty(in playlist: PlaylistModel) {
         dirtyPlaylistEntryIDs.insert(playlist.id)
@@ -1121,6 +1140,8 @@ final class PlaylistManager: ObservableObject {
                     url: resolvedURL ?? storedEntry.url,
                     bookmarkData: resolvedURL == nil ? nil : storedEntry.bookmark,
                     title: storedEntry.title,
+                    artist: storedEntry.artist,
+                    trackTitle: storedEntry.trackTitle,
                     duration: storedEntry.duration,
                     metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata
                 )
@@ -1158,6 +1179,8 @@ final class PlaylistManager: ObservableObject {
             url: entry.url,
             bookmark: entry.bookmarkData,
             title: entry.title,
+            artist: entry.artist,
+            trackTitle: entry.trackTitle,
             duration: entry.duration,
             metadata: entry.metadataIsAvailable
         )

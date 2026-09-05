@@ -242,6 +242,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let playlistShade = PlaylistShadeState()
     private let playlistLayout = PlaylistLayout()
     private let playback = PlaybackController()
+    private let trackNotifications = TrackNotificationController()
+    private var pendingTrackNotification: (entry: PlaylistEntry, shouldNotify: Bool)?
     private let playlistManager = PlaylistManager()
     private var preferencesWindow: NSWindow?
     private var equalizerWindow: NSWindow?
@@ -324,6 +326,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         AppDelegate.shared = self
+        trackNotifications.configure()
+        trackNotifications.onPause = { [weak self] in self?.pausePlayback() }
+        trackNotifications.onNext = { [weak self] in self?.playlistTransportAction(4) }
+        trackNotifications.onShowWindows = { [weak self] in self?.showWindowsFromNotification() }
         restorePersistentState()
         playback.onTrackFinished = { [weak self] in self?.advancePlaylistAfterTrackFinished() }
         playback.onPlaybackError = { [weak self] url in
@@ -332,7 +338,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.advancePlaylistAfterTrackFinished()
         }
         playback.onPlaybackReady = { [weak self] url in
-            self?.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
+            guard let self else { return }
+            self.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
+            if let pending = self.pendingTrackNotification {
+                self.pendingTrackNotification = nil
+                if pending.shouldNotify {
+                    var artist = pending.entry.artist
+                    var title = pending.entry.trackTitle ?? pending.entry.title
+                    if artist == nil, pending.entry.trackTitle == nil,
+                       let inferred = TrackNotificationController.artistAndTitle(
+                        fromFilename: pending.entry.url.deletingPathExtension().lastPathComponent
+                       ) {
+                        artist = inferred.artist
+                        title = inferred.title
+                    }
+                    let duration = pending.entry.duration ?? (self.playback.duration > 0 ? self.playback.duration : nil)
+                    self.trackNotifications.show(artist: artist, title: title, duration: duration)
+                }
+            }
         }
         // Create the SwiftUI view that provides the window contents.
         let contentView = ContentView(
@@ -438,6 +461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
+        trackNotifications.invalidate(removeDelivered: true)
         if let mediaKeyMonitor { NSEvent.removeMonitor(mediaKeyMonitor) }
         if let keyboardShortcutMonitor { NSEvent.removeMonitor(keyboardShortcutMonitor) }
         pendingPersistenceWorkItem?.cancel()
@@ -1435,7 +1459,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func stopTrack(_ sender: Any?) { stopPlayback() }
 
     func pausePlayback() { resetInfoTarget(); playback.pause() }
-    func stopPlayback() { resetInfoTarget(); playback.stop() }
+    func stopPlayback() {
+        resetInfoTarget()
+        pendingTrackNotification = nil
+        trackNotifications.invalidate(removeDelivered: true)
+        playback.stop()
+    }
     @objc private func nextTrack(_ sender: Any?) { playlistTransportAction(4) }
     @objc private func rewindFiveSeconds(_ sender: Any?) { seekPlayback(to: max(0, playback.position - 5)) }
     @objc private func forwardFiveSeconds(_ sender: Any?) { seekPlayback(to: min(playback.duration, playback.position + 5)) }
@@ -1571,11 +1600,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel) {
+    private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel, automatic: Bool = false) {
         guard let entry else {
             if playback.isRepeatEnabled,
                let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
                 playlistManager.play(current, in: playlist)
+                prepareTrackNotification(for: current, automatic: automatic)
                 playback.open(current.url, bookmarkData: current.bookmarkData, displayTitle: current.title)
                 observePlayingEntryTitle(current)
                 infoModel.showForPlayback(current.url)
@@ -1586,6 +1616,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
         playlistManager.play(entry, in: playlist)
+        prepareTrackNotification(for: entry, automatic: automatic)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
@@ -1598,9 +1629,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A direct row activation is the sole retry route for a failed item.
         // Keep its marker until PlaybackController confirms it opened.
         playlistManager.play(entry, in: playlist, revealIfNeeded: false)
+        prepareTrackNotification(for: entry, automatic: false)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
+    }
+
+    private func prepareTrackNotification(for entry: PlaylistEntry, automatic: Bool) {
+        // Skinned nonactivating panels can own keyboard focus even when
+        // NSApp.isActive is false. Settings and file panels count as well.
+        let hasActiveWindow = NSApp.windows.contains {
+            $0.isVisible && !$0.isMiniaturized && ($0.isKeyWindow || (NSApp.isActive && $0.isMainWindow))
+        }
+        let shouldNotify = TrackNotificationController.shouldNotify(
+            enabled: trackNotifications.isEnabled, automatic: automatic, hasActiveWindow: hasActiveWindow)
+        trackNotifications.invalidate(removeDelivered: !shouldNotify)
+        pendingTrackNotification = (entry, shouldNotify)
     }
 
     private func observePlayingEntryTitle(_ entry: PlaylistEntry) {
@@ -1630,14 +1674,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func advancePlaylistAfterTrackFinished() {
         resetInfoTarget()
-        guard let playlist = playlistManager.activePlaylist else { playback.stop(); return }
+        guard let playlist = playlistManager.activePlaylist else { stopPlayback(); return }
         if let next = playlistManager.entryToPlay(in: playlist, step: 1, shuffle: playback.isShuffleEnabled) {
-            playPlaylistEntry(next, in: playlist)
+            playPlaylistEntry(next, in: playlist, automatic: true)
         } else if playback.isRepeatEnabled,
                   let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
-            playPlaylistEntry(current, in: playlist)
+            playPlaylistEntry(current, in: playlist, automatic: true)
         } else {
-            playback.stop()
+            stopPlayback()
         }
     }
 
@@ -1703,6 +1747,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshInterfaceVisibility()
     }
 
+    private func showWindowsFromNotification() {
+        let auxiliary = [equalizerState.isVisible ? equalizerWindow : nil,
+                         infoState.isVisible ? infoWindow : nil,
+                         settingsWindowState.isVisible ? preferencesWindow : nil].compactMap { $0 }
+        let playlists = playlistState.isVisible ? Array(playlistWindows.values) : []
+        NSApp.unhide(nil)
+        for panel in [window!] + auxiliary + playlists {
+            if panel.isMiniaturized { panel.deminiaturize(nil) }
+            panel.orderFrontRegardless()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        refreshInterfaceVisibility()
+    }
+
     @objc func hideMainPlayer(_ sender: Any?) {
         window.orderOut(nil)
         equalizerWindow?.orderOut(nil)
@@ -1743,6 +1802,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showPreferences(_ sender: Any?) {
+        trackNotifications.refreshPermission()
         if let preferencesWindow {
             preferencesWindow.makeKeyAndOrderFront(nil)
             settingsWindowState.isVisible = true
@@ -1751,7 +1811,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let preferences = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 216),
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 300),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1762,7 +1822,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preferences.contentView = NSHostingView(rootView: SettingsView(
             interfaceScale: interfaceScale,
             playlistFontScale: playlistFontScale,
-            timeDisplayPreference: timeDisplayPreference
+            timeDisplayPreference: timeDisplayPreference,
+            trackNotifications: trackNotifications
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -2621,6 +2682,7 @@ private struct SettingsView: View {
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var playlistFontScale: PlaylistFontScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
+    @ObservedObject var trackNotifications: TrackNotificationController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -2641,9 +2703,16 @@ private struct SettingsView: View {
                     .font(.system(.body, design: .monospaced))
             }
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
+            Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
+            if !trackNotifications.permissionMessage.isEmpty {
+                Text(trackNotifications.permissionMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(20)
-        .frame(width: 300, height: 216, alignment: .topLeading)
+        .frame(width: 300, height: 300, alignment: .topLeading)
     }
 }
 
