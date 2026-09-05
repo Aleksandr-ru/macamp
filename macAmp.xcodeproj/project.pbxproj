@@ -111,6 +111,7 @@
 				27067736242E89F100CFBEE7 /* Sources */,
 				27067737242E89F100CFBEE7 /* Frameworks */,
 				27067738242E89F100CFBEE7 /* Resources */,
+				E1A0001326A0000100000001 /* Update Day version */,
 			);
 			buildRules = (
 			);
@@ -168,6 +169,22 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		E1A0001326A0000100000001 /* Update Day version */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",
+			);
+			name = "Update Day version";
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/zsh;
+			shellScript = "\"$SRCROOT/Scripts/update-day-version.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		27067736242E89F100CFBEE7 /* Sources */ = {
