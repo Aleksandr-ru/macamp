@@ -2978,13 +2978,15 @@ private struct PlaylistView: View {
             .onChange(of: manager.playbackRevealRevision) { _ in
                 guard manager.activePlaylistID == playlist.id,
                       let id = manager.playingEntryID,
-                      let index = playlist.entries.firstIndex(where: { $0.id == id }) else { return }
-                let visible = playlist.scrollPosition..<min(playlist.entries.count, playlist.scrollPosition + playlist.visibleEntryCount)
-                // Do not disturb a row the user can already see.  Deferring
-                // one main-loop turn guarantees LazyVStack has materialised an
-                // off-screen destination before ScrollViewReader resolves it.
-                if !visible.contains(index) {
-                    DispatchQueue.main.async { proxy.scrollTo(id, anchor: .center) }
+                      playlist.entries.contains(where: { $0.id == id }) else { return }
+                // Do not use PlaylistModel.scrollPosition here. It is a
+                // coalesced, scheduler-oriented value and can lag behind the
+                // native scroll view during a fast/manual jump (for example,
+                // when changing from row 41 to row 19). Wait for that layout
+                // pass to finish, then perform one centred scroll so there is
+                // no visible top-then-centre jump.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    proxy.scrollTo(id, anchor: .center)
                 }
             }
             .onChange(of: manager.keyboardSelectionReveal) { request in
