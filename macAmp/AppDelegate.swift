@@ -183,9 +183,23 @@ private final class PixelRegionMaskLayer: CALayer {
     }
 }
 
-private final class PlayerWindow: NSPanel {
+private final class PlayerWindow: NSWindow {
     private var skinRegion: WinampSkinStore.WindowRegion?
     private var skinRegionBaseSize: NSSize?
+
+    override init(
+        contentRect: NSRect,
+        styleMask style: NSWindow.StyleMask,
+        backing backingStoreType: NSWindow.BackingStoreType,
+        defer flag: Bool
+    ) {
+        super.init(contentRect: contentRect,
+                   styleMask: style,
+                   backing: backingStoreType,
+                   defer: flag)
+        hidesOnDeactivate = false
+        collectionBehavior = [.managed]
+    }
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -515,7 +529,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Create the window and set the content view. 
         window = PlayerWindow(
             contentRect: NSRect(x: 0, y: 0, width: 275, height: 116),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: .borderless,
             backing: .buffered, defer: false)
         window.center()
         window.isMovableByWindowBackground = false
@@ -1812,8 +1826,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func prepareTrackNotification(for entry: PlaylistEntry, automatic: Bool) {
-        // Skinned nonactivating panels can own keyboard focus even when
-        // NSApp.isActive is false. Settings and file panels count as well.
+        // During application activation a skinned panel can own keyboard
+        // focus before NSApp.isActive changes. Settings and file panels count
+        // as well.
         let hasActiveWindow = NSApp.windows.contains {
             $0.isVisible && !$0.isMiniaturized && ($0.isKeyWindow || (NSApp.isActive && $0.isMainWindow))
         }
@@ -1963,9 +1978,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         active.makeKeyAndOrderFront(nil)
     }
 
-    /// All classic panels belong to one player surface. NSPanel does not
-    /// automatically join the application's activation ordering, so Info must
-    /// be raised explicitly alongside Main, EQ and Playlist windows.
+    /// All classic windows belong to one player surface. Keep the separate
+    /// borderless windows together when the application becomes active.
     private func raiseVisiblePlayerWindows() {
         // A minimized main panel owns the visibility of the complete player
         // surface.  Activation notifications must not reveal auxiliary panels
@@ -2154,7 +2168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let skin = WinampSkinStore.shared
         let minimumWidth = CGFloat(skin.genericMinimumWindowWidth(title: "Info"))
         infoLogicalSize.width = max(minimumWidth, infoLogicalSize.width)
-        let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale), styleMask: .borderless, backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
         applyAlwaysOnTopLevel(to: panel)
         panel.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
@@ -2209,7 +2223,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scale = CGFloat(interfaceScale.factor)
         let context = PlaylistWindowContext(model, interfaceScale: scale)
         let initialHeight = (context.shade.isEnabled ? 14 : context.layout.height) * scale
-        let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: context.layout.width * scale, height: initialHeight), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: context.layout.width * scale, height: initialHeight), styleMask: .borderless, backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isMovableByWindowBackground = false
         applyAlwaysOnTopLevel(to: panel)
         panel.contentView = NSHostingView(rootView: PlaylistView(interfaceScale: interfaceScale, fontScale: playlistFontScale, focus: context.focus, shade: context.shade, layout: context.layout, playback: playback, timeDisplayPreference: timeDisplayPreference, manager: playlistManager, playlist: model, onClose: { [weak self] in self?.closePlaylistWindow(for: model) }, onToggleShade: { [weak self] in self?.toggleFloatingPlaylistShade(panel, context: context) }, onDragEnded: { [weak self] in self?.finishFloatingPlaylistGesture(panel, model: model) }, onResize: { [weak self] width, height in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: height) }, onShadeResize: { [weak self] width in self?.resizeFloatingPlaylist(panel, context: context, width: width, height: 14) }))
@@ -2258,7 +2272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scale = CGFloat(interfaceScale.factor)
         let playlist = PlayerWindow(
             contentRect: NSRect(x: 0, y: 0, width: playlistLayout.width * scale, height: playlistLayout.height * scale),
-            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false
+            styleMask: .borderless, backing: .buffered, defer: false
         )
         playlist.isOpaque = false
         playlist.backgroundColor = .clear
@@ -2498,7 +2512,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scale = CGFloat(interfaceScale.factor)
         let equalizer = PlayerWindow(
             contentRect: NSRect(x: 0, y: 0, width: 275 * scale, height: 116 * scale),
-            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false
+            styleMask: .borderless, backing: .buffered, defer: false
         )
         equalizer.isOpaque = false
         equalizer.backgroundColor = .clear
