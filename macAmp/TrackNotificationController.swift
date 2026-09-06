@@ -29,6 +29,7 @@ final class TrackNotificationController: NSObject, ObservableObject, UNUserNotif
     private var queuedContent: UNMutableNotificationContent?
     private var isAdding = false
     private var currentToken: Int?
+    private var authorizationStatus: UNAuthorizationStatus?
 
     var onPause: (() -> Void)?
     var onNext: (() -> Void)?
@@ -69,22 +70,62 @@ final class TrackNotificationController: NSObject, ObservableObject, UNUserNotif
     func refreshPermission() {
         dispatchPrecondition(condition: .onQueue(.main))
         center.getNotificationSettings { [weak self] settings in
-            let denied = settings.authorizationStatus == .denied
+            let status = settings.authorizationStatus
             DispatchQueue.main.async {
-                self?.permissionMessage = denied
-                    ? "Allow macAmp notifications in macOS System Settings." : ""
+                self?.updatePermissionStatus(status)
             }
         }
     }
 
     private func requestPermission(completion: (@Sendable (Bool) -> Void)? = nil) {
-        center.requestAuthorization(options: [.alert]) { [weak self] granted, error in
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let authorizationStatus {
+            resolvePermission(status: authorizationStatus, completion: completion)
+            return
+        }
+
+        center.getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
             DispatchQueue.main.async {
-                self?.permissionMessage = error != nil ? "Could not request notification permission."
-                    : (granted ? "" : "Allow macAmp notifications in macOS System Settings.")
-                completion?(granted)
+                guard let self else { return }
+                self.resolvePermission(status: status, completion: completion)
             }
         }
+    }
+
+    private func resolvePermission(status: UNAuthorizationStatus,
+                                   completion: (@Sendable (Bool) -> Void)?) {
+        updatePermissionStatus(status)
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            completion?(true)
+        case .denied:
+            completion?(false)
+        case .notDetermined:
+            center.requestAuthorization(options: [.alert]) { [weak self] granted, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let error {
+                        self.authorizationStatus = nil
+                        self.permissionMessage = "Could not request notification permission: \(error.localizedDescription)"
+                        NSLog("Notification permission request failed: %@", error.localizedDescription)
+                    } else {
+                        self.updatePermissionStatus(granted ? .authorized : .denied)
+                    }
+                    completion?(granted && error == nil)
+                }
+            }
+        @unknown default:
+            authorizationStatus = nil
+            permissionMessage = "Could not determine notification permission."
+            completion?(false)
+        }
+    }
+
+    private func updatePermissionStatus(_ status: UNAuthorizationStatus) {
+        authorizationStatus = status
+        permissionMessage = status == .denied
+            ? "Allow macAmp notifications in macOS System Settings." : ""
     }
 
     /// Invalidate asynchronous permission/delivery work on every track selection.
