@@ -879,12 +879,12 @@ private struct TickerDisplay: View {
     @State private var tickerTimer: Timer?
 
     var body: some View {
-        let colors = skin.playlistColors()
+        let textColor = skinTextColor(skin.textForegroundColor())
         ZStack(alignment: .leading) {
             Text(tickerDisplayText)
                 .lineLimit(1)
                 .font(.system(size: 7, weight: .regular, design: .monospaced))
-                .foregroundColor(skinTextColor(colors.normalText))
+                .foregroundColor(textColor)
                 .fixedSize(horizontal: true, vertical: false)
                 .offset(y: -1)
                 .offset(x: -tickerOffset)

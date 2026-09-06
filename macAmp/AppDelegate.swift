@@ -2848,7 +2848,6 @@ private struct PlaylistStatusField: View {
     @ObservedObject var playlist: PlaylistModel
 
     var body: some View {
-        let colors = skin.playlistColors()
         let counter = manager.statusCounter(for: playlist)
         let counterWidth = CGFloat((counter?.count ?? 0) * 5)
         let indicator: String = {
@@ -2857,7 +2856,8 @@ private struct PlaylistStatusField: View {
             if playback.isPaused { return "⏸" }
             return manager.playingEntryID == nil ? "" : "■"
         }()
-        let color = colors.normalText.usingColorSpace(.deviceRGB) ?? colors.normalText
+        let textColor = skin.textForegroundColor()
+        let color = textColor.usingColorSpace(.deviceRGB) ?? textColor
         return HStack(spacing: 2) {
             if playlist.scannerState == .idle, !indicator.isEmpty { Text(indicator) }
             Text(verbatim: manager.statusText(for: playlist, playbackIndicator: nil).uppercased())
@@ -3168,7 +3168,7 @@ private struct PlaylistView: View {
         let trackTitle = isActivePlaylist ? (current?.title ?? playlist.name) : playlist.name
         let compactDuration = isActivePlaylist ? (current?.duration ?? playback.duration) : playlist.totalDuration
         let hasTrack = isActivePlaylist ? compactDuration > 0 : !playlist.entries.isEmpty
-        let colors = skin.playlistColors()
+        let textColor = playlistColor(skin.textForegroundColor())
         let totalSeconds = max(0, Int(compactDuration.rounded(.down)))
         let inactiveSuffix = isActivePlaylist ? "" : "[\(playlist.entries.count)] \(formattedLongTime(playlist.totalDuration))"
         let durationTextWidth = isActivePlaylist && hasTrack
@@ -3203,7 +3203,7 @@ private struct PlaylistView: View {
             if !compactIndicator.isEmpty {
                 Text(compactIndicator)
                     .font(.system(size: 7, weight: .regular, design: .monospaced))
-                    .foregroundColor(playlistColor(colors.normalText))
+                    .foregroundColor(textColor)
                     .frame(width: CGFloat(indicatorWidth), height: 10, alignment: .leading)
                     .position(x: 8 + CGFloat(indicatorWidth) / 2, y: 8)
             }
@@ -3211,7 +3211,7 @@ private struct PlaylistView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .font(.system(size: 7, weight: .regular, design: .monospaced))
-                .foregroundColor(playlistColor(colors.normalText))
+                .foregroundColor(textColor)
                 .frame(width: CGFloat(titleWidth), height: 10, alignment: .leading)
                 .position(x: 8 + CGFloat(indicatorWidth) + CGFloat(titleWidth) / 2, y: 8)
             PlaylistDragArea(cursor: skin.cursor(named: "PTBAR.CUR"), onEnded: onDragEnded, onDoubleClick: onToggleShade)

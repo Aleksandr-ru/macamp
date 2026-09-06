@@ -162,6 +162,8 @@ final class WinampSkinStore: ObservableObject {
     private var equalizerSliderCache: [String: NSImage] = [:]
     private var playlistTimeCache: [String: NSImage] = [:]
     private var playlistWindowShadeTrackCache: [String: NSImage] = [:]
+    private var textForegroundColorCache: NSColor?
+    private var textForegroundColorResolved = false
     private var playlistColorsCache: PlaylistColors?
     private var skinInformationCache: [String: SkinInformation] = [:]
     private var windowRegionCache: [String: WindowRegion] = [:]
@@ -960,6 +962,8 @@ final class WinampSkinStore: ObservableObject {
         equalizerSliderCache.removeAll()
         playlistTimeCache.removeAll()
         playlistWindowShadeTrackCache.removeAll()
+        textForegroundColorCache = nil
+        textForegroundColorResolved = false
         playlistColorsCache = nil
         windowRegionCache.removeAll()
         missingWindowRegions.removeAll()
@@ -1197,6 +1201,59 @@ final class WinampSkinStore: ObservableObject {
         )
         playlistColorsCache = colors
         return colors
+    }
+
+    /// Foreground colour used by Winamp's skinned main-window font.
+    ///
+    /// The original renderer does not use PLEDIT.TXT/Normal for this text.
+    /// It derives `mfont_fgcolor` from the most distant non-background colour
+    /// in the first 20×6 glyph area of TEXT.BMP. This matters for skins such as
+    /// Denon, where the playlist's normal text colour is intentionally dimmer
+    /// than the colour of the small bitmap font.
+    func textForegroundColor() -> NSColor {
+        if textForegroundColorResolved {
+            return textForegroundColorCache ?? playlistColors().normalText
+        }
+        textForegroundColorResolved = true
+
+        let fallback = playlistColors().normalText
+        guard let sheet = bitmap(named: "TEXT.BMP"),
+              let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            textForegroundColorCache = fallback
+            return fallback
+        }
+        let bitmap = NSBitmapImageRep(cgImage: source)
+        guard bitmap.pixelsWide > 0, bitmap.pixelsHigh > 0 else {
+            textForegroundColorCache = fallback
+            return fallback
+        }
+
+        let backgroundX = min(150, bitmap.pixelsWide - 1)
+        let backgroundY = min(4, bitmap.pixelsHigh - 1)
+        let background = bitmap.colorAt(x: backgroundX, y: backgroundY) ?? fallback
+        let backgroundRGB = background.usingColorSpace(.deviceRGB) ?? background
+        var foreground = background
+        var greatestDistance: CGFloat = 0
+
+        let sampleWidth = min(20, bitmap.pixelsWide)
+        let sampleHeight = min(6, bitmap.pixelsHigh)
+        for y in 0..<sampleHeight {
+            for x in 0..<sampleWidth {
+                guard let candidate = bitmap.colorAt(x: x, y: y),
+                      let candidateRGB = candidate.usingColorSpace(.deviceRGB) else { continue }
+                let redDelta = candidateRGB.redComponent - backgroundRGB.redComponent
+                let greenDelta = candidateRGB.greenComponent - backgroundRGB.greenComponent
+                let blueDelta = candidateRGB.blueComponent - backgroundRGB.blueComponent
+                let distance = redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta
+                if distance > greatestDistance {
+                    greatestDistance = distance
+                    foreground = candidate
+                }
+            }
+        }
+
+        textForegroundColorCache = foreground
+        return foreground
     }
 
     private static func color(hex: String) -> NSColor { colorIfValid(hex: hex) ?? .black }
