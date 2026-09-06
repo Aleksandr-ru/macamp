@@ -106,8 +106,14 @@ final class TrackNotificationController: NSObject, ObservableObject, UNUserNotif
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if let error {
-                        self.authorizationStatus = nil
-                        self.permissionMessage = "Could not request notification permission: \(error.localizedDescription)"
+                        let notificationError = error as NSError
+                        if notificationError.domain == UNErrorDomain,
+                           notificationError.code == UNError.Code.notificationsNotAllowed.rawValue {
+                            self.updatePermissionStatus(.denied)
+                        } else {
+                            self.authorizationStatus = nil
+                            self.permissionMessage = "Could not request notification permission: \(error.localizedDescription)"
+                        }
                         NSLog("Notification permission request failed: %@", error.localizedDescription)
                     } else {
                         self.updatePermissionStatus(granted ? .authorized : .denied)
