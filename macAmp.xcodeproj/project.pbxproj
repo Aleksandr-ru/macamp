@@ -12,7 +12,6 @@
 		27067740242E89F100CFBEE7 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2706773F242E89F100CFBEE7 /* ContentView.swift */; };
 		E1A0000126A0000100000001 /* WinampSkinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000226A0000100000001 /* WinampSkinStore.swift */; };
 		E1A0000326A0000100000001 /* InterfaceScale.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000426A0000100000001 /* InterfaceScale.swift */; };
-		E1A0000526A0000100000001 /* Default.wsz in Resources */ = {isa = PBXBuildFile; fileRef = E1A0000626A0000100000001 /* Default.wsz */; };
 		E1A0000726A0000100000001 /* DefaultSkin in Resources */ = {isa = PBXBuildFile; fileRef = E1A0000826A0000100000001 /* DefaultSkin */; };
 		E1A0000926A0000100000001 /* PlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000A26A0000100000001 /* PlaybackController.swift */; };
 		E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000C26A0000100000001 /* EqualizerController.swift */; };
@@ -30,7 +29,6 @@
 		2706773F242E89F100CFBEE7 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		E1A0000226A0000100000001 /* WinampSkinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WinampSkinStore.swift; sourceTree = "<group>"; };
 		E1A0000426A0000100000001 /* InterfaceScale.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterfaceScale.swift; sourceTree = "<group>"; };
-		E1A0000626A0000100000001 /* Default.wsz */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = Resources/Default.wsz; sourceTree = "<group>"; };
 		E1A0000826A0000100000001 /* DefaultSkin */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources/DefaultSkin; sourceTree = "<group>"; };
 		E1A0000A26A0000100000001 /* PlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackController.swift; sourceTree = "<group>"; };
 		E1A0000C26A0000100000001 /* EqualizerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EqualizerController.swift; sourceTree = "<group>"; };
@@ -78,7 +76,6 @@
 				2706773F242E89F100CFBEE7 /* ContentView.swift */,
 				E1A0000226A0000100000001 /* WinampSkinStore.swift */,
 				E1A0000426A0000100000001 /* InterfaceScale.swift */,
-				E1A0000626A0000100000001 /* Default.wsz */,
 				E1A0000826A0000100000001 /* DefaultSkin */,
 				E1A0000A26A0000100000001 /* PlaybackController.swift */,
 				E1A0000C26A0000100000001 /* EqualizerController.swift */,
@@ -161,7 +158,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				E1A0000726A0000100000001 /* DefaultSkin in Resources */,
-				E1A0000526A0000100000001 /* Default.wsz in Resources */,
 				27067748242E89F200CFBEE7 /* Main.storyboard in Resources */,
 				27067745242E89F200CFBEE7 /* Preview Assets.xcassets in Resources */,
 				27067742242E89F200CFBEE7 /* Assets.xcassets in Resources */,

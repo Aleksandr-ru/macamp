@@ -1,18 +1,120 @@
 import AppKit
 import Combine
+import Foundation
 
 /// Imports a classic Winamp `.wsz` archive. A `.wsz` is a ZIP containing BMP assets;
 /// the extracted files are kept in Application Support for the renderer to consume.
 final class WinampSkinStore: ObservableObject {
+    /// There is one active skin for the entire application. Every player
+    /// window observes this instance so a skin change is applied consistently.
+    static let shared = WinampSkinStore()
+
     struct PlaylistColors {
         let normalText: NSColor
         let currentText: NSColor
         let background: NSColor
         let selectedBackground: NSColor
     }
+
+    struct SkinDescriptor: Identifiable {
+        let directoryName: String
+        let displayName: String
+        let directory: URL
+        let isBundled: Bool
+
+        var id: String { directoryName }
+    }
+
+    struct SkinInformation {
+        let name: String
+        let type: String
+        let author: String
+        let version: String
+        let comment: String
+        let preview: NSImage?
+    }
+
+    enum WindowRegionKind {
+        case main
+        case equalizer
+    }
+
+    struct WindowRegion {
+        private let polygons: [[CGPoint]]
+
+        fileprivate init(polygons: [[CGPoint]]) {
+            self.polygons = polygons
+        }
+
+        /// REGION.TXT and the layer-backed NSHostingView both use a top-left
+        /// origin here. Keep the skin coordinates unchanged vertically; an
+        /// additional Core Animation flip places bottom cut-outs at the top.
+        func layerPath(in size: NSSize, baseSize: NSSize) -> CGPath {
+            let path = CGMutablePath()
+            let scaleX = size.width / max(1, baseSize.width)
+            let scaleY = size.height / max(1, baseSize.height)
+            func transformedPoint(_ source: CGPoint) -> CGPoint {
+                CGPoint(x: source.x * scaleX,
+                        y: source.y * scaleY)
+            }
+            for polygon in polygons {
+                guard let first = polygon.first else { continue }
+                path.move(to: transformedPoint(first))
+                for point in polygon.dropFirst() {
+                    path.addLine(to: transformedPoint(point))
+                }
+                path.closeSubpath()
+            }
+            return path
+        }
+
+        /// Rasterizes the Winamp region using source-pixel centres. The
+        /// coordinates in REGION.TXT describe pixel boundaries; asking Core
+        /// Graphics to rasterize the polygons directly can include pixels on
+        /// the outside edge and reveal the BMP chroma-key colour.
+        func pixelMaskRects(in size: NSSize, baseSize: NSSize) -> [CGRect] {
+            let width = max(1, Int(baseSize.width.rounded()))
+            let height = max(1, Int(baseSize.height.rounded()))
+            let sourcePath = layerPath(in: baseSize, baseSize: baseSize)
+            let scaleX = size.width / CGFloat(width)
+            let scaleY = size.height / CGFloat(height)
+            var rects: [CGRect] = []
+            rects.reserveCapacity(height * 2)
+
+            for y in 0..<height {
+                var runStart: Int?
+                for x in 0...width {
+                    let isInside = x < width && sourcePath.contains(
+                        CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5),
+                        using: .winding
+                    )
+                    if isInside, runStart == nil {
+                        runStart = x
+                    } else if !isInside, let start = runStart {
+                        rects.append(CGRect(x: CGFloat(start) * scaleX,
+                                            y: CGFloat(y) * scaleY,
+                                            width: CGFloat(x - start) * scaleX,
+                                            height: scaleY))
+                        runStart = nil
+                    }
+                }
+            }
+            return rects
+        }
+
+        func contains(_ point: NSPoint, in size: NSSize, baseSize: NSSize, isFlipped: Bool) -> Bool {
+            let layerPoint = CGPoint(x: point.x,
+                                     y: isFlipped ? point.y : size.height - point.y)
+            return layerPath(in: size, baseSize: baseSize).contains(layerPoint, using: .winding)
+        }
+    }
+
     @Published private(set) var name = "CLASSIC"
     @Published private(set) var status = "NO TRACK — LOAD A WINAMP .WSZ SKIN"
     @Published private(set) var visualizationPalette: [NSColor] = WinampSkinStore.defaultVisualizationPalette
+    @Published private(set) var availableSkins: [SkinDescriptor] = []
+    @Published private(set) var activeSkinDirectoryName = "DefaultSkin"
+    @Published private(set) var isImporting = false
     private(set) var extractedDirectory: URL?
     /// Source sheets are immutable for a loaded skin. Keep each decoded BMP in
     /// memory; reopening and case-insensitively scanning the skin directory on
@@ -49,6 +151,9 @@ final class WinampSkinStore: ObservableObject {
     private var playlistTimeCache: [String: NSImage] = [:]
     private var playlistWindowShadeTrackCache: [String: NSImage] = [:]
     private var playlistColorsCache: PlaylistColors?
+    private var skinInformationCache: [String: SkinInformation] = [:]
+    private var windowRegionCache: [String: WindowRegion] = [:]
+    private var missingWindowRegions: Set<String> = []
 
     enum WindowToggle {
         case equalizer
@@ -85,70 +190,690 @@ final class WinampSkinStore: ObservableObject {
         case lostSync
     }
 
-    init() {
-        loadBundledDefaultSkin()
+    private static let activeSkinDirectoryNameKey = "macAmp.activeSkinDirectoryName.v1"
+    private static let bundledDefaultSkinDirectoryName = "DefaultSkin"
+
+    private init() {
+        if !loadPersistedSkin() {
+            _ = loadBundledDefaultSkin()
+        }
+        refreshAvailableSkins()
     }
 
-    func chooseArchive() {
+    @discardableResult
+    func chooseArchive() -> Bool {
+        guard !isImporting else {
+            status = "SKIN IMPORT ALREADY IN PROGRESS"
+            return false
+        }
+
         let panel = NSOpenPanel()
         panel.allowedFileTypes = ["wsz", "zip"]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let archive = panel.url else {
             status = "SKIN IMPORT CANCELLED"
-            return
+            return false
+        }
+
+        let selectedSkinName = archive.deletingPathExtension().lastPathComponent
+        guard isValidSkinDirectoryName(selectedSkinName) else {
+            status = "INVALID SKIN NAME"
+            showImportError("The skin file name is not valid.")
+            return false
+        }
+        guard selectedSkinName.caseInsensitiveCompare(Self.bundledDefaultSkinDirectoryName) != .orderedSame else {
+            status = "DEFAULT SKIN IS PROTECTED"
+            showImportError("The built-in DefaultSkin cannot be replaced.")
+            return false
+        }
+
+        let existingSkin = availableSkins.first {
+            $0.directoryName.caseInsensitiveCompare(selectedSkinName) == .orderedSame
+        }
+        if let existingSkin, !confirmReplacement(of: existingSkin.displayName) {
+            status = "SKIN IMPORT CANCELLED"
+            return false
+        }
+
+        isImporting = true
+        status = "IMPORTING SKIN — \(selectedSkinName.uppercased())"
+
+        // NSOpenPanel may return a security-scoped URL in a sandboxed build.
+        // Keep that access alive for the worker that reads the archive.
+        let hasSecurityScope = archive.startAccessingSecurityScopedResource()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else {
+                if hasSecurityScope { archive.stopAccessingSecurityScopedResource() }
+                return
+            }
+            defer {
+                if hasSecurityScope { archive.stopAccessingSecurityScopedResource() }
+            }
+            do {
+                let destination = try self.extract(archive, replacing: existingSkin?.directory)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.finishImport(at: destination, displayName: selectedSkinName)
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.finishImport(with: error)
+                }
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    func selectSkin(named directoryName: String) -> Bool {
+        guard let selectedSkin = availableSkins.first(where: {
+            $0.directoryName.caseInsensitiveCompare(directoryName) == .orderedSame
+        }) else { return false }
+
+        if selectedSkin.isBundled {
+            return loadBundledDefaultSkin()
+        }
+
+        guard canLoadSkin(at: selectedSkin.directory) else {
+            _ = loadBundledDefaultSkin(loadStatus: "SKIN LOAD FAILED — DEFAULT SKIN")
+            return false
+        }
+
+        activateSkin(at: selectedSkin.directory,
+                     directoryName: selectedSkin.directoryName,
+                     displayName: selectedSkin.displayName,
+                     loadStatus: "SKIN LOADED — \(selectedSkin.displayName.uppercased())")
+        UserDefaults.standard.set(selectedSkin.directoryName, forKey: Self.activeSkinDirectoryNameKey)
+        return true
+    }
+
+    @discardableResult
+    func deleteSkin(named directoryName: String) -> Bool {
+        guard let selectedSkin = availableSkins.first(where: {
+            $0.directoryName.caseInsensitiveCompare(directoryName) == .orderedSame
+        }), !selectedSkin.isBundled,
+              selectedSkin.directoryName.caseInsensitiveCompare(Self.bundledDefaultSkinDirectoryName) != .orderedSame else {
+            return false
+        }
+
+        let target = selectedSkin.directory.standardizedFileURL
+        guard let root = try? skinsRoot(create: false),
+              isVerifiedDirectory(target, directlyInside: root),
+              target == root.appendingPathComponent(selectedSkin.directoryName, isDirectory: true).standardizedFileURL else {
+            status = "UNSAFE SKIN PATH"
+            return false
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Delete skin?"
+        alert.informativeText = "The skin \"\(selectedSkin.displayName)\" will be removed from macAmp."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+
+        // Switch away before removing the directory. This keeps the renderer
+        // from retaining a path that has just been deleted and guarantees the
+        // bundled skin is active when the current skin is removed.
+        if activeSkinDirectoryName.caseInsensitiveCompare(selectedSkin.directoryName) == .orderedSame {
+            guard loadBundledDefaultSkin(loadStatus: "DEFAULT WINAMP 2.91 SKIN") else { return false }
         }
 
         do {
-            try extract(archive)
-            name = archive.deletingPathExtension().lastPathComponent
-            status = "SKIN LOADED — \(name.uppercased())"
+            // A user-initiated skin deletion should remain recoverable. The
+            // path has already been tied to the real Skins root above; moving
+            // it to Trash also avoids recursively walking any parent path.
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: target, resultingItemURL: &resultingURL)
+            skinInformationCache.removeValue(forKey: selectedSkin.directoryName)
+            refreshAvailableSkins()
+            return true
         } catch {
-            status = "INVALID WINAMP SKIN"
+            status = "SKIN COULD NOT BE DELETED"
+            return false
         }
     }
 
-    private func loadBundledDefaultSkin() {
-        guard let directory = Bundle.main.resourceURL?.appendingPathComponent("DefaultSkin", isDirectory: true),
-              FileManager.default.fileExists(atPath: directory.appendingPathComponent("MAIN.BMP").path) else {
-            status = "DEFAULT SKIN NOT FOUND"
-            return
+    func information(for skin: SkinDescriptor) -> SkinInformation {
+        if let cached = skinInformationCache[skin.directoryName] { return cached }
+
+        let information: SkinInformation
+        if skin.isBundled {
+            information = SkinInformation(
+                name: "WINAMP CLASSIC 2.91",
+                type: "Classic",
+                author: "Steve Gedikian",
+                version: "2.0",
+                comment: "Winamp base skin v5.5",
+                preview: decodedBitmap(named: "MAIN.BMP", in: skin.directory)
+            )
+        } else {
+            let values = loadSkinInfoValues(from: skin.directory)
+            let isModern = fileURL(named: "skin.xml", in: skin.directory) != nil
+            let hasClassicMainBitmap = fileURL(named: "MAIN.BMP", in: skin.directory) != nil
+            let preview: NSImage?
+            if let screenshot = values["screenshot"], !screenshot.isEmpty {
+                let screenshotURL = screenshot.hasPrefix("/")
+                    ? URL(fileURLWithPath: screenshot)
+                    : skin.directory.appendingPathComponent(screenshot)
+                preview = decodedBitmap(at: screenshotURL) ?? decodedBitmap(named: "MAIN.BMP", in: skin.directory)
+            } else {
+                preview = decodedBitmap(named: "MAIN.BMP", in: skin.directory)
+            }
+            information = SkinInformation(
+                name: values["name"] ?? skin.displayName,
+                type: isModern ? "Modern" : (hasClassicMainBitmap ? "Classic" : "Unknown"),
+                author: values["author"] ?? "",
+                version: values["version"] ?? "",
+                comment: values["comment"] ?? "",
+                preview: preview
+            )
         }
+        skinInformationCache[skin.directoryName] = information
+        return information
+    }
+
+    func windowRegion(for kind: WindowRegionKind, isWindowShaded: Bool) -> WindowRegion? {
+        let section: String
+        switch (kind, isWindowShaded) {
+        case (.main, false): section = "Normal"
+        case (.main, true): section = "WindowShade"
+        case (.equalizer, false): section = "Equalizer"
+        case (.equalizer, true): section = "EqualizerWS"
+        }
+        let key = section.lowercased()
+        if missingWindowRegions.contains(key) { return nil }
+        if let cached = windowRegionCache[key] { return cached }
+        guard let directory = extractedDirectory,
+              let regionFile = fileURL(named: "REGION.TXT", in: directory),
+              let contents = try? String(contentsOf: regionFile, encoding: .utf8),
+              let region = parseWindowRegion(section: section, from: contents) else {
+            missingWindowRegions.insert(key)
+            return nil
+        }
+        windowRegionCache[key] = region
+        return region
+    }
+
+    private func loadBundledDefaultSkin(loadStatus: String = "DEFAULT WINAMP 2.91 SKIN") -> Bool {
+        guard let directory = Bundle.main.resourceURL?.appendingPathComponent(Self.bundledDefaultSkinDirectoryName, isDirectory: true),
+              canLoadSkin(at: directory) else {
+            status = "DEFAULT SKIN NOT FOUND"
+            return false
+        }
+        UserDefaults.standard.removeObject(forKey: Self.activeSkinDirectoryNameKey)
+        activateSkin(at: directory,
+                     directoryName: Self.bundledDefaultSkinDirectoryName,
+                     displayName: "WINAMP CLASSIC 2.91",
+                     loadStatus: loadStatus)
+        return true
+    }
+
+    private func loadPersistedSkin() -> Bool {
+        guard let skinDirectoryName = UserDefaults.standard.string(forKey: Self.activeSkinDirectoryNameKey),
+              isValidSkinDirectoryName(skinDirectoryName),
+              skinDirectoryName.caseInsensitiveCompare(Self.bundledDefaultSkinDirectoryName) != .orderedSame,
+              let applicationSupport = try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                                     in: .userDomainMask,
+                                                                     appropriateFor: nil,
+                                                                     create: false) else {
+            UserDefaults.standard.removeObject(forKey: Self.activeSkinDirectoryNameKey)
+            return false
+        }
+        let directory = applicationSupport
+            .appendingPathComponent("macAmp/Skins", isDirectory: true)
+            .appendingPathComponent(skinDirectoryName, isDirectory: true)
+        guard canLoadSkin(at: directory) else {
+            UserDefaults.standard.removeObject(forKey: Self.activeSkinDirectoryNameKey)
+            return false
+        }
+        activateSkin(at: directory,
+                     directoryName: skinDirectoryName,
+                     displayName: skinDirectoryName,
+                     loadStatus: "SKIN LOADED — \(skinDirectoryName.uppercased())")
+        return true
+    }
+
+    private func activateSkin(at directory: URL, directoryName: String, displayName: String, loadStatus: String) {
         extractedDirectory = directory
         clearImageCaches()
         predecodeCoreBitmaps()
-        name = "WINAMP CLASSIC 2.91"
-        status = "DEFAULT WINAMP 2.91 SKIN"
         visualizationPalette = loadVisualizationPalette(from: directory)
+        activeSkinDirectoryName = directoryName
+        name = displayName
+        status = loadStatus
     }
 
-    private func extract(_ archive: URL) throws {
-        let root = try FileManager.default.url(for: .applicationSupportDirectory,
-                                               in: .userDomainMask,
-                                               appropriateFor: nil,
-                                               create: true)
-            .appendingPathComponent("macAmp/Skins", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let destination = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    private func finishImport(at destination: URL, displayName: String) {
+        isImporting = false
+        let destinationName = destination.lastPathComponent
+        skinInformationCache.removeValue(forKey: destinationName)
+        activateSkin(at: destination,
+                     directoryName: destinationName,
+                     displayName: displayName,
+                     loadStatus: "SKIN LOADED — \(displayName.uppercased())")
+        UserDefaults.standard.set(destinationName, forKey: Self.activeSkinDirectoryNameKey)
+        refreshAvailableSkins()
+    }
+
+    private func finishImport(with error: Error) {
+        isImporting = false
+        switch error {
+        case SkinError.protectedDefaultSkin:
+            status = "DEFAULT SKIN IS PROTECTED"
+            showImportError("The built-in DefaultSkin cannot be replaced.")
+        case SkinError.missingMainBitmap:
+            status = "INVALID WINAMP SKIN"
+            showImportError("The archive does not contain a readable MAIN.BMP file.")
+        case SkinError.invalidArchive:
+            status = "INVALID WINAMP SKIN"
+            showImportError("The archive could not be read as a Winamp skin.")
+        case SkinError.unsafePath:
+            status = "UNSAFE SKIN PATH"
+            showImportError("The skin path is outside macAmp's protected Skins directory.")
+        default:
+            status = "INVALID WINAMP SKIN"
+            showImportError("The skin could not be imported. Check the archive and try again.")
+        }
+    }
+
+    private func extract(_ archive: URL, replacing existingDirectory: URL?) throws -> URL {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: archive.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw SkinError.invalidArchive
+        }
+
+        let skinDirectoryName = archive.deletingPathExtension().lastPathComponent
+        guard isValidSkinDirectoryName(skinDirectoryName) else {
+            throw SkinError.invalidArchive
+        }
+        guard skinDirectoryName.caseInsensitiveCompare(Self.bundledDefaultSkinDirectoryName) != .orderedSame else {
+            throw SkinError.protectedDefaultSkin
+        }
+
+        let root = try skinsRoot(create: true)
+
+        // Import into a deterministic sibling first. This keeps an existing
+        // same-named skin intact until the new archive has been validated and
+        // avoids leaving a partially extracted skin after an error.
+        let destination = (existingDirectory ?? root.appendingPathComponent(skinDirectoryName, isDirectory: true))
+            .standardizedFileURL
+        let staging = root.appendingPathComponent(".\(skinDirectoryName).importing", isDirectory: true)
+            .standardizedFileURL
+        guard isDirectChild(destination, of: root),
+              isDirectChild(staging, of: root) else {
+            throw SkinError.unsafePath
+        }
+        if fileManager.fileExists(atPath: staging.path) {
+            try removeVerifiedDirectory(staging, directlyInside: root)
+        }
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: false)
+        var didPromoteStaging = false
+        defer {
+            if !didPromoteStaging {
+                try? removeVerifiedDirectory(staging, directlyInside: root)
+            }
+        }
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        task.arguments = ["-x", "-k", archive.path, destination.path]
+        task.arguments = ["-x", "-k", archive.path, staging.path]
         try task.run()
         task.waitUntilExit()
         guard task.terminationStatus == 0 else { throw SkinError.invalidArchive }
 
-        let files = try FileManager.default.contentsOfDirectory(at: destination,
-                                                                 includingPropertiesForKeys: nil,
-                                                                 options: [.skipsHiddenFiles])
-        guard files.contains(where: { $0.lastPathComponent.caseInsensitiveCompare("main.bmp") == .orderedSame }) else {
+        try normalizeExtractedSkin(at: staging)
+        guard canLoadSkin(at: staging) else {
             throw SkinError.missingMainBitmap
         }
-        extractedDirectory = destination
-        visualizationPalette = loadVisualizationPalette(from: destination)
-        clearImageCaches()
-        predecodeCoreBitmaps()
+
+        if fileManager.fileExists(atPath: destination.path) {
+            guard isVerifiedDirectory(destination, directlyInside: root) else {
+                throw SkinError.unsafePath
+            }
+            _ = try fileManager.replaceItemAt(destination, withItemAt: staging)
+        } else {
+            try fileManager.moveItem(at: staging, to: destination)
+        }
+        didPromoteStaging = true
+        return destination
+    }
+
+    /// Winamp skin archives commonly contain one or more wrapper directories
+    /// (for example `SkinName/SkinName/MAIN.BMP`). The renderer consumes a
+    /// flat skin directory, so promote the directory containing MAIN.BMP to
+    /// the staging root before validation and activation.
+    private func normalizeExtractedSkin(at staging: URL) throws {
+        guard let main = try findFileRecursively(named: "MAIN.BMP", in: staging) else {
+            throw SkinError.missingMainBitmap
+        }
+        let normalizedStaging = staging.standardizedFileURL
+        let skinRoot = main.deletingLastPathComponent().standardizedFileURL
+        guard skinRoot != normalizedStaging else { return }
+        guard isDescendant(skinRoot, of: normalizedStaging) else {
+            throw SkinError.unsafePath
+        }
+
+        let fileManager = FileManager.default
+        let contents = try fileManager.contentsOfDirectory(at: skinRoot,
+                                                            includingPropertiesForKeys: [.isSymbolicLinkKey],
+                                                            options: [])
+        for item in contents {
+            guard isDirectChild(item.standardizedFileURL, of: skinRoot),
+                  (try? item.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                throw SkinError.unsafePath
+            }
+            let destination = staging.appendingPathComponent(item.lastPathComponent,
+                                                              isDirectory: item.hasDirectoryPath).standardizedFileURL
+            guard isDirectChild(destination, of: normalizedStaging),
+                  !fileManager.fileExists(atPath: destination.path) else {
+                throw SkinError.invalidArchive
+            }
+            try fileManager.moveItem(at: item, to: destination)
+        }
+
+        // Remove only the verified top-level wrapper. Never walk towards a
+        // parent path: a malformed archive must not turn cleanup into an
+        // operation outside this import's staging directory.
+        let stagingComponents = normalizedStaging.pathComponents
+        let skinRootComponents = skinRoot.pathComponents
+        guard skinRootComponents.count > stagingComponents.count else {
+            throw SkinError.unsafePath
+        }
+        let wrapper = normalizedStaging
+            .appendingPathComponent(skinRootComponents[stagingComponents.count], isDirectory: true)
+            .standardizedFileURL
+        guard isDirectChild(wrapper, of: normalizedStaging) else {
+            throw SkinError.unsafePath
+        }
+        if fileManager.fileExists(atPath: wrapper.path) {
+            try removeVerifiedDirectory(wrapper, directlyInside: normalizedStaging)
+        }
+    }
+
+    private func findFileRecursively(named filename: String, in directory: URL) throws -> URL? {
+        let contents = try FileManager.default.contentsOfDirectory(at: directory,
+                                                                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+                                                                    options: [])
+        for item in contents.sorted(by: { $0.path < $1.path }) {
+            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isSymbolicLink != true else { continue }
+            if values.isRegularFile == true,
+               item.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame {
+                return item
+            }
+            if values.isDirectory == true {
+                if let match = try findFileRecursively(named: filename, in: item) {
+                    return match
+                }
+            }
+        }
+        return nil
+    }
+
+    private func skinsRoot(create: Bool) throws -> URL {
+        let fileManager = FileManager.default
+        let applicationSupport = try fileManager.url(for: .applicationSupportDirectory,
+                                                      in: .userDomainMask,
+                                                      appropriateFor: nil,
+                                                      create: create)
+        let root = applicationSupport
+            .appendingPathComponent("macAmp/Skins", isDirectory: true)
+            .standardizedFileURL
+        if create {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        guard root.resolvingSymlinksInPath().standardizedFileURL.path == root.path else {
+            throw SkinError.unsafePath
+        }
+        return root
+    }
+
+    private func isDescendant(_ candidate: URL, of root: URL) -> Bool {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        return candidateComponents.count > rootComponents.count
+            && candidateComponents.prefix(rootComponents.count).elementsEqual(rootComponents)
+    }
+
+    private func isDirectChild(_ candidate: URL, of root: URL) -> Bool {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        return candidateComponents.count == rootComponents.count + 1
+            && candidateComponents.prefix(rootComponents.count).elementsEqual(rootComponents)
+    }
+
+    /// Both the lexical and resolved paths must identify one real directory
+    /// immediately below the allowed root. This is the single gate for every
+    /// recursive directory removal performed by the skin store.
+    private func isVerifiedDirectory(_ candidate: URL, directlyInside root: URL) -> Bool {
+        let normalizedRoot = root.standardizedFileURL
+        let normalizedCandidate = candidate.standardizedFileURL
+        guard isDirectChild(normalizedCandidate, of: normalizedRoot),
+              normalizedCandidate != normalizedRoot,
+              let values = try? normalizedCandidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory == true,
+              values.isSymbolicLink != true else {
+            return false
+        }
+
+        let resolvedRoot = normalizedRoot.resolvingSymlinksInPath().standardizedFileURL
+        let resolvedCandidate = normalizedCandidate.resolvingSymlinksInPath().standardizedFileURL
+        return resolvedRoot == normalizedRoot
+            && isDirectChild(resolvedCandidate, of: resolvedRoot)
+            && resolvedCandidate.deletingLastPathComponent().standardizedFileURL == resolvedRoot
+    }
+
+    private func removeVerifiedDirectory(_ candidate: URL, directlyInside root: URL) throws {
+        guard isVerifiedDirectory(candidate, directlyInside: root) else {
+            throw SkinError.unsafePath
+        }
+        try FileManager.default.removeItem(at: candidate.standardizedFileURL)
+    }
+
+    func refreshAvailableSkins() {
+        var result = [SkinDescriptor(
+            directoryName: Self.bundledDefaultSkinDirectoryName,
+            displayName: "WINAMP CLASSIC 2.91",
+            directory: Bundle.main.resourceURL?.appendingPathComponent(Self.bundledDefaultSkinDirectoryName, isDirectory: true)
+                ?? URL(fileURLWithPath: "/__missing_default_skin__", isDirectory: true),
+            isBundled: true
+        )]
+
+        if let applicationSupport = try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                                  in: .userDomainMask,
+                                                                  appropriateFor: nil,
+                                                                  create: false) {
+            let root = applicationSupport.appendingPathComponent("macAmp/Skins", isDirectory: true)
+            let directories = (try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isHiddenKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            result += directories.compactMap { directory -> SkinDescriptor? in
+                guard let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      values.isDirectory == true,
+                      values.isSymbolicLink != true,
+                      isValidSkinDirectoryName(directory.lastPathComponent),
+                      directory.lastPathComponent.caseInsensitiveCompare(Self.bundledDefaultSkinDirectoryName) != .orderedSame else { return nil }
+                return SkinDescriptor(directoryName: directory.lastPathComponent,
+                                      displayName: directory.lastPathComponent,
+                                      directory: directory,
+                                      isBundled: false)
+            }
+        }
+
+        result.sort {
+            if $0.isBundled != $1.isBundled { return $0.isBundled }
+            return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        availableSkins = result
+        let availableNames = Set(result.map(\.directoryName))
+        skinInformationCache = skinInformationCache.filter { availableNames.contains($0.key) }
+    }
+
+    private func confirmReplacement(of skinName: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Replace existing skin?"
+        alert.informativeText = "A skin named \"\(skinName)\" is already installed."
+        alert.addButton(withTitle: "Replace")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func showImportError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Unable to import skin"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func canLoadSkin(at directory: URL) -> Bool {
+        guard let main = fileURL(named: "MAIN.BMP", in: directory),
+              decodedBitmap(at: main) != nil else { return false }
+        return true
+    }
+
+    private func fileURL(named filename: String, in directory: URL) -> URL? {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: directory,
+                                                                        includingPropertiesForKeys: nil,
+                                                                        options: [.skipsHiddenFiles]) else { return nil }
+        return files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame })
+    }
+
+    private func decodedBitmap(named filename: String, in directory: URL) -> NSImage? {
+        guard let url = fileURL(named: filename, in: directory) else { return nil }
+        return decodedBitmap(at: url)
+    }
+
+    private func decodedBitmap(at url: URL) -> NSImage? {
+        guard let data = try? Data(contentsOf: url),
+              let representation = NSBitmapImageRep(data: data),
+              let cgImage = representation.cgImage else { return nil }
+        let decodedImage = decodedSkinImage(cgImage, filename: url.lastPathComponent)
+        let image = NSImage(cgImage: decodedImage,
+                            size: NSSize(width: representation.pixelsWide, height: representation.pixelsHigh))
+        image.cacheMode = .always
+        return image
+    }
+
+    private func decodedSkinImage(_ source: CGImage, filename: String) -> CGImage {
+        switch filename.lowercased() {
+        case "main.bmp", "eqmain.bmp", "titlebar.bmp":
+            return removingWindowChromaKey(from: source) ?? source
+        default:
+            return source
+        }
+    }
+
+    /// Window regions remove the outside of non-rectangular classic skins,
+    /// while their BMPs commonly keep those pixels in pure magenta. SwiftUI
+    /// composites MAIN, EQMAIN and TITLEBAR as separate layers, so make the
+    /// conventional chroma key transparent before those layers are composed.
+    /// This conversion happens once and the resulting NSImage is cached.
+    private func removingWindowChromaKey(from source: CGImage) -> CGImage? {
+        let width = source.width
+        let height = source.height
+        let bytesPerRow = width * 4
+        guard width > 0, height > 0,
+              let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.premultipliedLast.rawValue
+              ),
+              let data = context.data else { return nil }
+
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .none
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let pixels = data.bindMemory(to: UInt8.self, capacity: bytesPerRow * height)
+        for offset in stride(from: 0, to: bytesPerRow * height, by: 4) {
+            if pixels[offset] == 255,
+               pixels[offset + 1] == 0,
+               pixels[offset + 2] == 255 {
+                pixels[offset] = 0
+                pixels[offset + 1] = 0
+                pixels[offset + 2] = 0
+                pixels[offset + 3] = 0
+            }
+        }
+        return context.makeImage()
+    }
+
+    private func loadSkinInfoValues(from directory: URL) -> [String: String] {
+        guard let url = fileURL(named: "skininfo.xml", in: directory) ?? fileURL(named: "skin.xml", in: directory),
+              let parser = XMLParser(contentsOf: url) else { return [:] }
+        let delegate = SkinInfoXMLDelegate()
+        parser.delegate = delegate
+        parser.parse()
+        return delegate.values
+    }
+
+    private func parseWindowRegion(section: String, from contents: String) -> WindowRegion? {
+        var activeSection = ""
+        var values: [String: String] = [:]
+        for rawLine in contents.split(whereSeparator: \.isNewline) {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let commentStart = line.firstIndex(of: ";") {
+                line = String(line[..<commentStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                activeSection = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
+            }
+            guard activeSection.caseInsensitiveCompare(section) == .orderedSame,
+                  let separator = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            values[key] = value
+        }
+
+        guard let pointCountText = values["numpoints"],
+              let pointListText = values["pointlist"] else { return nil }
+        let pointCounts = parseRegionNumbers(pointCountText)
+        let coordinates = parseRegionNumbers(pointListText)
+        guard !pointCounts.isEmpty,
+              pointCounts.allSatisfy({ $0 >= 3 }),
+              coordinates.count.isMultiple(of: 2),
+              coordinates.count == pointCounts.reduce(0, +) * 2 else { return nil }
+
+        var polygons: [[CGPoint]] = []
+        var coordinateIndex = 0
+        for count in pointCounts {
+            var polygon: [CGPoint] = []
+            polygon.reserveCapacity(count)
+            for _ in 0..<count {
+                polygon.append(CGPoint(x: CGFloat(coordinates[coordinateIndex]),
+                                       y: CGFloat(coordinates[coordinateIndex + 1])))
+                coordinateIndex += 2
+            }
+            polygons.append(polygon)
+        }
+        return WindowRegion(polygons: polygons)
+    }
+
+    private func parseRegionNumbers(_ value: String) -> [Int] {
+        value.split { character in
+            character == "," || character == " " || character == "\t"
+        }.compactMap { Int($0) }
+    }
+
+    private func isValidSkinDirectoryName(_ name: String) -> Bool {
+        !name.isEmpty
+            && name != "."
+            && name != ".."
+            && !name.hasPrefix(".")
+            && !name.contains("/")
+            && !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 
     private func clearImageCaches() {
@@ -179,6 +904,8 @@ final class WinampSkinStore: ObservableObject {
         playlistTimeCache.removeAll()
         playlistWindowShadeTrackCache.removeAll()
         playlistColorsCache = nil
+        windowRegionCache.removeAll()
+        missingWindowRegions.removeAll()
     }
 
     func bitmap(named filename: String) -> NSImage? {
@@ -213,8 +940,9 @@ final class WinampSkinStore: ObservableObject {
             missingSkinFiles.insert(key)
             return nil
         }
+        let decodedImage = decodedSkinImage(cgImage, filename: url.lastPathComponent)
         let image = NSImage(
-            cgImage: cgImage,
+            cgImage: decodedImage,
             size: NSSize(width: representation.pixelsWide, height: representation.pixelsHigh)
         )
         image.cacheMode = .always
@@ -1331,5 +2059,42 @@ final class WinampSkinStore: ObservableObject {
         NSColor(calibratedRed: 0.18, green: 0.01, blue: 0.08, alpha: 1)
     ]
 
-    enum SkinError: Error { case invalidArchive, missingMainBitmap }
+    enum SkinError: Error { case invalidArchive, missingMainBitmap, protectedDefaultSkin, unsafePath }
+}
+
+private final class SkinInfoXMLDelegate: NSObject, XMLParserDelegate {
+    private let supportedTags: Set<String> = [
+        "name", "version", "author", "comment", "email", "homepage", "screenshot"
+    ]
+    private var currentTag: String?
+    private var currentText = ""
+    var values: [String: String] = [:]
+
+    func parser(_ parser: XMLParser,
+                didStartElement elementName: String,
+                namespaceURI: String?,
+                qualifiedName qName: String?,
+                attributes attributeDict: [String: String] = [:]) {
+        let tag = elementName.lowercased()
+        guard supportedTags.contains(tag) else { return }
+        currentTag = tag
+        currentText = ""
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard currentTag != nil else { return }
+        currentText.append(string)
+    }
+
+    func parser(_ parser: XMLParser,
+                didEndElement elementName: String,
+                namespaceURI: String?,
+                qualifiedName qName: String?) {
+        let tag = elementName.lowercased()
+        guard currentTag == tag else { return }
+        let value = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty { values[tag] = value }
+        currentTag = nil
+        currentText = ""
+    }
 }

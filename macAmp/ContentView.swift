@@ -13,7 +13,7 @@ private enum VisualizationMode: Int {
 }
 
 struct ContentView: View {
-    @StateObject private var skin = WinampSkinStore()
+    @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var playback: PlaybackController
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference

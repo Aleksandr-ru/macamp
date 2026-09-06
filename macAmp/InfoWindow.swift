@@ -231,7 +231,7 @@ final class InfoPanelView: NSView {
     private let onResize: (CGFloat, CGFloat) -> Void
     private let onDragChanged: () -> Void
     private let onDragEnded: () -> Void
-    private let skin = WinampSkinStore()
+    private let skin = WinampSkinStore.shared
     private let scrollView = NSScrollView()
     private let documentView = InfoDocumentView()
     private var observation = Set<AnyCancellable>()
@@ -261,6 +261,16 @@ final class InfoPanelView: NSView {
         // replaced by the previous, still-empty content state.
         model.$content.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildContent(resetScrollPosition: true) }
+        }.store(in: &observation)
+        skin.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.needsDisplay = true
+                self.needsLayout = true
+                self.laidOutContentSize = NSSize(width: -.greatestFiniteMagnitude, height: -.greatestFiniteMagnitude)
+                self.rebuildContent(resetScrollPosition: false)
+                self.window?.invalidateCursorRects(for: self)
+            }
         }.store(in: &observation)
         focus.objectWillChange.sink { [weak self] _ in DispatchQueue.main.async { self?.needsDisplay = true } }.store(in: &observation)
         scale.objectWillChange.sink { [weak self] _ in

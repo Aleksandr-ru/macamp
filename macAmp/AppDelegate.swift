@@ -11,6 +11,7 @@ import SwiftUI
 import Combine
 import UniformTypeIdentifiers
 import MediaPlayer
+import QuartzCore
 
 /// AppKit has no built-in equivalents of the CSS `move` and
 /// `resize-northwest-southeast` cursors on all supported macOS versions.
@@ -89,10 +90,77 @@ enum SkinCursors {
     }
 }
 
+private final class SkinMaskContainerView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+/// A classic Winamp region is a hard pixel boundary. Drawing pre-rasterized
+/// source-pixel runs avoids both antialiasing and Core Graphics' polygon-edge
+/// inclusion rules, either of which can expose the BMP chroma-key colour.
+private final class PixelRegionMaskLayer: CALayer {
+    var regionRects: [CGRect] = []
+
+    override func draw(in context: CGContext) {
+        context.clear(bounds)
+        guard !regionRects.isEmpty else { return }
+        context.setAllowsAntialiasing(false)
+        context.setShouldAntialias(false)
+        context.setBlendMode(.copy)
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(regionRects)
+    }
+}
+
 private final class PlayerWindow: NSPanel {
+    private var skinRegion: WinampSkinStore.WindowRegion?
+    private var skinRegionBaseSize: NSSize?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Keep the region mask on an AppKit-owned layer. SwiftUI owns the
+    /// NSHostingView backing layer and may replace its layer state during a
+    /// root-view update, which used to expose the chroma-key corner pixels.
+    func installSkinnedContentView(_ hostingView: NSView) {
+        let container = SkinMaskContainerView(frame: NSRect(origin: .zero,
+                                                             size: contentLayoutRect.size))
+        container.wantsLayer = true
+        hostingView.frame = container.bounds
+        hostingView.autoresizingMask = [.width, .height]
+        container.addSubview(hostingView)
+        contentView = container
+    }
+
+    func applySkinRegion(_ region: WinampSkinStore.WindowRegion?, baseSize: NSSize) {
+        skinRegion = region
+        skinRegionBaseSize = region == nil ? nil : baseSize
+        guard let contentView else { return }
+        contentView.wantsLayer = true
+        guard let region else {
+            contentView.layer?.mask = nil
+            return
+        }
+        let mask = PixelRegionMaskLayer()
+        mask.frame = contentView.bounds
+        mask.contentsScale = backingScaleFactor
+        mask.allowsEdgeAntialiasing = false
+        mask.regionRects = region.pixelMaskRects(in: contentView.bounds.size,
+                                                 baseSize: baseSize)
+        mask.setNeedsDisplay()
+        contentView.layer?.mask = mask
+    }
+
     override func sendEvent(_ event: NSEvent) {
+        if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type),
+           let region = skinRegion,
+           let baseSize = skinRegionBaseSize,
+           let contentView,
+           !region.contains(contentView.convert(event.locationInWindow, from: nil),
+                            in: contentView.bounds.size,
+                            baseSize: baseSize,
+                            isFlipped: contentView.isFlipped) {
+            return
+        }
         // Keep the original mouse-down/up pair intact: SwiftUI drag gestures
         // depend on receiving both from the same event sequence. When a panel
         // is activated by this click, force a display after dispatching its
@@ -283,6 +351,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var persistenceCancellables = Set<AnyCancellable>()
     private var playingEntryTitleCancellable: AnyCancellable?
     private var pendingPersistenceWorkItem: DispatchWorkItem?
+    private var pendingSkinRegionUpdate: DispatchWorkItem?
     private var lastNowPlayingUpdate = Date.distantPast
     private var lastNowPlayingTitle = ""
     private var lastNowPlayingIsPlaying = false
@@ -382,7 +451,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.backgroundColor = .clear
         window.hasShadow = true
         window.setFrameAutosaveName("Main Window")
-        window.contentView = NSHostingView(rootView: contentView)
+        (window as? PlayerWindow)?.installSkinnedContentView(NSHostingView(rootView: contentView))
         applyInterfaceScale()
         if hasRestoredMainOrigin { window.setFrameOrigin(restoredMainOrigin) }
         window.makeKeyAndOrderFront(nil)
@@ -452,6 +521,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                                 queue: .main) { [weak self] _ in
             self?.applyInterfaceScale()
         }
+
+        WinampSkinStore.shared.objectWillChange.sink { [weak self] _ in
+            self?.scheduleSkinRegionUpdate()
+        }.store(in: &persistenceCancellables)
 
         restoreAuxiliaryWindows()
         observePersistentState()
@@ -1069,7 +1142,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let infoWindow {
             let top = infoWindow.frame.maxY
-            let minimumWidth = CGFloat(WinampSkinStore().genericMinimumWindowWidth(title: "Info"))
+            let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Info"))
             infoLogicalSize.width = max(minimumWidth, infoLogicalSize.width)
             infoLogicalSize.height = max(116, infoLogicalSize.height)
             infoWindow.setContentSize(NSSize(width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale))
@@ -1085,6 +1158,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         lastAppliedInterfaceScale = scale
+        applySkinRegions()
+    }
+
+    private func scheduleSkinRegionUpdate() {
+        pendingSkinRegionUpdate?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.applySkinRegions()
+        }
+        pendingSkinRegionUpdate = workItem
+        DispatchQueue.main.async(execute: workItem)
+    }
+
+    private func applySkinRegions() {
+        let skin = WinampSkinStore.shared
+        let mainBaseSize = NSSize(width: 275,
+                                  height: windowShade.isEnabled ? 14 : 116)
+        (window as? PlayerWindow)?.applySkinRegion(
+            skin.windowRegion(for: .main, isWindowShaded: windowShade.isEnabled),
+            baseSize: mainBaseSize
+        )
+        let equalizerBaseSize = NSSize(width: 275,
+                                       height: equalizerShade.isEnabled ? 14 : 116)
+        (equalizerWindow as? PlayerWindow)?.applySkinRegion(
+            skin.windowRegion(for: .equalizer, isWindowShaded: equalizerShade.isEnabled),
+            baseSize: equalizerBaseSize
+        )
     }
 
     /// Keep window origins on the screen's physical-pixel grid. The rendered
@@ -1197,6 +1296,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let fileMenu = NSApp.mainMenu?.item(withTitle: "File")?.submenu else { return }
         configureFileItem("New Playlist", action: #selector(newPlaylist(_:)), in: fileMenu)
         configureFileItem("Open…", action: #selector(openDocument(_:)), in: fileMenu)
+        configureFileItem("Import Skin…", action: #selector(importSkin(_:)), in: fileMenu)
         configureFileItem("Save…", action: #selector(savePlaylist(_:)), in: fileMenu)
         configureFileItem("Save As…", action: #selector(savePlaylistAs(_:)), in: fileMenu)
         if let recent = fileMenu.items.first(where: { $0.title == "Open Recent" })?.submenu {
@@ -1513,6 +1613,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showPlaylistWindow(for: playlist); connectFileMenu()
     }
 
+    @objc private func importSkin(_ sender: Any?) {
+        _ = WinampSkinStore.shared.chooseArchive()
+    }
+
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         var didOpen = false
         for filename in filenames {
@@ -1811,7 +1915,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let preferences = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 340),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1824,7 +1928,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             playlistFontScale: playlistFontScale,
             timeDisplayPreference: timeDisplayPreference,
             trackNotifications: trackNotifications,
-            equalizer: playback.equalizer
+            equalizer: playback.equalizer,
+            skin: WinampSkinStore.shared
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -1974,7 +2079,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func makeInfoWindowIfNeeded() -> NSWindow {
         if let infoWindow { return infoWindow }
         let scale = CGFloat(interfaceScale.factor)
-        let skin = WinampSkinStore()
+        let skin = WinampSkinStore.shared
         let minimumWidth = CGFloat(skin.genericMinimumWindowWidth(title: "Info"))
         infoLogicalSize.width = max(minimumWidth, infoLogicalSize.width)
         let panel = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -2002,7 +2107,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func resizeInfo(_ panel: NSWindow?, width: CGFloat, height: CGFloat) {
         guard let panel else { return }
         let scale = CGFloat(interfaceScale.factor)
-        let minimumWidth = CGFloat(WinampSkinStore().genericMinimumWindowWidth(title: "Info"))
+        let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Info"))
         let logicalWidth = max(minimumWidth, ceil(width / 25) * 25)
         let requestedHeight = max(116, ceil(height / 29) * 29)
         let logicalHeight = magneticallySnappedResizeHeight(for: panel, requestedLogicalHeight: requestedHeight, scale: scale)
@@ -2328,13 +2433,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         equalizer.hasShadow = true
         equalizer.isMovableByWindowBackground = false
         applyAlwaysOnTopLevel(to: equalizer)
-        equalizer.contentView = NSHostingView(rootView: EqualizerView(
+        equalizer.installSkinnedContentView(NSHostingView(rootView: EqualizerView(
             interfaceScale: interfaceScale,
             focus: equalizerFocus,
             shade: equalizerShade,
             playback: playback,
             equalizer: playback.equalizer
-        ))
+        )))
+        equalizer.applySkinRegion(
+            WinampSkinStore.shared.windowRegion(for: .equalizer, isWindowShaded: equalizerShade.isEnabled),
+            baseSize: NSSize(width: 275, height: equalizerShade.isEnabled ? 14 : 116)
+        )
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: equalizer, queue: .main) { [weak self] _ in self?.equalizerFocus.isKey = true }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: equalizer, queue: .main) { [weak self] _ in self?.equalizerFocus.isKey = false }
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
@@ -2691,6 +2800,7 @@ private struct SettingsView: View {
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var trackNotifications: TrackNotificationController
     @ObservedObject var equalizer: EqualizerController
+    @ObservedObject var skin: WinampSkinStore
     @State private var selectedTab: Tab = .general
 
     var body: some View {
@@ -2710,13 +2820,15 @@ private struct SettingsView: View {
                 switch selectedTab {
                 case .general:
                     generalSettings
-                case .skin, .output:
+                case .skin:
+                    skinSettings
+                case .output:
                     Color.clear
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(width: 300, height: 340, alignment: .topLeading)
+        .frame(width: 620, height: 420, alignment: .topLeading)
     }
 
     private var generalSettings: some View {
@@ -2753,12 +2865,158 @@ private struct SettingsView: View {
         }
         .padding(20)
     }
+
+    private var skinSettings: some View {
+        SkinSettingsView(skin: skin)
+    }
+}
+
+private struct SkinSettingsView: View {
+    @ObservedObject var skin: WinampSkinStore
+    @State private var selectedSkinDirectoryName: String?
+
+    private var selectedSkin: WinampSkinStore.SkinDescriptor? {
+        let selectedName = selectedSkinDirectoryName ?? skin.activeSkinDirectoryName
+        return skin.availableSkins.first(where: {
+            $0.directoryName.caseInsensitiveCompare(selectedName) == .orderedSame
+        }) ?? skin.availableSkins.first
+    }
+
+    var body: some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Installed skins")
+                    .font(.headline)
+
+                List(selection: $selectedSkinDirectoryName) {
+                    ForEach(skin.availableSkins) { item in
+                        HStack(spacing: 6) {
+                            Text(item.displayName)
+                                .lineLimit(1)
+                            if item.isBundled {
+                                Spacer(minLength: 4)
+                                Text("Built-in")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .tag(item.directoryName as String?)
+                    }
+                }
+                .listStyle(.inset)
+                .frame(minWidth: 220, maxWidth: 250)
+                .disabled(skin.isImporting)
+
+                HStack(spacing: 0) {
+                    Button(action: importSkin) {
+                        Image(systemName: "plus")
+                    }
+                    .frame(width: 28, height: 22)
+                    .help("Import skin")
+                    .disabled(skin.isImporting)
+
+                    Button(action: deleteSelectedSkin) {
+                        Image(systemName: "minus")
+                    }
+                    .frame(width: 28, height: 22)
+                    .help("Delete skin")
+                    .disabled(skin.isImporting || selectedSkin?.isBundled != false)
+                }
+            }
+            .frame(minWidth: 250, maxWidth: 250, maxHeight: .infinity, alignment: .topLeading)
+
+            Divider()
+
+            if let selectedSkin {
+                SkinInformationView(information: skin.information(for: selectedSkin))
+            } else {
+                Text("No skin selected")
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        }
+        .padding(18)
+        .onAppear {
+            selectedSkinDirectoryName = skin.activeSkinDirectoryName
+        }
+        .onChange(of: selectedSkinDirectoryName) { selectedName in
+            guard let selectedName,
+                  selectedName.caseInsensitiveCompare(skin.activeSkinDirectoryName) != .orderedSame else { return }
+            _ = skin.selectSkin(named: selectedName)
+        }
+        .onChange(of: skin.activeSkinDirectoryName) { activeName in
+            selectedSkinDirectoryName = activeName
+        }
+    }
+
+    private func importSkin() {
+        _ = skin.chooseArchive()
+        selectedSkinDirectoryName = skin.activeSkinDirectoryName
+    }
+
+    private func deleteSelectedSkin() {
+        guard let selectedSkin, !selectedSkin.isBundled else { return }
+        if skin.deleteSkin(named: selectedSkin.directoryName) {
+            selectedSkinDirectoryName = skin.activeSkinDirectoryName
+        }
+    }
+}
+
+private struct SkinInformationView: View {
+    let information: WinampSkinStore.SkinInformation
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Skin information")
+                    .font(.headline)
+
+                if let preview = information.preview {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .interpolation(.none)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: 290, maxHeight: 140, alignment: .leading)
+                        .background(Color(NSColor.textBackgroundColor))
+                        .border(Color.secondary.opacity(0.35))
+                }
+
+                skinInfoRow("Name", information.name)
+                skinInfoRow("Type", information.type)
+                if !information.author.isEmpty {
+                    skinInfoRow("Author", information.author)
+                }
+                if !information.version.isEmpty {
+                    skinInfoRow("Version", information.version)
+                }
+                if !information.comment.isEmpty {
+                    Divider()
+                    Text(information.comment)
+                        .font(.body)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func skinInfoRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(label)
+                .foregroundColor(.secondary)
+                .frame(width: 58, alignment: .trailing)
+            Text(value)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 }
 
 /// Classic Playlist Editor rendered from `PLEDIT.BMP`, backed by a persistent
 /// PlaylistModel and its independent window context.
 private struct PlaylistView: View {
-    @StateObject private var skin = WinampSkinStore()
+    @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var fontScale: PlaylistFontScale
     @ObservedObject var focus: PlaylistFocusState
@@ -3494,7 +3752,7 @@ private final class PlaylistWindowShadeResizeNSView: NSView {
 }
 
 private struct EqualizerView: View {
-    @StateObject private var skin = WinampSkinStore()
+    @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var focus: EqualizerFocusState
     @ObservedObject var shade: EqualizerShadeState
