@@ -385,7 +385,7 @@ final class WinampSkinStore: ObservableObject {
         if missingWindowRegions.contains(key) { return nil }
         if let cached = windowRegionCache[key] { return cached }
         guard let directory = extractedDirectory,
-              let regionFile = fileURL(named: "REGION.TXT", in: directory),
+              let regionFile = skinResourceURL(named: "REGION.TXT", in: directory),
               let contents = try? String(contentsOf: regionFile, encoding: .utf8),
               let region = parseWindowRegion(section: section, from: contents) else {
             missingWindowRegions.insert(key)
@@ -743,6 +743,24 @@ final class WinampSkinStore: ObservableObject {
         return files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame })
     }
 
+    /// Classic skins are partial overlays in practice. Keep the active skin
+    /// authoritative when it provides a resource, and use the bundled skin
+    /// only for a resource it omits. This keeps every renderer on one lookup
+    /// rule while preserving the active skin's own artwork and palette.
+    private func skinResourceURL(named filename: String, in directory: URL) -> URL? {
+        if let url = fileURL(named: filename, in: directory) {
+            return url
+        }
+        guard let fallbackDirectory = Bundle.main.resourceURL?.appendingPathComponent(
+            Self.bundledDefaultSkinDirectoryName,
+            isDirectory: true
+        ),
+        fallbackDirectory.standardizedFileURL != directory.standardizedFileURL else {
+            return nil
+        }
+        return fileURL(named: filename, in: fallbackDirectory)
+    }
+
     private func decodedBitmap(named filename: String, in directory: URL) -> NSImage? {
         guard let url = fileURL(named: filename, in: directory) else { return nil }
         return decodedBitmap(at: url)
@@ -916,20 +934,12 @@ final class WinampSkinStore: ObservableObject {
         let url: URL
         if let cachedURL = skinFileURLCache[key] {
             url = cachedURL
+        } else if let resolvedURL = skinResourceURL(named: filename, in: directory) {
+            url = resolvedURL
+            skinFileURLCache[key] = resolvedURL
         } else {
-            let directURL = directory.appendingPathComponent(filename)
-            if FileManager.default.fileExists(atPath: directURL.path) {
-                url = directURL
-            } else {
-                guard let files = try? FileManager.default.contentsOfDirectory(at: directory,
-                                                                                includingPropertiesForKeys: nil),
-                      let match = files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame }) else {
-                    missingSkinFiles.insert(key)
-                    return nil
-                }
-                url = match
-            }
-            skinFileURLCache[key] = url
+            missingSkinFiles.insert(key)
+            return nil
         }
         // NSImage(contentsOf:) defers BMP/RLE decoding until the first draw,
         // which can put image decompression back on the main thread during
@@ -1123,8 +1133,7 @@ final class WinampSkinStore: ObservableObject {
             selectedBackground: Self.color(hex: "0000C6")
         )
         guard let directory = extractedDirectory,
-              let file = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-                  .first(where: { $0.lastPathComponent.caseInsensitiveCompare("PLEDIT.TXT") == .orderedSame }),
+              let file = skinResourceURL(named: "PLEDIT.TXT", in: directory),
               let contents = try? String(contentsOf: file, encoding: .utf8) else {
             playlistColorsCache = defaults
             return defaults
@@ -1173,9 +1182,9 @@ final class WinampSkinStore: ObservableObject {
         let url: URL
         if let cachedURL = skinFileURLCache[fileKey] {
             url = cachedURL
-        } else if let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil),
-                  let match = files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame }) {
-            url = match
+        } else if let resolvedURL = skinResourceURL(named: filename, in: directory) {
+            url = resolvedURL
+            skinFileURLCache[fileKey] = resolvedURL
         } else {
             missingSkinFiles.insert(fileKey)
             return nil
@@ -1184,7 +1193,6 @@ final class WinampSkinStore: ObservableObject {
             missingSkinFiles.insert(fileKey)
             return nil
         }
-        skinFileURLCache[fileKey] = url
         let cursor = NSCursor(image: image, hotSpot: hotSpot)
         cursorCache[key] = cursor
         return cursor
@@ -2018,8 +2026,7 @@ final class WinampSkinStore: ObservableObject {
     }
 
     private func loadVisualizationPalette(from directory: URL) -> [NSColor] {
-        guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil),
-              let file = files.first(where: { $0.lastPathComponent.caseInsensitiveCompare("VISCOLOR.TXT") == .orderedSame }),
+        guard let file = skinResourceURL(named: "VISCOLOR.TXT", in: directory),
               let text = try? String(contentsOf: file, encoding: .utf8) else {
             return Self.defaultVisualizationPalette
         }
