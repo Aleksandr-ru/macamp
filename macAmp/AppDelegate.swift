@@ -2994,13 +2994,14 @@ private struct SkinSettingsView: View {
                     .help("Delete skin")
                     .disabled(skin.isImporting || selectedSkin?.isBundled != false)
                 }
+
             }
             .frame(minWidth: 250, maxWidth: 250, maxHeight: .infinity, alignment: .topLeading)
 
             Divider()
 
             if let selectedSkin {
-                SkinInformationView(information: skin.information(for: selectedSkin))
+                SkinInformationView(information: skin.information(for: selectedSkin), skin: skin)
             } else {
                 Text("No skin selected")
                     .foregroundColor(.secondary)
@@ -3036,6 +3037,7 @@ private struct SkinSettingsView: View {
 
 private struct SkinInformationView: View {
     let information: WinampSkinStore.SkinInformation
+    @ObservedObject var skin: WinampSkinStore
 
     var body: some View {
         ScrollView {
@@ -3067,6 +3069,10 @@ private struct SkinInformationView: View {
                         .font(.body)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Divider()
+                Toggle("Use skin cursors", isOn: $skin.useSkinCursors)
+                    .disabled(skin.isImporting || !skin.skinCursorsAvailable)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 2)
@@ -3121,7 +3127,7 @@ private struct PlaylistView: View {
             } else {
                 Color.black
             }
-            PlaylistDragArea(cursor: skin.cursor(named: "TITLEBAR.CUR"), onEnded: onDragEnded, onDoubleClick: onToggleShade)
+            PlaylistDragArea(cursor: skin.cursor(named: "PTBAR.CUR"), onEnded: onDragEnded, onDoubleClick: onToggleShade)
                 .frame(width: max(1, layout.width - 30), height: 14)
                 .position(x: (layout.width - 30) / 2, y: 7)
             // Winamp's coordinates are left edges: width−20 and width−11.
@@ -3194,7 +3200,7 @@ private struct PlaylistView: View {
                 .foregroundColor(playlistColor(colors.normalText))
                 .frame(width: CGFloat(titleWidth), height: 10, alignment: .leading)
                 .position(x: 8 + CGFloat(indicatorWidth) + CGFloat(titleWidth) / 2, y: 8)
-            PlaylistDragArea(cursor: skin.cursor(named: "TITLEBAR.CUR"), onEnded: onDragEnded, onDoubleClick: onToggleShade)
+            PlaylistDragArea(cursor: skin.cursor(named: "PTBAR.CUR"), onEnded: onDragEnded, onDoubleClick: onToggleShade)
                 .frame(width: max(1, layout.width - 30), height: 14)
                 .position(x: (layout.width - 30) / 2, y: 7)
             PlaylistWindowShadeResizeArea(cursor: skin.cursor(named: "PWSIZE.CUR") ?? .resizeLeftRight, onResize: onShadeResize)
@@ -3873,7 +3879,7 @@ private struct EqualizerView: View {
                 : skin.equalizerTitleBarImage(isActive: focus.isKey) {
                 Image(nsImage: title).interpolation(.none)
             }
-            EqualizerDragArea(cursor: skin.cursor(named: "EQTITLE.CUR") ?? skin.cursor(named: "TITLEBAR.CUR"))
+            EqualizerDragArea(cursor: skin.cursor(named: "EQTITLE.CUR"))
                 .frame(width: 245, height: 14).position(x: 126.5, y: 7)
             equalizerTitleButton(.windowShade, x: 257.5, windowShade: windowShade) { AppDelegate.shared?.toggleEqualizerWindowShade(nil) }
             equalizerTitleButton(.close, x: 268.5, windowShade: windowShade) { AppDelegate.shared?.hideEqualizer(nil) }

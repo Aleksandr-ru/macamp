@@ -114,6 +114,18 @@ final class WinampSkinStore: ObservableObject {
     @Published private(set) var visualizationPalette: [NSColor] = WinampSkinStore.defaultVisualizationPalette
     @Published private(set) var availableSkins: [SkinDescriptor] = []
     @Published private(set) var activeSkinDirectoryName = "DefaultSkin"
+    @Published var useSkinCursors: Bool {
+        didSet {
+            guard oldValue != useSkinCursors else { return }
+            if useSkinCursors && !skinCursorsAvailable {
+                useSkinCursors = false
+                return
+            }
+            UserDefaults.standard.set(useSkinCursors, forKey: Self.useSkinCursorsKey)
+            cursorCache.removeAll()
+        }
+    }
+    @Published private(set) var skinCursorsAvailable = false
     @Published private(set) var isImporting = false
     private(set) var extractedDirectory: URL?
     /// Source sheets are immutable for a loaded skin. Keep each decoded BMP in
@@ -192,8 +204,10 @@ final class WinampSkinStore: ObservableObject {
 
     private static let activeSkinDirectoryNameKey = "macAmp.activeSkinDirectoryName.v1"
     private static let bundledDefaultSkinDirectoryName = "DefaultSkin"
+    private static let useSkinCursorsKey = "macAmp.useSkinCursors.v1"
 
     private init() {
+        useSkinCursors = UserDefaults.standard.object(forKey: Self.useSkinCursorsKey) as? Bool ?? true
         if !loadPersistedSkin() {
             _ = loadBundledDefaultSkin()
         }
@@ -437,6 +451,10 @@ final class WinampSkinStore: ObservableObject {
     private func activateSkin(at directory: URL, directoryName: String, displayName: String, loadStatus: String) {
         extractedDirectory = directory
         clearImageCaches()
+        skinCursorsAvailable = containsSkinCursor(in: directory)
+        if !skinCursorsAvailable {
+            useSkinCursors = false
+        }
         predecodeCoreBitmaps()
         visualizationPalette = loadVisualizationPalette(from: directory)
         activeSkinDirectoryName = directoryName
@@ -743,15 +761,36 @@ final class WinampSkinStore: ObservableObject {
         return files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame })
     }
 
+    private func containsSkinCursor(in directory: URL) -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+
+        return files.contains { file in
+            guard file.pathExtension.caseInsensitiveCompare("cur") == .orderedSame,
+                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true else { return false }
+            return true
+        }
+    }
+
     /// Classic skins are partial overlays in practice. Keep the active skin
     /// authoritative when it provides a resource, and use the bundled skin
     /// only for a resource it omits. This keeps every renderer on one lookup
     /// rule while preserving the active skin's own artwork and palette.
-    private func skinResourceURL(named filename: String, in directory: URL) -> URL? {
+    private func skinResourceURL(
+        named filename: String,
+        in directory: URL,
+        fallbackToBundledSkin: Bool = true
+    ) -> URL? {
         if let url = fileURL(named: filename, in: directory) {
             return url
         }
-        guard let fallbackDirectory = Bundle.main.resourceURL?.appendingPathComponent(
+        guard fallbackToBundledSkin,
+              let fallbackDirectory = Bundle.main.resourceURL?.appendingPathComponent(
             Self.bundledDefaultSkinDirectoryName,
             isDirectory: true
         ),
@@ -1174,7 +1213,7 @@ final class WinampSkinStore: ObservableObject {
 
     /// Classic skins provide a dedicated diagonal Playlist resize cursor.
     func cursor(named filename: String, hotSpot: NSPoint = NSPoint(x: 8, y: 8)) -> NSCursor? {
-        guard let directory = extractedDirectory else { return nil }
+        guard useSkinCursors, let directory = extractedDirectory else { return nil }
         let fileKey = filename.lowercased()
         let key = "\(fileKey)-\(hotSpot.x)-\(hotSpot.y)"
         if let cached = cursorCache[key] { return cached }
@@ -1182,7 +1221,9 @@ final class WinampSkinStore: ObservableObject {
         let url: URL
         if let cachedURL = skinFileURLCache[fileKey] {
             url = cachedURL
-        } else if let resolvedURL = skinResourceURL(named: filename, in: directory) {
+        } else if let resolvedURL = skinResourceURL(named: filename,
+                                                    in: directory,
+                                                    fallbackToBundledSkin: false) {
             url = resolvedURL
             skinFileURLCache[fileKey] = resolvedURL
         } else {
@@ -1764,8 +1805,9 @@ final class WinampSkinStore: ObservableObject {
         return image
     }
 
-    /// The first ten cells of a classic `numbers.bmp` are the digits 0 through 9.
-    /// They are fixed 9×13 pixel glyphs in the Winamp 2.x skin specification.
+    /// Winamp prefers the skin's extended number sheet when it is present;
+    /// classic skins commonly ship only `NUMS_EX.BMP`. Its first ten cells
+    /// are the fixed 9×13 pixel glyphs for digits 0 through 9.
     func timeDigit(_ digit: Int) -> NSImage? {
         timeGlyph(at: digit)
     }
@@ -1789,7 +1831,7 @@ final class WinampSkinStore: ObservableObject {
     private func timeGlyph(at index: Int) -> NSImage? {
         guard (0...9).contains(index) else { return nil }
         if let cached = timeDigitCache[index] { return cached }
-        guard let sheet = bitmap(named: "NUMBERS.BMP") ?? bitmap(named: "NUMS_EX.BMP"),
+        guard let sheet = bitmap(named: "NUMS_EX.BMP") ?? bitmap(named: "NUMBERS.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
               source.width >= 99, source.height >= 13,
               let cropped = source.cropping(to: CGRect(x: index * 9, y: 0, width: 9, height: 13)) else {
