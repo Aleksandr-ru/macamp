@@ -1282,15 +1282,12 @@ private struct SkinWindowDragArea: NSViewRepresentable {
     }
     func updateNSView(_ nsView: SkinWindowDragNSView, context: Context) {
         nsView.dragCursor = cursor
+        nsView.refreshCursorIfInside()
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
 
-private final class SkinWindowDragNSView: NSView {
-    var dragCursor: NSCursor?
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: dragCursor ?? SkinCursors.move)
-    }
+private final class SkinWindowDragNSView: SkinnedTitleDragNSView {
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {

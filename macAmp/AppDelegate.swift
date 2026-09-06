@@ -13,11 +13,14 @@ import UniformTypeIdentifiers
 import MediaPlayer
 import QuartzCore
 
-/// AppKit has no built-in equivalents of the CSS `move` and
-/// `resize-northwest-southeast` cursors on all supported macOS versions.
-/// Render those two classic cursor shapes consistently for every skin window.
+/// AppKit has no built-in equivalents of the classic move and diagonal resize
+/// cursors on all supported macOS versions. Render those shapes consistently
+/// for every skin window that does not provide its own cursor.
 enum SkinCursors {
-    static let move: NSCursor = makeCursor(symbol: "arrow.up.and.down.and.arrow.left.and.right", pointSize: 15, outlined: true)
+    /// Use macOS's own four-way move cursor. The system resource includes the
+    /// white outline and shadow that remain visible over both light and dark
+    /// skin artwork.
+    static let move: NSCursor = systemMoveCursor()
     /// The system's "busy but clickable" cursor is the arrow with the small
     /// spinning indicator used by macOS while background work continues.
     private static let busyFrames = systemBusyButClickableFrames()
@@ -31,6 +34,14 @@ enum SkinCursors {
         }
         return makeCursor(symbol: "arrow.up.left.and.arrow.down.right", pointSize: 16, outlined: true)
     }()
+
+    private static func systemMoveCursor() -> NSCursor {
+        let path = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/Resources/cursors/move/cursor.pdf"
+        guard let image = NSImage(contentsOf: URL(fileURLWithPath: path)) else {
+            return NSCursor.arrow
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: 9, y: 9))
+    }
 
     private static func makeCursor(symbol: String, pointSize: CGFloat, outlined: Bool) -> NSCursor {
         let size = NSSize(width: 20, height: 20)
@@ -86,6 +97,67 @@ enum SkinCursors {
             // The source is a 2× cursor frame.  Keep a little extra point
             // space so the attached system busy badge is never clipped.
             return NSCursor(image: NSImage(cgImage: frame, size: NSSize(width: 18, height: 26)), hotSpot: NSPoint(x: 3.25, y: 3.25))
+        }
+    }
+}
+
+/// Owns the cursor for a skinned title bar and explicitly restores the
+/// window's normal arrow when the pointer leaves it. Cursor rects alone can
+/// remain active while a borderless SwiftUI window is being recomposed.
+class SkinnedTitleDragNSView: NSView {
+    var dragCursor: NSCursor?
+    private var cursorTrackingArea: NSTrackingArea?
+    private var isCursorInside = false
+
+    private var effectiveCursor: NSCursor { dragCursor ?? SkinCursors.move }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateTrackingAreas()
+        window?.invalidateCursorRects(for: self)
+        if window == nil {
+            isCursorInside = false
+            NSCursor.arrow.set()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        if let cursorTrackingArea {
+            removeTrackingArea(cursorTrackingArea)
+        }
+        super.updateTrackingAreas()
+
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .cursorUpdate, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        cursorTrackingArea = area
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: effectiveCursor)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        effectiveCursor.set()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isCursorInside = true
+        effectiveCursor.set()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isCursorInside = false
+        NSCursor.arrow.set()
+    }
+
+    func refreshCursorIfInside() {
+        if isCursorInside {
+            effectiveCursor.set()
         }
     }
 }
@@ -3556,6 +3628,7 @@ private struct PlaylistDragArea: NSViewRepresentable {
     func updateNSView(_ nsView: PlaylistDragNSView, context: Context) {
         nsView.dragCursor = cursor
         nsView.onEnded = onEnded; nsView.onDoubleClick = onDoubleClick
+        nsView.refreshCursorIfInside()
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
@@ -3644,13 +3717,9 @@ private final class PlaylistLoadingCursorNSView: NSView {
 
 }
 
-private final class PlaylistDragNSView: NSView {
-    var dragCursor: NSCursor?
+private final class PlaylistDragNSView: SkinnedTitleDragNSView {
     var onEnded: (() -> Void)?
     var onDoubleClick: (() -> Void)?
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: dragCursor ?? SkinCursors.move)
-    }
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
@@ -4047,6 +4116,7 @@ private struct EqualizerDragArea: NSViewRepresentable {
     }
     func updateNSView(_ nsView: EqualizerDragNSView, context: Context) {
         nsView.dragCursor = cursor
+        nsView.refreshCursorIfInside()
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
@@ -4068,11 +4138,7 @@ private struct EqualizerTitleButtonStyle: ButtonStyle {
     }
 }
 
-private final class EqualizerDragNSView: NSView {
-    var dragCursor: NSCursor?
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: dragCursor ?? SkinCursors.move)
-    }
+private final class EqualizerDragNSView: SkinnedTitleDragNSView {
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
