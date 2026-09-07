@@ -664,12 +664,17 @@ private struct MainTimeDisplay: View {
                     Group {
                         if let glyph = skin.timeMinusSign() {
                             Image(nsImage: glyph).interpolation(.none)
+                                .frame(width: glyph.size.width, height: glyph.size.height)
+                                // NUMS_EX uses a full 9×13 minus cell at x=-1;
+                                // NUMBERS uses a narrow 5×1 strip at x=-1.
+                                .position(
+                                    x: glyph.size.width > 5 ? 3.5 : 1.5,
+                                    y: 6.5
+                                )
                         } else {
                             Color.clear
                         }
                     }
-                    .frame(width: 5, height: 1)
-                    .position(x: 1.5, y: 6.5)
                 }
                 HStack(spacing: 0) {
                     digit(minutes / 10)

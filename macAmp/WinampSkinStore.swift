@@ -969,15 +969,19 @@ final class WinampSkinStore: ObservableObject {
         missingWindowRegions.removeAll()
     }
 
-    func bitmap(named filename: String) -> NSImage? {
+    func bitmap(named filename: String, fallbackToBundledSkin: Bool = true) -> NSImage? {
         guard let directory = extractedDirectory else { return nil }
-        let key = filename.lowercased()
+        let key = "\(fallbackToBundledSkin ? "fallback" : "active"):\(filename.lowercased())"
         if let cached = bitmapCache[key] { return cached }
         if missingSkinFiles.contains(key) { return nil }
         let url: URL
         if let cachedURL = skinFileURLCache[key] {
             url = cachedURL
-        } else if let resolvedURL = skinResourceURL(named: filename, in: directory) {
+        } else if let resolvedURL = skinResourceURL(
+            named: filename,
+            in: directory,
+            fallbackToBundledSkin: fallbackToBundledSkin
+        ) {
             url = resolvedURL
             skinFileURLCache[key] = resolvedURL
         } else {
@@ -1874,13 +1878,20 @@ final class WinampSkinStore: ObservableObject {
     func timeMinusSign() -> NSImage? {
         let cacheKey = 10
         if let cached = timeDigitCache[cacheKey] { return cached }
-        guard let sheet = bitmap(named: "NUMBERS.BMP"),
-              let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              source.width >= 25, source.height >= 7,
-              let cropped = source.cropping(to: CGRect(x: 20, y: 6, width: 5, height: 1)) else {
+        // Do not use the normal resource fallback here. A skin with NUMS_EX
+        // but without NUMBERS must not inherit the bundled skin's green minus.
+        let extendedSheet = bitmap(named: "NUMS_EX.BMP", fallbackToBundledSkin: false)
+        let isExtended = extendedSheet != nil
+        guard let sheet = extendedSheet ?? bitmap(named: "NUMBERS.BMP", fallbackToBundledSkin: false),
+              let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
-        let image = NSImage(cgImage: cropped, size: NSSize(width: 5, height: 1))
+        let cropRect = isExtended
+            ? CGRect(x: 99, y: 0, width: 9, height: 13)
+            : CGRect(x: 20, y: 6, width: 5, height: 1)
+        guard cropRect.maxX <= CGFloat(source.width), cropRect.maxY <= CGFloat(source.height),
+              let cropped = source.cropping(to: cropRect) else { return nil }
+        let image = NSImage(cgImage: cropped, size: NSSize(width: cropRect.width, height: cropRect.height))
         timeDigitCache[cacheKey] = image
         return image
     }
