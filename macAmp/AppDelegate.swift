@@ -1383,8 +1383,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureFileItem("New Playlist", action: #selector(newPlaylist(_:)), in: fileMenu)
         configureFileItem("Open…", action: #selector(openDocument(_:)), in: fileMenu)
         configureFileItem("Import Skin…", action: #selector(importSkin(_:)), in: fileMenu)
-        configureFileItem("Save…", action: #selector(savePlaylist(_:)), in: fileMenu)
-        configureFileItem("Save As…", action: #selector(savePlaylistAs(_:)), in: fileMenu)
         if let recent = fileMenu.items.first(where: { $0.title == "Open Recent" })?.submenu {
             rebuildRecentMenu(recent)
         }
@@ -1930,6 +1928,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func selectAllInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectAll(in: playlist) } }
     func selectNoneInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectNone(in: playlist) } }
     func invertSelectionInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.invertSelection(in: playlist) } }
+
+    func renameActivePlaylist() {
+        guard let playlist = playlistManager.editingPlaylist else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Rename"
+        alert.informativeText = "Enter a new name for the playlist."
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(string: playlist.name)
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { NSSound.beep(); return }
+        playlist.name = name
+        playlistManager.save()
+    }
 
     @objc func showMainPlayer(_ sender: Any?) {
         window.orderFrontRegardless()
@@ -3256,11 +3275,11 @@ private struct PlaylistView: View {
             ])
             playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Sort…", "Misc…"])
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
-                "New Playlist", "Load Playlist…", "Save Playlist As…", "Clear Playlist"
+                "New", "Load…", "Save As…", "Rename"
             ], shortcuts: [
-                "New Playlist": .commandN,
-                "Load Playlist…": .commandO,
-                "Save Playlist As…": .commandShiftS
+                "New": .commandN,
+                "Load…": .commandO,
+                "Save As…": .commandShiftS
             ])
 
             PlaylistStatusField(skin: skin, playback: playback, manager: manager, playlist: playlist)
@@ -3580,9 +3599,10 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Select All": AppDelegate.shared?.selectAllInActivePlaylist()
         case "Select None": AppDelegate.shared?.selectNoneInActivePlaylist()
         case "Invert Selection": AppDelegate.shared?.invertSelectionInActivePlaylist()
-        case "New Playlist": AppDelegate.shared?.newPlaylist(nil)
-        case "Load Playlist…": AppDelegate.shared?.openDocument(nil)
-        case "Save Playlist As…": AppDelegate.shared?.savePlaylistAs(nil)
+        case "New": AppDelegate.shared?.newPlaylist(nil)
+        case "Load…": AppDelegate.shared?.openDocument(nil)
+        case "Save As…": AppDelegate.shared?.savePlaylistAs(nil)
+        case "Rename": AppDelegate.shared?.renameActivePlaylist()
         default: break
         }
     }
