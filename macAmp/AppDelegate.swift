@@ -699,11 +699,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case 11: // physical B key — Next
             playlistTransportAction(4)
         case 1: // physical S key — Shuffle
-            playback.isShuffleEnabled.toggle()
-            updateControlsMenuState()
+            toggleShuffle(nil)
         case 15: // physical R key — Repeat
-            playback.isRepeatEnabled.toggle()
-            updateControlsMenuState()
+            toggleRepeat(nil)
         case 123: // ← — Back 5 seconds
             seekPlayback(to: max(0, playback.position - 5))
         case 124: // → — Forward 5 seconds
@@ -1082,7 +1080,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func savePersistentState() {
         let state = PersistentState(
             volume: playback.volume, balance: playback.balance,
-            shuffle: playback.isShuffleEnabled, repeatTrack: playback.isRepeatEnabled,
+            shuffle: playback.shuffleMode != .off, repeatTrack: playback.repeatMode != .off,
             mainShade: windowShade.isEnabled,
             equalizerVisible: equalizerState.isVisible, equalizerShade: equalizerShade.isEnabled,
             playlistVisible: playlistState.isVisible, playlistShade: playlistShade.isEnabled,
@@ -1424,8 +1422,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addControlMenuItem("Volume Down", action: #selector(volumeDown(_:)), key: menuKey(NSDownArrowFunctionKey), to: controlsMenu)
         addControlMenuItem("Volume Up", action: #selector(volumeUp(_:)), key: menuKey(NSUpArrowFunctionKey), to: controlsMenu)
         controlsMenu.addItem(.separator())
-        addControlMenuItem("Shuffle", action: #selector(toggleShuffle(_:)), key: "s", to: controlsMenu)
-        addControlMenuItem("Repeat", action: #selector(toggleRepeat(_:)), key: "r", to: controlsMenu)
+        // S/R are handled by the context-aware playback shortcut router. Do
+        // not also assign them to the parent items: AppKit treats a parent
+        // and its submenu item with the same key as duplicates and can hide
+        // the shortcut column in the submenu.
+        let shuffleItem = NSMenuItem(title: "Shuffle", action: #selector(toggleShuffle(_:)), keyEquivalent: "")
+        shuffleItem.target = self
+        shuffleItem.keyEquivalentModifierMask = []
+        shuffleItem.submenu = makeShuffleMenu()
+        controlsMenu.addItem(shuffleItem)
+
+        let repeatItem = NSMenuItem(title: "Repeat", action: #selector(toggleRepeat(_:)), keyEquivalent: "")
+        repeatItem.target = self
+        repeatItem.keyEquivalentModifierMask = []
+        repeatItem.submenu = makeRepeatMenu()
+        controlsMenu.addItem(repeatItem)
         updateControlsMenuState()
     }
 
@@ -1633,8 +1644,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateControlsMenuState() {
-        controlsMenu?.item(withTitle: "Shuffle")?.state = playback.isShuffleEnabled ? .on : .off
-        controlsMenu?.item(withTitle: "Repeat")?.state = playback.isRepeatEnabled ? .on : .off
+        if let menu = controlsMenu?.item(withTitle: "Shuffle")?.submenu {
+            updateModeMenuState(menu, selectedRawValue: playback.shuffleMode.rawValue, toggleKey: "s")
+        }
+        if let menu = controlsMenu?.item(withTitle: "Repeat")?.submenu {
+            updateModeMenuState(menu, selectedRawValue: playback.repeatMode.rawValue, toggleKey: "r")
+        }
+    }
+
+    private func updateModeMenuState(_ menu: NSMenu, selectedRawValue: Int, toggleKey: String) {
+        // The shortcut is a binary toggle: it turns the feature on in its
+        // basic mode and turns every active mode off. Keep the key equivalent
+        // on the item that represents the next result, so the submenu itself
+        // explains what S/R will do from the current state.
+        let shortcutTarget = selectedRawValue == 0 ? 1 : 0
+        for item in menu.items {
+            item.state = item.tag == selectedRawValue ? .on : .off
+            item.keyEquivalent = item.tag == shortcutTarget ? toggleKey : ""
+            item.keyEquivalentModifierMask = []
+        }
     }
 
     @objc private func previousTrack(_ sender: Any?) { playlistTransportAction(0) }
@@ -1654,8 +1682,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func forwardFiveSeconds(_ sender: Any?) { seekPlayback(to: min(playback.duration, playback.position + 5)) }
     @objc private func volumeDown(_ sender: Any?) { playback.volume = max(0, playback.volume - 0.05) }
     @objc private func volumeUp(_ sender: Any?) { playback.volume = min(1, playback.volume + 0.05) }
-    @objc private func toggleShuffle(_ sender: Any?) { playback.isShuffleEnabled.toggle(); updateControlsMenuState() }
-    @objc private func toggleRepeat(_ sender: Any?) { playback.isRepeatEnabled.toggle(); updateControlsMenuState() }
+    @objc func toggleShuffle(_ sender: Any?) {
+        let mode: ShuffleMode = playback.shuffleMode == .off ? .currentPlaylist : .off
+        setShuffleMode(mode)
+    }
+
+    @objc func toggleRepeat(_ sender: Any?) {
+        let mode: RepeatMode = playback.repeatMode == .off ? .currentTrack : .off
+        setRepeatMode(mode)
+    }
+
+    private func setShuffleMode(_ mode: ShuffleMode) {
+        playlistManager.resetShuffleOrder()
+        playback.shuffleMode = mode
+        updateControlsMenuState()
+    }
+
+    private func setRepeatMode(_ mode: RepeatMode) {
+        playlistManager.resetShuffleOrder()
+        playback.repeatMode = mode
+        updateControlsMenuState()
+    }
+
+    private func makeShuffleMenu() -> NSMenu {
+        let menu = NSMenu(title: "Shuffle")
+        for mode in ShuffleMode.allCases {
+            let item = NSMenuItem(title: mode.title, action: #selector(selectShuffleMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = mode.rawValue
+            menu.addItem(item)
+        }
+        updateModeMenuState(menu, selectedRawValue: playback.shuffleMode.rawValue, toggleKey: "s")
+        return menu
+    }
+
+    private func makeRepeatMenu() -> NSMenu {
+        let menu = NSMenu(title: "Repeat")
+        for mode in RepeatMode.allCases {
+            let item = NSMenuItem(title: mode.title, action: #selector(selectRepeatMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = mode.rawValue
+            menu.addItem(item)
+        }
+        updateModeMenuState(menu, selectedRawValue: playback.repeatMode.rawValue, toggleKey: "r")
+        return menu
+    }
+
+    @objc private func selectShuffleMode(_ sender: NSMenuItem) {
+        guard let mode = ShuffleMode(rawValue: sender.tag) else { return }
+        setShuffleMode(mode)
+    }
+
+    @objc private func selectRepeatMode(_ sender: NSMenuItem) {
+        guard let mode = RepeatMode(rawValue: sender.tag) else { return }
+        setRepeatMode(mode)
+    }
+
+    func showShuffleMenu(for view: NSView, with event: NSEvent) {
+        NSMenu.popUpContextMenu(makeShuffleMenu(), with: event, for: view)
+    }
+
+    func showRepeatMenu(for view: NSView, with event: NSEvent) {
+        NSMenu.popUpContextMenu(makeRepeatMenu(), with: event, for: view)
+    }
 
     private func configureFileItem(_ title: String, action: Selector, in menu: NSMenu) {
         guard let item = menu.items.first(where: { $0.title == title }) else { return }
@@ -1778,28 +1867,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resetInfoTarget()
         guard let playlist = playlistManager.activePlaylist else { return }
         switch index {
-        case 0: playPlaylistEntry(playlistManager.entryToPlay(in: playlist, step: -1, shuffle: false), in: playlist)
+        case 0:
+            if playback.shuffleMode != .off {
+                if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: -1) {
+                    playPlaylistEntry(next.entry, in: next.playlist)
+                }
+            } else if let previous = playlistManager.entryToPlay(in: playlist, step: -1, shuffle: false)
+                        ?? (playback.repeatMode != .off ? playlistManager.lastPlayableEntry(in: playlist) : nil) {
+                playPlaylistEntry(previous, in: playlist)
+            }
         case 1: playFromActivePlaylist()
         case 2: pausePlayback()
         case 3: stopPlayback()
-        case 4: playPlaylistEntry(playlistManager.entryToPlay(in: playlist, step: 1, shuffle: playback.isShuffleEnabled), in: playlist)
+        case 4:
+            if playback.shuffleMode != .off {
+                if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: 1) {
+                    playPlaylistEntry(next.entry, in: next.playlist)
+                }
+            } else if let next = playlistManager.entryToPlay(in: playlist, step: 1, shuffle: false)
+                        ?? (playback.repeatMode != .off ? playlistManager.firstPlayableEntry(in: playlist) : nil) {
+                playPlaylistEntry(next, in: playlist)
+            }
         case 5: addFilesToActivePlaylist()
         default: break
         }
     }
 
-    private func playPlaylistEntry(_ entry: PlaylistEntry?, in playlist: PlaylistModel, automatic: Bool = false) {
-        guard let entry else {
-            if playback.isRepeatEnabled,
-               let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
-                playlistManager.play(current, in: playlist)
-                prepareTrackNotification(for: current, automatic: automatic)
-                playback.open(current.url, bookmarkData: current.bookmarkData, displayTitle: current.title)
-                observePlayingEntryTitle(current)
-                infoModel.showForPlayback(current.url)
-            }
-            return
-        }
+    private func playPlaylistEntry(_ entry: PlaylistEntry, in playlist: PlaylistModel, automatic: Bool = false) {
         // Error-marked rows are retried only through a direct double-click in
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
@@ -1864,12 +1958,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func advancePlaylistAfterTrackFinished() {
         resetInfoTarget()
         guard let playlist = playlistManager.activePlaylist else { stopPlayback(); return }
-        if let next = playlistManager.entryToPlay(in: playlist, step: 1, shuffle: playback.isShuffleEnabled) {
+        if playback.shuffleMode != .off {
+            if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: 1) {
+                playPlaylistEntry(next.entry, in: next.playlist, automatic: true)
+            } else {
+                stopPlayback()
+            }
+            return
+        }
+
+        if let next = playlistManager.entryToPlay(in: playlist, step: 1, shuffle: false) {
             playPlaylistEntry(next, in: playlist, automatic: true)
-        } else if playback.isRepeatEnabled,
-                  let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
-            playPlaylistEntry(current, in: playlist, automatic: true)
-        } else {
+            return
+        }
+
+        switch playback.repeatMode {
+        case .currentTrack:
+            if let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
+                playPlaylistEntry(current, in: playlist, automatic: true)
+            } else {
+                stopPlayback()
+            }
+        case .currentPlaylist:
+            if let first = playlistManager.firstPlayableEntry(in: playlist) {
+                playPlaylistEntry(first, in: playlist, automatic: true)
+            } else {
+                stopPlayback()
+            }
+        case .off:
             stopPlayback()
         }
     }

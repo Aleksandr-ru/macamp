@@ -97,6 +97,10 @@ final class PlaylistManager: ObservableObject {
         let alignToBottom: Bool
         let revision: UInt
     }
+    private struct ShuffleTrack: Hashable {
+        let playlistID: UUID
+        let entryID: UUID
+    }
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
     /// Bump when a stored display-title format needs one background refresh.
     /// Existing snapshots did not retain separate artist/title fields, so they
@@ -175,6 +179,11 @@ final class PlaylistManager: ObservableObject {
     /// Metadata discovery is intentionally gentle: it must never compete with
     /// audio rendering just to fill columns that are not currently visible.
     private let metadataWorkInterval: TimeInterval = 0.25
+    // Shuffle advances through a permutation so an enabled pass does not
+    // repeat a track before all eligible tracks have been visited.
+    private var shuffleOrderMode: ShuffleMode = .off
+    private var shuffleOrder: [ShuffleTrack] = []
+    private var shuffleCursor = -1
 
     init() {
         let root = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
@@ -210,6 +219,79 @@ final class PlaylistManager: ObservableObject {
     func isOpenPlaylist(at url: URL) -> Bool {
         let canonical = url.resolvingSymlinksInPath().standardizedFileURL
         return playlists.contains { $0.fileURL?.resolvingSymlinksInPath().standardizedFileURL == canonical }
+    }
+
+    func resetShuffleOrder() {
+        shuffleOrderMode = .off
+        shuffleOrder.removeAll(keepingCapacity: true)
+        shuffleCursor = -1
+    }
+
+    /// Removes tracks from a closed playlist without rebuilding the rest of
+    /// the current all-playlists permutation. The cursor is then anchored to
+    /// the track that remains current, if any, so the next/previous commands
+    /// cannot resolve a deleted playlist or skip the first retained track.
+    func removeShuffleHistory(for playlistID: UUID) {
+        guard shuffleOrder.contains(where: { $0.playlistID == playlistID }) else { return }
+        shuffleOrder.removeAll { $0.playlistID == playlistID }
+        guard !shuffleOrder.isEmpty else {
+            resetShuffleOrder()
+            return
+        }
+
+        if let currentID = playingEntryID,
+           let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+            shuffleCursor = currentIndex
+        } else {
+            shuffleCursor = -1
+        }
+    }
+
+    func shuffledEntry(for mode: ShuffleMode, step: Int) -> (playlist: PlaylistModel, entry: PlaylistEntry)? {
+        guard mode != .off, step != 0 else { return nil }
+        let sourcePlaylists: [PlaylistModel]
+        switch mode {
+        case .off:
+            return nil
+        case .currentPlaylist:
+            sourcePlaylists = activePlaylist.map { [$0] } ?? []
+        case .allPlaylists:
+            sourcePlaylists = playlists
+        }
+
+        let candidates = sourcePlaylists.flatMap { playlist in
+            playlist.entries
+                .filter { !$0.hasPlaybackError }
+                .map { ShuffleTrack(playlistID: playlist.id, entryID: $0.id) }
+        }
+        guard !candidates.isEmpty else { return nil }
+        let candidateSet = Set(candidates)
+
+        if shuffleOrderMode != mode || Set(shuffleOrder) != candidateSet {
+            shuffleOrderMode = mode
+            shuffleOrder = candidates.shuffled()
+            if let currentID = playingEntryID,
+               let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+                shuffleOrder.swapAt(0, currentIndex)
+                shuffleCursor = 0
+            } else {
+                shuffleCursor = -1
+            }
+        } else if let currentID = playingEntryID,
+                  let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+            shuffleCursor = currentIndex
+        }
+
+        let nextCursor = shuffleCursor + step
+        guard shuffleOrder.indices.contains(nextCursor) else { return nil }
+        shuffleCursor = nextCursor
+        let track = shuffleOrder[nextCursor]
+        guard let playlist = playlist(id: track.playlistID),
+              let entry = playlist.entries.first(where: { $0.id == track.entryID }) else {
+            resetShuffleOrder()
+            return nil
+        }
+        return (playlist, entry)
     }
 
     @discardableResult func createPlaylist(name: String = "New Playlist") -> PlaylistModel {
@@ -357,6 +439,7 @@ final class PlaylistManager: ObservableObject {
         if let url = playlist.fileURL { addRecent(url) }
         let wasActive = activePlaylistID == playlist.id
         playlists.removeAll { $0.id == playlist.id }
+        removeShuffleHistory(for: playlist.id)
         dirtyPlaylistEntryIDs.remove(playlist.id)
         if wasActive {
             // Prefer an actually open window; fall back to a remaining hidden
@@ -457,19 +540,20 @@ final class PlaylistManager: ObservableObject {
         return playlist.entries.first(where: { !$0.hasPlaybackError })
     }
 
+    func firstPlayableEntry(in playlist: PlaylistModel) -> PlaylistEntry? {
+        playlist.entries.first(where: { !$0.hasPlaybackError })
+    }
+
+    func lastPlayableEntry(in playlist: PlaylistModel) -> PlaylistEntry? {
+        playlist.entries.reversed().first(where: { !$0.hasPlaybackError })
+    }
+
     func entryToPlay(in playlist: PlaylistModel, step: Int, shuffle: Bool) -> PlaylistEntry? {
         guard !playlist.entries.isEmpty else { return nil }
-        if shuffle {
-            // A shuffle transition must make progress.  Keep the only entry
-            // eligible, but never immediately choose the currently playing
-            // one when another track exists.
-            let eligible = playlist.entries.filter { !$0.hasPlaybackError }
-            let alternatives = eligible.filter { $0.id != playingEntryID }
-            return (alternatives.isEmpty ? eligible : alternatives).randomElement()
-        }
+        if shuffle { return shuffledEntry(for: .currentPlaylist, step: step)?.entry }
         guard let current = playingEntryID,
               let index = playlist.entries.firstIndex(where: { $0.id == current }) else {
-            return playlist.entries.first(where: { !$0.hasPlaybackError })
+            return firstPlayableEntry(in: playlist)
         }
         // The next-track path advances past unavailable items.  Previous keeps
         // its normal positional behaviour; an errored item can be retried only

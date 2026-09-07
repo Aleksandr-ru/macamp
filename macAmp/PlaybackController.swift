@@ -9,6 +9,34 @@ enum InterfaceRenderGate {
     static var isSuspended = false
 }
 
+enum ShuffleMode: Int, CaseIterable {
+    case off = 0
+    case currentPlaylist = 1
+    case allPlaylists = 2
+
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .currentPlaylist: return "Current Playlist"
+        case .allPlaylists: return "All Playlists"
+        }
+    }
+}
+
+enum RepeatMode: Int, CaseIterable {
+    case off = 0
+    case currentTrack = 1
+    case currentPlaylist = 2
+
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .currentTrack: return "Current Track"
+        case .currentPlaylist: return "Current Playlist"
+        }
+    }
+}
+
 /// High-frequency state is kept separate from transport state so spectrum
 /// frames do not invalidate the whole player interface.
 final class PlaybackVisualizationState: ObservableObject {
@@ -110,11 +138,21 @@ final class PlaybackController: NSObject, ObservableObject {
     let visualization = PlaybackVisualizationState()
     @Published var volume: Double = 0.8 { didSet { playerNode.volume = Float(volume) } }
     @Published var balance: Double = 0 { didSet { playerNode.pan = Float(min(1, max(-1, balance))) } }
-    @Published var isShuffleEnabled = false {
-        didSet { UserDefaults.standard.set(isShuffleEnabled, forKey: Self.shufflePreferenceKey) }
+    @Published var shuffleMode: ShuffleMode = .off {
+        didSet {
+            UserDefaults.standard.set(shuffleMode.rawValue, forKey: Self.shuffleModePreferenceKey)
+            if shuffleMode != .off, repeatMode != .off {
+                repeatMode = .off
+            }
+        }
     }
-    @Published var isRepeatEnabled = false {
-        didSet { UserDefaults.standard.set(isRepeatEnabled, forKey: Self.repeatPreferenceKey) }
+    @Published var repeatMode: RepeatMode = .off {
+        didSet {
+            UserDefaults.standard.set(repeatMode.rawValue, forKey: Self.repeatModePreferenceKey)
+            if repeatMode != .off, shuffleMode != .off {
+                shuffleMode = .off
+            }
+        }
     }
 
     var currentURL: URL? { scopedURL }
@@ -188,18 +226,25 @@ final class PlaybackController: NSObject, ObservableObject {
     private lazy var visualFFTWorkspace = FFTWorkspace(size: visualFFTSize)
     private var smoothedBandEnergy = Array(repeating: -60.0, count: 10)
     private var hasAdaptiveAnalysisHistory = false
-    private static let shufflePreferenceKey = "macAmp.playback.shuffleEnabled"
-    private static let repeatPreferenceKey = "macAmp.playback.repeatEnabled"
+    private static let shuffleModePreferenceKey = "macAmp.playback.shuffleMode"
+    private static let repeatModePreferenceKey = "macAmp.playback.repeatMode"
+    private static let legacyShufflePreferenceKey = "macAmp.playback.shuffleEnabled"
+    private static let legacyRepeatPreferenceKey = "macAmp.playback.repeatEnabled"
 
     override init() {
         super.init()
         // Keep these choices independent from window-layout persistence: a
         // damaged/older layout snapshot must never reset playback modes.
-        if UserDefaults.standard.object(forKey: Self.shufflePreferenceKey) != nil {
-            isShuffleEnabled = UserDefaults.standard.bool(forKey: Self.shufflePreferenceKey)
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.shuffleModePreferenceKey) != nil {
+            shuffleMode = ShuffleMode(rawValue: defaults.integer(forKey: Self.shuffleModePreferenceKey)) ?? .off
+        } else if defaults.bool(forKey: Self.legacyShufflePreferenceKey) {
+            shuffleMode = .currentPlaylist
         }
-        if UserDefaults.standard.object(forKey: Self.repeatPreferenceKey) != nil {
-            isRepeatEnabled = UserDefaults.standard.bool(forKey: Self.repeatPreferenceKey)
+        if defaults.object(forKey: Self.repeatModePreferenceKey) != nil {
+            repeatMode = RepeatMode(rawValue: defaults.integer(forKey: Self.repeatModePreferenceKey)) ?? .off
+        } else if defaults.bool(forKey: Self.legacyRepeatPreferenceKey) {
+            repeatMode = .currentTrack
         }
         configureAudioGraph()
         equalizer.onChange = { [weak self] in self?.applyEqualizer() }

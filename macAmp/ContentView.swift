@@ -401,8 +401,12 @@ extension ContentView {
     private var shuffleButton: some View {
         playbackToggleButton(
             .shuffle,
-            isActive: $playback.isShuffleEnabled,
-            isPressed: $isShufflePressed
+            isActive: playback.shuffleMode != .off,
+            isPressed: $isShufflePressed,
+            action: { AppDelegate.shared?.toggleShuffle(nil) },
+            rightClick: { event, view in
+                AppDelegate.shared?.showShuffleMenu(for: view, with: event)
+            }
         )
         .position(x: 187.5, y: 96.5)
     }
@@ -410,40 +414,45 @@ extension ContentView {
     private var repeatButton: some View {
         playbackToggleButton(
             .repeatTrack,
-            isActive: $playback.isRepeatEnabled,
-            isPressed: $isRepeatPressed
+            isActive: playback.repeatMode != .off,
+            isPressed: $isRepeatPressed,
+            action: { AppDelegate.shared?.toggleRepeat(nil) },
+            rightClick: { event, view in
+                AppDelegate.shared?.showRepeatMenu(for: view, with: event)
+            }
         )
         .position(x: 225, y: 96.5)
     }
 
     private func playbackToggleButton(
         _ toggle: WinampSkinStore.PlaybackToggle,
-        isActive: Binding<Bool>,
-        isPressed: Binding<Bool>
+        isActive: Bool,
+        isPressed: Binding<Bool>,
+        action: @escaping () -> Void,
+        rightClick: @escaping (NSEvent, NSView) -> Void
     ) -> some View {
         let width: CGFloat = toggle == .shuffle ? 47 : 28
-        return Group {
-            if let image = skin.playbackToggleImage(
-                toggle,
-                isActive: isActive.wrappedValue,
-                isPressed: isPressed.wrappedValue
-            ) {
-                Image(nsImage: image)
-                    .interpolation(.none)
-            } else {
-                Color.clear
+        return ZStack {
+            Group {
+                if let image = skin.playbackToggleImage(
+                    toggle,
+                    isActive: isActive,
+                    isPressed: isPressed.wrappedValue
+                ) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                } else {
+                    Color.clear
+                }
             }
+            PlaybackToggleHotspot(
+                isPressed: isPressed,
+                action: action,
+                rightClick: rightClick
+            )
         }
         .frame(width: width, height: 15)
         .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in isPressed.wrappedValue = true }
-                .onEnded { _ in
-                    isPressed.wrappedValue = false
-                    isActive.wrappedValue.toggle()
-                }
-        )
     }
 
     private func windowToggleButton(
@@ -798,6 +807,51 @@ struct ContentView_Previews: PreviewProvider {
             alwaysOnTopState: AlwaysOnTopState(),
             settingsWindowState: SettingsWindowState()
         )
+    }
+}
+
+private struct PlaybackToggleHotspot: NSViewRepresentable {
+    let isPressed: Binding<Bool>
+    let action: () -> Void
+    let rightClick: (NSEvent, NSView) -> Void
+
+    func makeNSView(context: Context) -> PlaybackToggleHotspotNSView {
+        let view = PlaybackToggleHotspotNSView()
+        view.onPressed = { isPressed in self.isPressed.wrappedValue = isPressed }
+        view.action = action
+        view.rightClick = rightClick
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaybackToggleHotspotNSView, context: Context) {
+        nsView.onPressed = { isPressed in self.isPressed.wrappedValue = isPressed }
+        nsView.action = action
+        nsView.rightClick = rightClick
+    }
+}
+
+private final class PlaybackToggleHotspotNSView: NSView {
+    var onPressed: ((Bool) -> Void)?
+    var action: (() -> Void)?
+    var rightClick: ((NSEvent, NSView) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        onPressed?(true)
+        var releasedInside = false
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp {
+                releasedInside = bounds.contains(convert(next.locationInWindow, from: nil))
+                break
+            }
+        }
+        onPressed?(false)
+        if releasedInside { action?() }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        rightClick?(event, self)
     }
 }
 
