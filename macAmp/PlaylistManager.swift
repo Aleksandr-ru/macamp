@@ -182,6 +182,11 @@ final class PlaylistManager: ObservableObject {
     // Shuffle advances through a permutation so an enabled pass does not
     // repeat a track before all eligible tracks have been visited.
     private var shuffleOrderMode: ShuffleMode = .off
+    /// The permutation's source is part of its identity.  A current-playlist
+    /// shuffle must be rebuilt as soon as playback moves to another editor;
+    /// comparing only the mode and track IDs leaves a stale cursor in a few
+    /// restore/edit edge cases.
+    private var shuffleOrderPlaylistID: UUID?
     private var shuffleOrder: [ShuffleTrack] = []
     private var shuffleCursor = -1
 
@@ -223,8 +228,16 @@ final class PlaylistManager: ObservableObject {
 
     func resetShuffleOrder() {
         shuffleOrderMode = .off
+        shuffleOrderPlaylistID = nil
         shuffleOrder.removeAll(keepingCapacity: true)
         shuffleCursor = -1
+    }
+
+    private var currentShuffleTrack: ShuffleTrack? {
+        guard let currentID = playingEntryID,
+              let playlist = activePlaylist,
+              playlist.entries.contains(where: { $0.id == currentID }) else { return nil }
+        return ShuffleTrack(playlistID: playlist.id, entryID: currentID)
     }
 
     /// Removes tracks from a closed playlist without rebuilding the rest of
@@ -239,8 +252,8 @@ final class PlaylistManager: ObservableObject {
             return
         }
 
-        if let currentID = playingEntryID,
-           let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+        if let currentTrack = currentShuffleTrack,
+           let currentIndex = shuffleOrder.firstIndex(of: currentTrack) {
             shuffleCursor = currentIndex
         } else {
             shuffleCursor = -1
@@ -266,20 +279,30 @@ final class PlaylistManager: ObservableObject {
         }
         guard !candidates.isEmpty else { return nil }
         let candidateSet = Set(candidates)
+        let sourcePlaylistID = mode == .currentPlaylist ? sourcePlaylists.first?.id : nil
 
-        if shuffleOrderMode != mode || Set(shuffleOrder) != candidateSet {
+        if shuffleOrderMode != mode
+            || shuffleOrderPlaylistID != sourcePlaylistID
+            || Set(shuffleOrder) != candidateSet {
             shuffleOrderMode = mode
+            shuffleOrderPlaylistID = sourcePlaylistID
             shuffleOrder = candidates.shuffled()
-            if let currentID = playingEntryID,
-               let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+            if let currentTrack = currentShuffleTrack,
+               let currentIndex = shuffleOrder.firstIndex(of: currentTrack) {
                 shuffleOrder.swapAt(0, currentIndex)
                 shuffleCursor = 0
             } else {
                 shuffleCursor = -1
             }
-        } else if let currentID = playingEntryID,
-                  let currentIndex = shuffleOrder.firstIndex(where: { $0.entryID == currentID }) {
+        } else if let currentTrack = currentShuffleTrack,
+                  let currentIndex = shuffleOrder.firstIndex(of: currentTrack) {
             shuffleCursor = currentIndex
+        } else {
+            // The current source can change independently of this method (for
+            // example after a direct row activation or entry cleanup). Never
+            // continue from the old playlist's cursor when the current track
+            // is absent from the retained permutation.
+            shuffleCursor = -1
         }
 
         let nextCursor = shuffleCursor + step
@@ -503,6 +526,13 @@ final class PlaylistManager: ObservableObject {
                 entry.bookmarkData = bookmark
                 markEntriesDirty(in: playlist)
             }
+        }
+        // A direct double-click is how playback changes the active editor.
+        // Discard only the current-playlist permutation here; an
+        // all-playlists shuffle intentionally keeps its order when it crosses
+        // from one editor to another.
+        if activePlaylistID != playlist.id, shuffleOrderMode == .currentPlaylist {
+            resetShuffleOrder()
         }
         activePlaylistID = playlist.id; focusedPlaylistID = playlist.id
         playlist.lastPlayedEntryID = entry.id; playingEntryID = entry.id

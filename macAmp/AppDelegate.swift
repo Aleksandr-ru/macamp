@@ -650,6 +650,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Local monitoring is the only AppKit path that consistently carries the
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
+        // Modal dialogs and text fields still pass through the application's
+        // local event monitor. Let AppKit deliver those key events to the
+        // field editor; otherwise a one-letter transport shortcut (Z/X/C/V,
+        // B/S/R) wins over the text being entered in a playlist name.
+        guard !isEditingText(for: event) else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if handleWindowShadeShortcut(event, modifiers: modifiers) { return true }
         if handleFileCloseShortcut(event, modifiers: modifiers) { return true }
@@ -713,6 +718,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: return false
         }
         return true
+    }
+
+    private func isEditingText(for event: NSEvent) -> Bool {
+        let window = event.window ?? NSApp.keyWindow
+        var responder = window?.firstResponder
+        while let current = responder {
+            if let textView = current as? NSTextView, textView.isEditable { return true }
+            if let textField = current as? NSTextField, textField.isEditable { return true }
+            responder = current.nextResponder
+        }
+        return false
     }
 
     /// Windowshade is assigned to the physical W key so ⌘W remains stable
