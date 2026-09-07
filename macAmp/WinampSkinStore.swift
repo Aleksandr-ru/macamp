@@ -1972,7 +1972,11 @@ final class WinampSkinStore: ObservableObject {
         let frame = Int((min(1, abs(balance)) * 27).rounded())
         if let cached = balanceBarCache[frame] { return cached }
         let y = frame * 15
-        guard let sheet = bitmap(named: "BALANCE.BMP") ?? bitmap(named: "VOLUME.BMP"),
+        // Winamp first uses the active skin's balance sheet. If it is absent,
+        // it reuses the volume sheet already selected for that skin; only the
+        // latter lookup may fall back to the bundled default skin.
+        guard let sheet = bitmap(named: "BALANCE.BMP", fallbackToBundledSkin: false)
+                ?? bitmap(named: "VOLUME.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
               source.width >= 47, source.height >= y + 13,
               let cropped = source.cropping(to: CGRect(x: 9, y: y, width: 38, height: 13)) else {
@@ -1987,7 +1991,9 @@ final class WinampSkinStore: ObservableObject {
     func balanceThumb(pressed: Bool) -> NSImage? {
         if let cached = balanceThumbCache[pressed] { return cached }
         let x = pressed ? 0 : 15
-        guard let sheet = bitmap(named: "BALANCE.BMP") ?? bitmap(named: "VOLUME.BMP"),
+        // Keep the thumb source consistent with the track source above.
+        guard let sheet = bitmap(named: "BALANCE.BMP", fallbackToBundledSkin: false)
+                ?? bitmap(named: "VOLUME.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
               source.width >= x + 14, source.height >= 433,
               let cropped = source.cropping(to: CGRect(x: x, y: 422, width: 14, height: 11)) else {
