@@ -151,15 +151,15 @@ final class PlaylistManager: ObservableObject {
     private var loadingMetadataAssets: [UUID: AVURLAsset] = [:]
     private var cancelledMetadataEntryIDs = Set<UUID>()
     private var pendingMetadataReprioritization: DispatchWorkItem?
-    private var pendingMetadataResume: DispatchWorkItem?
+    /// Playback can reveal an off-screen current row by scrolling the editor.
+    /// That programmatic viewport change must not be treated like a user
+    /// scroll: a user scroll may cancel obsolete metadata work, whereas a
+    /// track change must let the current read finish and retain its counter.
+    private var metadataReprioritizationSuppressedForPlaylistIDs = Set<UUID>()
     /// Main-thread generation of the visible metadata work set. A worker that
     /// finishes after scrolling skips its normal pacing delay and immediately
     /// chooses again from the new viewport.
     private var metadataPriorityRevision = 0
-    /// Starting a remote track takes precedence over cosmetic tag discovery.
-    /// AVFoundation otherwise opens the same file in two metadata workers and
-    /// competes with the audio decoder for the network volume.
-    private var metadataHoldUntil = Date.distantPast
     /// Keeps parsing off-main while pacing visual insertion.  Enqueuing all
     /// parsed chunks at once starves a run-loop frame and makes the Loading
     /// counter appear to jump from zero to a large number.
@@ -536,28 +536,29 @@ final class PlaylistManager: ObservableObject {
         }
         activePlaylistID = playlist.id; focusedPlaylistID = playlist.id
         playlist.lastPlayedEntryID = entry.id; playingEntryID = entry.id
-        if revealIfNeeded { playbackRevealRevision &+= 1 }
-        deferMetadataForPlaybackStart()
+        if revealIfNeeded {
+            if playlist.isVisible,
+               let index = playlist.entries.firstIndex(where: { $0.id == entry.id }),
+               !isVisibleInEditor(entry, in: playlist) {
+                // ScrollViewReader applies the visual reveal asynchronously.
+                // Update the scheduler's viewport now, rather than letting it
+                // continue reading the old range until that layout pass.
+                let maximumFirst = max(0, playlist.entries.count - playlist.visibleEntryCount)
+                playlist.scrollPosition = min(
+                    maximumFirst,
+                    max(0, index - playlist.visibleEntryCount / 2)
+                )
+                metadataPriorityRevision &+= 1
+                metadataReprioritizationSuppressedForPlaylistIDs.insert(playlist.id)
+            }
+            playbackRevealRevision &+= 1
+        }
+        // A playback change must keep metadata discovery alive. This starts a
+        // worker only when the serial scanner is idle; an active read remains
+        // untouched and the next pump turn uses the playing row, then the
+        // visible range.
+        scheduleMetadata(for: playlist)
         save()
-    }
-
-    private func deferMetadataForPlaybackStart() {
-        metadataHoldUntil = Date().addingTimeInterval(2)
-        metadataAssetLock.lock()
-        for (entryID, asset) in loadingMetadataAssets {
-            cancelledMetadataEntryIDs.insert(entryID)
-            asset.cancelLoading()
-        }
-        metadataAssetLock.unlock()
-        pendingMetadataResume?.cancel()
-        let resume = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.metadataHoldUntil = .distantPast
-            self.playlists.filter { $0.isVisible && !self.pausedPlaylistIDs.contains($0.id) }
-                .forEach { self.scheduleMetadata(for: $0) }
-        }
-        pendingMetadataResume = resume
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: resume)
     }
 
     func preferredEntryToPlay(in playlist: PlaylistModel) -> PlaylistEntry? {
@@ -706,6 +707,15 @@ final class PlaylistManager: ObservableObject {
         // Publish once as the viewport changes so the newly visible range is
         // rendered immediately with all metadata already available there.
         playlist.metadataRevision &+= 1
+        if metadataReprioritizationSuppressedForPlaylistIDs.remove(playlist.id) != nil {
+            // This range change is the delayed ScrollView reveal issued by
+            // play(_:in:). The worker will use the new viewport after its
+            // current request completes, without cancelling that request.
+            // It may have gone idle while the view was animating, so ensure
+            // the new visible range still has a worker to consume it.
+            scheduleMetadata(for: playlist)
+            return
+        }
         requestMetadataReprioritization()
     }
 
@@ -905,7 +915,7 @@ final class PlaylistManager: ObservableObject {
     /// volume or a remote URL).
     private func reprioritizeMetadataReading() {
         var preferredEntryIDs = Set<UUID>()
-        if let active = playlists.first(where: { $0.id == activePlaylistID }),
+        if playlists.contains(where: { $0.id == activePlaylistID }),
            let playingEntryID {
             preferredEntryIDs.insert(playingEntryID)
         }
@@ -935,7 +945,6 @@ final class PlaylistManager: ObservableObject {
     private func processNextMetadata() {
         var work: (playlist: PlaylistModel, entry: PlaylistEntry, total: Int, priorityRevision: Int, requestID: UInt64)?
         DispatchQueue.main.sync {
-            guard Date() >= metadataHoldUntil else { return }
             let eligible = playlists
                 .filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) }
                 .sorted { lhs, rhs in
