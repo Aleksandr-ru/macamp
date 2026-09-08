@@ -2137,6 +2137,63 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func selectNoneInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectNone(in: playlist) } }
     func invertSelectionInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.invertSelection(in: playlist) } }
 
+    /// Returns the one file that the Playlist Editor's File Info command may
+    /// act on. With no selection, the current track is valid only when this
+    /// editor is the playlist that owns the active playback cursor.
+    func fileInfoTarget(for playlist: PlaylistModel) -> URL? {
+        let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        guard selectedEntries.count <= 1 else { return nil }
+        if let selected = selectedEntries.first { return selected.url }
+
+        guard playlistManager.activePlaylistID == playlist.id else { return nil }
+        if let playingEntryID = playlistManager.playingEntryID,
+           let playingEntry = playlist.entries.first(where: { $0.id == playingEntryID }) {
+            return playingEntry.url
+        }
+        if let currentURL = playback.currentURL,
+           let currentEntry = playlist.entries.first(where: { $0.url == currentURL }) {
+            return currentEntry.url
+        }
+        return nil
+    }
+
+    /// Shows File Info for the selected row without toggling an already open
+    /// window. This is the Playlist Editor command, so its target is resolved
+    /// against the editor that opened the menu rather than global selection.
+    func showFileInfo(for playlist: PlaylistModel) {
+        guard let url = fileInfoTarget(for: playlist) else { return }
+        infoTargetURL = url
+        let panel = makeInfoWindowIfNeeded()
+        infoModel.show(url)
+        panel.makeKeyAndOrderFront(nil)
+        infoState.isVisible = true
+        schedulePersistentStateSave()
+    }
+
+    /// Returns the one file that the Playlist Editor's Reveal in Finder
+    /// command may act on. A multi-selection deliberately has no target;
+    /// with no selection, use the currently playing track instead.
+    func revealInFinderTarget(for playlist: PlaylistModel) -> URL? {
+        let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        guard selectedEntries.count <= 1 else { return nil }
+        if let selected = selectedEntries.first { return selected.url }
+
+        if let currentURL = playback.currentURL { return currentURL }
+        if let activePlaylist = playlistManager.activePlaylist,
+           let playingEntryID = playlistManager.playingEntryID,
+           let playingEntry = activePlaylist.entries.first(where: { $0.id == playingEntryID }) {
+            return playingEntry.url
+        }
+        return nil
+    }
+
+    /// Opens the containing folder in Finder and asks Finder to select the
+    /// same URL represented by the Playlist Editor row.
+    func revealInFinder(for playlist: PlaylistModel) {
+        guard let url = revealInFinderTarget(for: playlist), url.isFileURL, !url.path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
     func renameActivePlaylist() {
         guard let playlist = playlistManager.editingPlaylist else { return }
 
@@ -3433,7 +3490,7 @@ private struct SkinInformationView: View {
                 }
 
                 skinInfoRow("Name", information.name)
-                skinInfoRow("Type", information.type)
+                supportedWindowsRow
                 if !information.author.isEmpty {
                     skinInfoRow("Author", information.author)
                 }
@@ -3470,6 +3527,26 @@ private struct SkinInformationView: View {
                 .frame(width: 58, alignment: .trailing)
             Text(value)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var supportedWindowsRow: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("Windows")
+                .foregroundColor(.secondary)
+                .frame(width: 58, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(WinampSkinStore.SkinInformation.SupportedWindow.allCases) { window in
+                    let isSupported = information.supportedWindows.contains(window)
+                    HStack(spacing: 6) {
+                        Text(verbatim: isSupported ? "✓" : "−")
+                            .font(.system(.body, design: .monospaced))
+                            .frame(width: 14, alignment: .center)
+                            .foregroundColor(isSupported ? .accentColor : .secondary)
+                        Text(window.title)
+                    }
+                }
+            }
         }
     }
 }
@@ -3623,7 +3700,7 @@ private struct PlaylistView: View {
             playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"], shortcuts: [
                 "Select All": .commandA
             ])
-            playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Sort…", "Misc…"])
+            playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Reveal in Finder", "Sort…", "Misc…"])
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
                 "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
             ], shortcuts: [
@@ -3859,7 +3936,12 @@ private struct PlaylistView: View {
         titles: [String],
         shortcuts: [String: PlaylistMenuShortcut] = [:]
     ) -> some View {
-        PlaylistMenuHotspot(titles: titles, shortcuts: shortcuts, pressedImage: skin.playlistMenuButtonPressedImage(index: index))
+        PlaylistMenuHotspot(
+            titles: titles,
+            shortcuts: shortcuts,
+            playlist: playlist,
+            pressedImage: skin.playlistMenuButtonPressedImage(index: index)
+        )
             .frame(width: 22, height: 18)
             .position(x: x, y: layout.height - 21)
     }
@@ -3877,12 +3959,14 @@ private struct PlaylistScrollOffsetKey: PreferenceKey {
 private struct PlaylistMenuHotspot: NSViewRepresentable {
     let titles: [String]
     let shortcuts: [String: PlaylistMenuShortcut]
+    let playlist: PlaylistModel
     let pressedImage: NSImage?
 
     func makeNSView(context: Context) -> PlaylistMenuHotspotNSView {
         let view = PlaylistMenuHotspotNSView()
         view.titles = titles
         view.shortcuts = shortcuts
+        view.playlist = playlist
         view.pressedImage = pressedImage
         return view
     }
@@ -3890,6 +3974,7 @@ private struct PlaylistMenuHotspot: NSViewRepresentable {
     func updateNSView(_ nsView: PlaylistMenuHotspotNSView, context: Context) {
         nsView.titles = titles
         nsView.shortcuts = shortcuts
+        nsView.playlist = playlist
         nsView.pressedImage = pressedImage
     }
 }
@@ -3909,6 +3994,7 @@ private struct PlaylistMenuShortcut {
 private final class PlaylistMenuHotspotNSView: NSView {
     var titles: [String] = []
     var shortcuts: [String: PlaylistMenuShortcut] = [:]
+    var playlist: PlaylistModel?
     var pressedImage: NSImage? { didSet { needsDisplay = true } }
     private var isPressed = false { didSet { needsDisplay = true } }
 
@@ -3933,6 +4019,13 @@ private final class PlaylistMenuHotspotNSView: NSView {
             )
             item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
+            if let playlist, let appDelegate = AppDelegate.shared {
+                if title == "File Info" {
+                    item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
+                } else if title == "Reveal in Finder" {
+                    item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
+                }
+            }
             menu.addItem(item)
         }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -3950,6 +4043,10 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Select All": AppDelegate.shared?.selectAllInActivePlaylist()
         case "Select None": AppDelegate.shared?.selectNoneInActivePlaylist()
         case "Invert Selection": AppDelegate.shared?.invertSelectionInActivePlaylist()
+        case "File Info":
+            if let playlist { AppDelegate.shared?.showFileInfo(for: playlist) }
+        case "Reveal in Finder":
+            if let playlist { AppDelegate.shared?.revealInFinder(for: playlist) }
         case "New Playlist": AppDelegate.shared?.newPlaylist(nil)
         case "Load Playlist…": AppDelegate.shared?.openDocument(nil)
         case "Save Playlist As…": AppDelegate.shared?.savePlaylistAs(nil)

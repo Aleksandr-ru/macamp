@@ -26,8 +26,28 @@ final class WinampSkinStore: ObservableObject {
     }
 
     struct SkinInformation {
+        enum SupportedWindow: String, CaseIterable, Hashable, Identifiable {
+            case main
+            case equalizer
+            case playlist
+            case info
+            case visualization
+
+            var id: String { rawValue }
+
+            var title: String {
+                switch self {
+                case .main: return "Main"
+                case .equalizer: return "Equalizer"
+                case .playlist: return "Playlist"
+                case .info: return "Info"
+                case .visualization: return "Visualization"
+                }
+            }
+        }
+
         let name: String
-        let type: String
+        let supportedWindows: Set<SupportedWindow>
         let author: String
         let version: String
         let comment: String
@@ -378,7 +398,7 @@ final class WinampSkinStore: ObservableObject {
         if skin.isBundled {
             information = SkinInformation(
                 name: "WINAMP CLASSIC 2.91",
-                type: "Classic",
+                supportedWindows: supportedWindows(in: skin.directory),
                 author: "Steve Gedikian",
                 version: "2.0",
                 comment: "Winamp base skin v5.5",
@@ -386,8 +406,6 @@ final class WinampSkinStore: ObservableObject {
             )
         } else {
             let values = loadSkinInfoValues(from: skin.directory)
-            let isModern = fileURL(named: "skin.xml", in: skin.directory) != nil
-            let hasClassicMainBitmap = fileURL(named: "MAIN.BMP", in: skin.directory) != nil
             let preview: NSImage?
             if let screenshot = values["screenshot"], !screenshot.isEmpty {
                 let screenshotURL = screenshot.hasPrefix("/")
@@ -399,7 +417,7 @@ final class WinampSkinStore: ObservableObject {
             }
             information = SkinInformation(
                 name: values["name"] ?? skin.displayName,
-                type: isModern ? "Modern" : (hasClassicMainBitmap ? "Classic" : "Unknown"),
+                supportedWindows: supportedWindows(in: skin.directory),
                 author: values["author"] ?? "",
                 version: values["version"] ?? "",
                 comment: values["comment"] ?? "",
@@ -408,6 +426,23 @@ final class WinampSkinStore: ObservableObject {
         }
         skinInformationCache[skin.directoryName] = information
         return information
+    }
+
+    /// Reports only resources supplied by the selected skin. The renderer can
+    /// fall back to DefaultSkin for omitted assets, but that must not make the
+    /// settings screen claim that the selected skin implements the window.
+    /// Info is rendered from GEN.BMP. The built-in visualization has no
+    /// standalone sheet, so it uses the same GEN.BMP capability marker.
+    private func supportedWindows(in directory: URL) -> Set<SkinInformation.SupportedWindow> {
+        var supported = Set<SkinInformation.SupportedWindow>()
+        if fileURL(named: "MAIN.BMP", in: directory) != nil { supported.insert(.main) }
+        if fileURL(named: "EQMAIN.BMP", in: directory) != nil { supported.insert(.equalizer) }
+        if fileURL(named: "PLEDIT.BMP", in: directory) != nil { supported.insert(.playlist) }
+        if fileURL(named: "GEN.BMP", in: directory) != nil {
+            supported.insert(.info)
+            supported.insert(.visualization)
+        }
+        return supported
     }
 
     func windowRegion(for kind: WindowRegionKind, isWindowShaded: Bool) -> WindowRegion? {
