@@ -37,6 +37,48 @@ enum RepeatMode: Int, CaseIterable {
     }
 }
 
+enum VisualizationMode: Int {
+    case off
+    case spectrum
+    case oscilloscope
+
+    var analyzer: VisualizationAnalyzer {
+        switch self {
+        case .off: return .off
+        case .spectrum: return .spectrum
+        case .oscilloscope: return .oscilloscope
+        }
+    }
+
+    mutating func advance() {
+        self = VisualizationMode(rawValue: rawValue == VisualizationMode.oscilloscope.rawValue ? 0 : rawValue + 1) ?? .off
+    }
+}
+
+enum VisualizationAnalyzer: String, CaseIterable, Identifiable {
+    case off
+    case spectrum
+    case oscilloscope
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .spectrum: return "Spectrum analyzer"
+        case .oscilloscope: return "Oscilloscope"
+        }
+    }
+
+    var visualizationMode: VisualizationMode {
+        switch self {
+        case .off: return .off
+        case .spectrum: return .spectrum
+        case .oscilloscope: return .oscilloscope
+        }
+    }
+}
+
 /// High-frequency state is kept separate from transport state so spectrum
 /// frames do not invalidate the whole player interface.
 final class PlaybackVisualizationState: ObservableObject {
@@ -47,6 +89,14 @@ final class PlaybackVisualizationState: ObservableObject {
     @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
 
     private static let showsPeaksPreferenceKey = "macAmp.visualization.showsPeaks"
+    private static let analyzerPreferenceKey = "macAmp.visualization.analyzer"
+
+    @Published var analyzer: VisualizationAnalyzer {
+        didSet {
+            guard oldValue != analyzer else { return }
+            UserDefaults.standard.set(analyzer.rawValue, forKey: Self.analyzerPreferenceKey)
+        }
+    }
 
     @Published var showsPeaks: Bool {
         didSet {
@@ -57,6 +107,8 @@ final class PlaybackVisualizationState: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        analyzer = defaults.string(forKey: Self.analyzerPreferenceKey)
+            .flatMap(VisualizationAnalyzer.init(rawValue:)) ?? .spectrum
         showsPeaks = defaults.object(forKey: Self.showsPeaksPreferenceKey) == nil
             ? true
             : defaults.bool(forKey: Self.showsPeaksPreferenceKey)

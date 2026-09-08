@@ -3628,6 +3628,12 @@ private struct SettingsView: View {
             }
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
             Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
+            Picker("Spectrum analyzer", selection: $visualization.analyzer) {
+                ForEach(VisualizationAnalyzer.allCases) { analyzer in
+                    Text(analyzer.title).tag(analyzer)
+                }
+            }
+            .pickerStyle(.radioGroup)
             Toggle("Show Peaks", isOn: $visualization.showsPeaks)
             VStack(alignment: .leading, spacing: 6) {
                 Text("When opening a music file")

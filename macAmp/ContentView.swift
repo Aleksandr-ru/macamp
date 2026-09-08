@@ -2,19 +2,10 @@ import AppKit
 import Combine
 import SwiftUI
 
-private enum VisualizationMode: Int {
-    case off
-    case spectrum
-    case oscilloscope
-
-    mutating func advance() {
-        self = VisualizationMode(rawValue: rawValue == VisualizationMode.oscilloscope.rawValue ? 0 : rawValue + 1) ?? .off
-    }
-}
-
 struct ContentView: View {
     @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var playback: PlaybackController
+    @ObservedObject private var visualization: PlaybackVisualizationState
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var windowFocus: WindowFocusState
@@ -37,6 +28,32 @@ struct ContentView: View {
     @State private var pressedWindowShadeControl: Int?
     @State private var visualizationMode: VisualizationMode = .spectrum
 
+    init(
+        playback: PlaybackController,
+        interfaceScale: InterfaceScale,
+        timeDisplayPreference: TimeDisplayPreference,
+        windowFocus: WindowFocusState,
+        windowShade: WindowShadeState,
+        equalizerState: EqualizerWindowState,
+        playlistState: PlaylistWindowState,
+        infoState: InfoWindowState,
+        alwaysOnTopState: AlwaysOnTopState,
+        settingsWindowState: SettingsWindowState
+    ) {
+        self.playback = playback
+        self._visualization = ObservedObject(wrappedValue: playback.visualization)
+        self.interfaceScale = interfaceScale
+        self.timeDisplayPreference = timeDisplayPreference
+        self.windowFocus = windowFocus
+        self.windowShade = windowShade
+        self.equalizerState = equalizerState
+        self.playlistState = playlistState
+        self.infoState = infoState
+        self.alwaysOnTopState = alwaysOnTopState
+        self.settingsWindowState = settingsWindowState
+        self._visualizationMode = State(initialValue: playback.visualization.analyzer.visualizationMode)
+    }
+
     var body: some View {
         Group {
             if windowShade.isEnabled {
@@ -50,8 +67,14 @@ struct ContentView: View {
         .frame(width: 275 * CGFloat(interfaceScale.factor),
                height: (windowShade.isEnabled ? 14 : 116) * CGFloat(interfaceScale.factor),
                alignment: .topLeading)
-        .onAppear { updateVisualizationDemand() }
+        .onAppear {
+            visualizationMode = visualization.analyzer.visualizationMode
+            updateVisualizationDemand()
+        }
         .onChange(of: visualizationMode) { _ in updateVisualizationDemand() }
+        .onChange(of: visualization.analyzer) { _ in
+            visualizationMode = visualization.analyzer.visualizationMode
+        }
     }
 
     private var mainPlayerContent: some View {
@@ -92,6 +115,11 @@ struct ContentView: View {
             enabled: visualizationMode != .off,
             waveform: visualizationMode == .oscilloscope
         )
+    }
+
+    private func advanceVisualization() {
+        visualizationMode.advance()
+        visualization.analyzer = visualizationMode.analyzer
     }
 
     private var skinTitleBar: some View {
@@ -141,7 +169,7 @@ struct ContentView: View {
         visualizationView(isWindowShade: true)
         .frame(width: 38, height: 5)
         .contentShape(Rectangle())
-        .highPriorityGesture(TapGesture().onEnded { visualizationMode.advance() })
+        .highPriorityGesture(TapGesture().onEnded { advanceVisualization() })
         .position(x: 98, y: 7.5)
     }
 
@@ -507,14 +535,14 @@ extension ContentView {
         visualizationView(isWindowShade: false)
         .frame(width: 76, height: 15)
         .contentShape(Rectangle())
-        .highPriorityGesture(TapGesture().onEnded { visualizationMode.advance() })
+        .highPriorityGesture(TapGesture().onEnded { advanceVisualization() })
         .position(x: 62, y: 51.5)
     }
 
     @ViewBuilder
     private func visualizationView(isWindowShade: Bool) -> some View {
         VisualizationDisplay(
-            visualization: playback.visualization,
+            visualization: visualization,
             palette: skin.visualizationPalette,
             mode: visualizationMode,
             isWindowShade: isWindowShade
