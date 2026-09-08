@@ -709,6 +709,16 @@ final class PlaylistManager: ObservableObject {
         requestMetadataReprioritization()
     }
 
+    /// The editor publishes a coalesced viewport range. It is sufficient for
+    /// playback navigation, where avoiding an unnecessary scroll is more
+    /// important than repainting an already visible selected row.
+    func isVisibleInEditor(_ entry: PlaylistEntry, in playlist: PlaylistModel) -> Bool {
+        guard let index = playlist.entries.firstIndex(where: { $0.id == entry.id }) else { return false }
+        let first = min(max(0, playlist.scrollPosition), playlist.entries.count)
+        let end = min(playlist.entries.count, first + max(1, playlist.visibleEntryCount))
+        return index >= first && index < end
+    }
+
     private func requestMetadataReprioritization() {
         pendingMetadataReprioritization?.cancel()
         let work = DispatchWorkItem { [weak self] in

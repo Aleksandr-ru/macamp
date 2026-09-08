@@ -444,6 +444,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastDirectMediaKeyEvent = Date.distantPast
     private var mediaKeyMonitor: Any?
     private var keyboardShortcutMonitor: Any?
+    private var jumpToFileController: JumpToFileController?
     private var controlsMenu: NSMenu?
     private weak var windowMenu: NSMenu?
     private let persistentStateKey = "macAmp.applicationPersistentState.v1"
@@ -707,6 +708,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggleShuffle(nil)
         case 15: // physical R key — Repeat
             toggleRepeat(nil)
+        case 38: // physical J key — Jump to File
+            showJumpToFile(from: event.window)
         case 123: // ← — Back 5 seconds
             seekPlayback(to: max(0, playback.position - 5))
         case 124: // → — Forward 5 seconds
@@ -1433,6 +1436,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addControlMenuItem("Stop", action: #selector(stopTrack(_:)), key: "v", to: controlsMenu)
         addControlMenuItem("Next", action: #selector(nextTrack(_:)), key: "b", to: controlsMenu)
         controlsMenu.addItem(.separator())
+        addControlMenuItem("Jump to File…", action: #selector(jumpToFile(_:)), key: "j", to: controlsMenu)
+        controlsMenu.addItem(.separator())
         addControlMenuItem("Back 5 Seconds", action: #selector(rewindFiveSeconds(_:)), key: menuKey(NSLeftArrowFunctionKey), to: controlsMenu)
         addControlMenuItem("Forward 5 Seconds", action: #selector(forwardFiveSeconds(_:)), key: menuKey(NSRightArrowFunctionKey), to: controlsMenu)
         addControlMenuItem("Volume Down", action: #selector(volumeDown(_:)), key: menuKey(NSDownArrowFunctionKey), to: controlsMenu)
@@ -1694,6 +1699,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playback.stop()
     }
     @objc private func nextTrack(_ sender: Any?) { playlistTransportAction(4) }
+    @objc private func jumpToFile(_ sender: Any?) { showJumpToFile(from: NSApp.keyWindow) }
+
+    private func showJumpToFile(from sourceWindow: NSWindow?) {
+        if let jumpToFileController {
+            jumpToFileController.show(relativeTo: nil)
+            return
+        }
+        let sourcePlaylistID = sourceWindow.flatMap { source in
+            playlistWindows.first(where: { $0.value === source })?.key
+        }
+        let controller = JumpToFileController(
+            manager: playlistManager,
+            scopedPlaylistID: sourcePlaylistID ?? playlistManager.activePlaylist?.id,
+            searchesAllPlaylists: sourcePlaylistID == nil
+        ) { [weak self] playlistID, entryID in
+            guard let self,
+                  let playlist = self.playlistManager.playlist(id: playlistID),
+                  let entry = playlist.entries.first(where: { $0.id == entryID }) else { return }
+            // Mirror a direct playlist-row activation: first establish the
+            // row selection, then use the same retry/playback route.
+            self.playlistManager.selectEntry(entry, in: playlist, extending: false, toggling: false)
+            self.selectInfoTarget(entry)
+            self.playPlaylistEntryFromSelection(entry, in: playlist, revealIfNotVisible: true)
+        }
+        controller.onClose = { [weak self, weak controller] in
+            guard self?.jumpToFileController === controller else { return }
+            self?.jumpToFileController = nil
+        }
+        jumpToFileController = controller
+        if let panel = controller.window { applyAlwaysOnTopLevel(to: panel) }
+        controller.show(relativeTo: sourceWindow)
+    }
+
     @objc private func rewindFiveSeconds(_ sender: Any?) { seekPlayback(to: max(0, playback.position - 5)) }
     @objc private func forwardFiveSeconds(_ sender: Any?) { seekPlayback(to: min(playback.duration, playback.position + 5)) }
     @objc private func volumeDown(_ sender: Any?) { playback.volume = max(0, playback.volume - 0.05) }
@@ -1913,7 +1951,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Error-marked rows are retried only through a direct double-click in
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
-        playlistManager.play(entry, in: playlist)
+        // Transport commands must not disturb a list the user is already
+        // reading. Centre only when the newly playing row is outside its
+        // current viewport (including a shuffle jump to a distant row).
+        let shouldReveal = !playlistManager.isVisibleInEditor(entry, in: playlist)
+        playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry, automatic: automatic)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
@@ -1922,11 +1964,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Playlist rows call this route as well, so their double-click has the
     /// same Info Target reset semantics as every other transport command.
-    func playPlaylistEntryFromSelection(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
+    func playPlaylistEntryFromSelection(
+        _ entry: PlaylistEntry,
+        in playlist: PlaylistModel,
+        revealIfNotVisible: Bool = false
+    ) {
         resetInfoTarget()
         // A direct row activation is the sole retry route for a failed item.
         // Keep its marker until PlaybackController confirms it opened.
-        playlistManager.play(entry, in: playlist, revealIfNeeded: false)
+        let shouldReveal = revealIfNotVisible && !playlistManager.isVisibleInEditor(entry, in: playlist)
+        playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry, automatic: false)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
@@ -2194,6 +2241,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .compactMap { $0 }
             .forEach(applyAlwaysOnTopLevel(to:))
         playlistWindows.values.forEach(applyAlwaysOnTopLevel(to:))
+        if let jumpWindow = jumpToFileController?.window { applyAlwaysOnTopLevel(to: jumpWindow) }
         windowMenu?.items.first(where: { $0.title == "Always on Top" })?.state = alwaysOnTopState.isEnabled ? .on : .off
     }
 

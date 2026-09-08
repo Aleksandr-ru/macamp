@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		E1A0001126A0000100000001 /* TrackNotificationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001226A0000100000001 /* TrackNotificationController.swift */; };
+		E1A0001526A0000100000001 /* JumpToFileController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001426A0000100000001 /* JumpToFileController.swift */; };
 		2706773E242E89F100CFBEE7 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2706773D242E89F100CFBEE7 /* AppDelegate.swift */; };
 		27067740242E89F100CFBEE7 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2706773F242E89F100CFBEE7 /* ContentView.swift */; };
 		E1A0000126A0000100000001 /* WinampSkinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000226A0000100000001 /* WinampSkinStore.swift */; };
@@ -24,6 +25,7 @@
 
 /* Begin PBXFileReference section */
 		E1A0001226A0000100000001 /* TrackNotificationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackNotificationController.swift; sourceTree = "<group>"; };
+		E1A0001426A0000100000001 /* JumpToFileController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JumpToFileController.swift; sourceTree = "<group>"; };
 		2706773A242E89F100CFBEE7 /* macAmp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = macAmp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		2706773D242E89F100CFBEE7 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		2706773F242E89F100CFBEE7 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -73,6 +75,7 @@
 			children = (
 				2706773D242E89F100CFBEE7 /* AppDelegate.swift */,
 				E1A0001226A0000100000001 /* TrackNotificationController.swift */,
+				E1A0001426A0000100000001 /* JumpToFileController.swift */,
 				2706773F242E89F100CFBEE7 /* ContentView.swift */,
 				E1A0000226A0000100000001 /* WinampSkinStore.swift */,
 				E1A0000426A0000100000001 /* InterfaceScale.swift */,
@@ -196,6 +199,7 @@
 				27067740242E89F100CFBEE7 /* ContentView.swift in Sources */,
 				2706773E242E89F100CFBEE7 /* AppDelegate.swift in Sources */,
 				E1A0001126A0000100000001 /* TrackNotificationController.swift in Sources */,
+				E1A0001526A0000100000001 /* JumpToFileController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
