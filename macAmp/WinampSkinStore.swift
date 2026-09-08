@@ -163,6 +163,7 @@ final class WinampSkinStore: ObservableObject {
     private var playlistTimeCache: [String: NSImage] = [:]
     private var playlistWindowShadeTrackCache: [String: NSImage] = [:]
     private var textForegroundColorCache: NSColor?
+    private var textBackgroundColorCache: NSColor?
     private var textForegroundColorResolved = false
     private var playlistColorsCache: PlaylistColors?
     private var skinInformationCache: [String: SkinInformation] = [:]
@@ -963,6 +964,7 @@ final class WinampSkinStore: ObservableObject {
         playlistTimeCache.removeAll()
         playlistWindowShadeTrackCache.removeAll()
         textForegroundColorCache = nil
+        textBackgroundColorCache = nil
         textForegroundColorResolved = false
         playlistColorsCache = nil
         windowRegionCache.removeAll()
@@ -1215,26 +1217,43 @@ final class WinampSkinStore: ObservableObject {
     /// Denon, where the playlist's normal text colour is intentionally dimmer
     /// than the colour of the small bitmap font.
     func textForegroundColor() -> NSColor {
-        if textForegroundColorResolved {
-            return textForegroundColorCache ?? playlistColors().normalText
-        }
+        resolveMainTextColors()
+        return textForegroundColorCache ?? playlistColors().normalText
+    }
+
+    /// Background colour of the main window's scrolling title field.
+    /// Winamp samples this from pixel (150, 4) in `TEXT.BMP` and uses it to
+    /// fill the field before rendering the small bitmap font.
+    func textBackgroundColor() -> NSColor {
+        resolveMainTextColors()
+        return textBackgroundColorCache ?? .black
+    }
+
+    /// Resolves both main-window text colours in one bitmap pass. Keeping the
+    /// pair together mirrors Winamp's `mfont_fgcolor`/`mfont_bgcolor` setup
+    /// and avoids rescanning `TEXT.BMP` when SwiftUI redraws the ticker.
+    private func resolveMainTextColors() {
+        guard !textForegroundColorResolved else { return }
         textForegroundColorResolved = true
 
-        let fallback = playlistColors().normalText
+        let foregroundFallback = playlistColors().normalText
+        let backgroundFallback = NSColor.black
         guard let sheet = bitmap(named: "TEXT.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            textForegroundColorCache = fallback
-            return fallback
+            textForegroundColorCache = foregroundFallback
+            textBackgroundColorCache = backgroundFallback
+            return
         }
         let bitmap = NSBitmapImageRep(cgImage: source)
         guard bitmap.pixelsWide > 0, bitmap.pixelsHigh > 0 else {
-            textForegroundColorCache = fallback
-            return fallback
+            textForegroundColorCache = foregroundFallback
+            textBackgroundColorCache = backgroundFallback
+            return
         }
 
         let backgroundX = min(150, bitmap.pixelsWide - 1)
         let backgroundY = min(4, bitmap.pixelsHigh - 1)
-        let background = bitmap.colorAt(x: backgroundX, y: backgroundY) ?? fallback
+        let background = bitmap.colorAt(x: backgroundX, y: backgroundY) ?? backgroundFallback
         let backgroundRGB = background.usingColorSpace(.deviceRGB) ?? background
         var foreground = background
         var greatestDistance: CGFloat = 0
@@ -1257,7 +1276,7 @@ final class WinampSkinStore: ObservableObject {
         }
 
         textForegroundColorCache = foreground
-        return foreground
+        textBackgroundColorCache = background
     }
 
     private static func color(hex: String) -> NSColor { colorIfValid(hex: hex) ?? .black }

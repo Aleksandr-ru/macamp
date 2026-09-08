@@ -939,6 +939,7 @@ private struct TickerDisplay: View {
 
     var body: some View {
         let textColor = skinTextColor(skin.textForegroundColor())
+        let backgroundColor = skinTextColor(skin.textBackgroundColor())
         ZStack(alignment: .leading) {
             Text(tickerDisplayText)
                 .lineLimit(1)
@@ -949,7 +950,7 @@ private struct TickerDisplay: View {
                 .offset(x: -tickerOffset)
         }
         .frame(width: 154, height: 10, alignment: .topLeading)
-        .background(Color.black.opacity(0.86))
+        .background(backgroundColor)
         .clipped()
         .onAppear {
             resetTicker(for: statusText)
