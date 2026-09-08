@@ -3464,11 +3464,11 @@ private struct PlaylistView: View {
             ])
             playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Sort…", "Misc…"])
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
-                "New", "Load…", "Save As…", "Rename"
+                "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
             ], shortcuts: [
-                "New": .commandN,
-                "Load…": .commandO,
-                "Save As…": .commandShiftS
+                "New Playlist": .commandN,
+                "Load Playlist…": .commandO,
+                "Save Playlist As…": .commandShiftS
             ])
 
             PlaylistStatusField(skin: skin, playback: playback, manager: manager, playlist: playlist)
@@ -3789,10 +3789,10 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Select All": AppDelegate.shared?.selectAllInActivePlaylist()
         case "Select None": AppDelegate.shared?.selectNoneInActivePlaylist()
         case "Invert Selection": AppDelegate.shared?.invertSelectionInActivePlaylist()
-        case "New": AppDelegate.shared?.newPlaylist(nil)
-        case "Load…": AppDelegate.shared?.openDocument(nil)
-        case "Save As…": AppDelegate.shared?.savePlaylistAs(nil)
-        case "Rename": AppDelegate.shared?.renameActivePlaylist()
+        case "New Playlist": AppDelegate.shared?.newPlaylist(nil)
+        case "Load Playlist…": AppDelegate.shared?.openDocument(nil)
+        case "Save Playlist As…": AppDelegate.shared?.savePlaylistAs(nil)
+        case "Rename Playlist": AppDelegate.shared?.renameActivePlaylist()
         default: break
         }
     }
@@ -4268,7 +4268,12 @@ private struct EqualizerView: View {
 
     private func showPresetMenu(at location: CGPoint) {
         let menu = NSMenu()
-        for preset in EqualizerController.factoryPresets {
+        var factoryPresets = EqualizerController.factoryPresets
+        if let flatIndex = factoryPresets.firstIndex(where: { $0.name == "Flat" }) {
+            let flat = factoryPresets.remove(at: flatIndex)
+            factoryPresets.insert(flat, at: 0)
+        }
+        for preset in factoryPresets {
             let item = NSMenuItem(title: preset.name, action: #selector(EqualizerPresetMenuTarget.loadPreset(_:)), keyEquivalent: "")
             item.target = EqualizerPresetMenuTarget.shared
             item.representedObject = PresetSelection(equalizer: equalizer, preset: preset)
