@@ -422,6 +422,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let playback = PlaybackController()
     private let trackNotifications = TrackNotificationController()
     private var pendingTrackNotification: (entry: PlaylistEntry, shouldNotify: Bool)?
+    /// A file opened with the "Play file" preference is not inserted into a
+    /// playlist. Keep its source separate so reaching the end does not
+    /// accidentally advance the active playlist.
+    private var standalonePlaybackURL: URL?
     private let playlistManager = PlaylistManager()
     private var preferencesWindow: NSWindow?
     private var equalizerWindow: NSWindow?
@@ -511,9 +515,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trackNotifications.onNext = { [weak self] in self?.playlistTransportAction(4) }
         trackNotifications.onShowWindows = { [weak self] in self?.showWindowsFromNotification() }
         restorePersistentState()
-        playback.onTrackFinished = { [weak self] in self?.advancePlaylistAfterTrackFinished() }
+        playback.onTrackFinished = { [weak self] in
+            guard let self else { return }
+            if self.standalonePlaybackURL != nil {
+                self.standalonePlaybackURL = nil
+                self.stopPlayback()
+            } else {
+                self.advancePlaylistAfterTrackFinished()
+            }
+        }
         playback.onPlaybackError = { [weak self] url in
             guard let self else { return }
+            if self.standalonePlaybackURL == url {
+                self.standalonePlaybackURL = nil
+                self.pendingTrackNotification = nil
+                self.trackNotifications.invalidate(removeDelivered: true)
+                return
+            }
             self.playlistManager.markPlaybackErrorForActiveEntry(url: url)
             self.advancePlaylistAfterTrackFinished()
         }
@@ -1722,6 +1740,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func pausePlayback() { resetInfoTarget(); playback.pause() }
     func stopPlayback() {
+        standalonePlaybackURL = nil
         resetInfoTarget()
         pendingTrackNotification = nil
         trackNotifications.invalidate(removeDelivered: true)
@@ -1862,11 +1881,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.allowedFileTypes = ["m3u", "m3u8"]
+        panel.allowedFileTypes = (Array(PlaylistManager.supportedExtensions) + ["m3u", "m3u8"]).sorted()
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let playlist = playlistManager.loadPlaylistAsynchronously(from: url) else { NSSound.beep(); return }
-        showPlaylistWindow(for: playlist); connectFileMenu()
+        guard handleOpenedFiles([url]) else { NSSound.beep(); return }
     }
 
     @objc private func importSkin(_ sender: Any?) {
@@ -1874,17 +1892,73 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map(URL.init(fileURLWithPath:))
+        let didOpen = handleOpenedFiles(urls)
+        sender.reply(toOpenOrPrint: didOpen ? .success : .failure)
+    }
+
+    /// Handles both document types accepted by the app. Playlist documents
+    /// retain their existing import behaviour; audio documents use the
+    /// preference selected in Settings.
+    @discardableResult
+    private func handleOpenedFiles(_ urls: [URL]) -> Bool {
         var didOpen = false
-        for filename in filenames {
-            let url = URL(fileURLWithPath: filename)
-            if ["m3u", "m3u8"].contains(url.pathExtension.lowercased()),
-               let playlist = playlistManager.loadPlaylistAsynchronously(from: url) {
-                showPlaylistWindow(for: playlist)
-                connectFileMenu()
-                didOpen = true
+        var audioURLs: [URL] = []
+
+        for url in urls {
+            let extensionName = url.pathExtension.lowercased()
+            if ["m3u", "m3u8"].contains(extensionName) {
+                if let playlist = playlistManager.loadPlaylistAsynchronously(from: url) {
+                    showPlaylistWindow(for: playlist)
+                    connectFileMenu()
+                    didOpen = true
+                }
+            } else if PlaylistManager.supportedExtensions.contains(extensionName) {
+                audioURLs.append(url)
             }
         }
-        sender.reply(toOpenOrPrint: didOpen ? .success : .failure)
+
+        guard !audioURLs.isEmpty else { return didOpen }
+        switch openMusicFileAction {
+        case .play:
+            // The menu opens one file. If Finder supplies several paths, use
+            // the first one just as the single-file Open panel does.
+            playOpenedMusicFile(audioURLs[0])
+        case .addToActivePlaylist:
+            guard let playlist = playlistManager.activePlaylist else { return didOpen }
+            playlistManager.addFiles(audioURLs, to: playlist)
+            showPlaylistWindow(for: playlist)
+        case .addToDefaultPlaylist:
+            let playlist = defaultPlaylist()
+            playlistManager.addFiles(audioURLs, to: playlist)
+            showPlaylistWindow(for: playlist)
+        }
+        return true
+    }
+
+    private var openMusicFileAction: OpenMusicFileAction {
+        guard let rawValue = UserDefaults.standard.string(forKey: OpenMusicFileAction.preferenceKey),
+              let action = OpenMusicFileAction(rawValue: rawValue) else { return .play }
+        return action
+    }
+
+    private func defaultPlaylist() -> PlaylistModel {
+        if let playlist = playlistManager.playlists.first(where: {
+            $0.name.caseInsensitiveCompare("Default") == .orderedSame
+        }) {
+            return playlist
+        }
+        return playlistManager.createPlaylist(name: "Default")
+    }
+
+    private func playOpenedMusicFile(_ url: URL) {
+        let entry = PlaylistEntry(url: url)
+        standalonePlaybackURL = url
+        resetInfoTarget()
+        prepareTrackNotification(for: entry, automatic: false)
+        playback.open(url, displayTitle: entry.title)
+        observePlayingEntryTitle(entry)
+        infoModel.showForPlayback(url)
     }
 
     @objc func newPlaylist(_ sender: Any?) {
@@ -1980,6 +2054,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Error-marked rows are retried only through a direct double-click in
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
+        standalonePlaybackURL = nil
         // Transport commands must not disturb a list the user is already
         // reading. Centre only when the newly playing row is outside its
         // current viewport (including a shuffle jump to a distant row).
@@ -2001,6 +2076,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resetInfoTarget()
         // A direct row activation is the sole retry route for a failed item.
         // Keep its marker until PlaybackController confirms it opened.
+        standalonePlaybackURL = nil
         let shouldReveal = revealIfNotVisible && !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry, automatic: false)
@@ -2037,6 +2113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// source: resume its last cursor, otherwise use selection, then entry 1.
     func playFromActivePlaylist() {
         resetInfoTarget()
+        standalonePlaybackURL = nil
         guard let playlist = playlistManager.activePlaylist,
               let entry = playlistManager.preferredEntryToPlay(in: playlist) else { return }
         if playback.currentURL == entry.url {
@@ -3292,6 +3369,24 @@ private struct PlaylistStatusField: View {
     }
 }
 
+private enum OpenMusicFileAction: String, CaseIterable, Identifiable {
+    case play
+    case addToActivePlaylist
+    case addToDefaultPlaylist
+
+    static let preferenceKey = "macAmp.openMusicFileAction"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .play: return "Play file"
+        case .addToActivePlaylist: return "Add to active playlist"
+        case .addToDefaultPlaylist: return "Add to \"Default\" playlist (created if missing)"
+        }
+    }
+}
+
 private struct SettingsView: View {
     private enum Tab: Hashable {
         case general
@@ -3306,6 +3401,7 @@ private struct SettingsView: View {
     @ObservedObject var equalizer: EqualizerController
     @ObservedObject var visualization: PlaybackVisualizationState
     @ObservedObject var skin: WinampSkinStore
+    @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
     @State private var selectedTab: Tab = .general
 
     var body: some View {
@@ -3357,6 +3453,16 @@ private struct SettingsView: View {
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
             Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
             Toggle("Show Peaks", isOn: $visualization.showsPeaks)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("When opening a music file")
+                Picker("When opening a music file", selection: $openMusicFileActionRawValue) {
+                    ForEach(OpenMusicFileAction.allCases) { action in
+                        Text(action.title).tag(action.rawValue)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+            }
             Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
                 ForEach(AdaptiveEQCorrectionRange.allCases) { range in
                     Text(range.title).tag(range)
