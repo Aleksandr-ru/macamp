@@ -3711,6 +3711,7 @@ private struct PlaylistView: View {
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var manager: PlaylistManager
     @ObservedObject var playlist: PlaylistModel
+    @State private var dropInsertionIndex: Int?
 
     var body: some View {
         Group {
@@ -3890,74 +3891,7 @@ private struct PlaylistView: View {
         _ = playlist.metadataRevision
         return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    // Indices shift after a removal.  They must not be the
-                    // row identity: otherwise LazyVStack may reuse a middle
-                    // button with the action captured for the old entry.
-                    ForEach(Array(playlist.entries.enumerated()), id: \.element.id) { index, entry in
-                        Button(action: {
-                            let event = NSApp.currentEvent
-                            let modifiers = event?.modifierFlags ?? []
-                            manager.selectEntry(
-                                entry,
-                                in: playlist,
-                                extending: modifiers.contains(.shift),
-                                toggling: modifiers.contains(.command)
-                            )
-                            AppDelegate.shared?.selectInfoTarget(entry)
-                            // Keep double-click playback in the button action
-                            // itself. A separate simultaneous recognizer can
-                            // retain stale tap state when LazyVStack recycles
-                            // rows after removal, causing later single clicks
-                            // to be lost.
-                            if event?.clickCount == 2 {
-                                AppDelegate.shared?.playPlaylistEntryFromSelection(entry, in: playlist)
-                            }
-                        }) {
-                            let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
-                            let isSelected = playlist.selectedIDs.contains(entry.id)
-                            let rowLabel = entry.hasPlaybackError ? "!" : String(index + 1)
-                            HStack(spacing: 3) {
-                                // `Text` string interpolation is localised by
-                                // SwiftUI and can insert a thousands separator
-                                // (e.g. "1 000") for Int values. Playlist row
-                                // numbers are identifiers, not quantities.
-                                Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
-                                Spacer(minLength: 2)
-                                Text(entry.duration.map(formattedTime) ?? "--:--")
-                            }
-                            .font(Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))))
-                            // draw_pe.cpp: bit 2 (current) selects the text
-                            // colour; bit 1 (selection) selects only the row
-                            // background.  A selected current entry is white
-                            // on the skin's SelectedBG, never black or green.
-                            .foregroundColor(playlistColor(isPlayingEntry ? colors.currentText : colors.normalText))
-                            .padding(.horizontal, 2)
-                            // A vertical ScrollView does not guarantee that
-                            // its lazy children receive the viewport width.
-                            // Make the whole visual row — not only its text —
-                            // the button's hit target after list mutations.
-                            .frame(maxWidth: .infinity, minHeight: entryHeight, alignment: .leading)
-                            .background(playlistColor(isSelected ? colors.selectedBackground : colors.background))
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(PlainButtonStyle())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .id(entry.id)
-                    }
-                }
-                // Stable entry IDs preserve normal row updates, while this
-                // coarse identity changes only after insertion/removal. It
-                // prevents LazyVStack from retaining stale drawing hosts for
-                // rows that moved to another index after deletion.
-                .id(playlist.structureRevision)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(GeometryReader { geometry in
-                    Color.clear.preference(
-                        key: PlaylistScrollOffsetKey.self,
-                        value: geometry.frame(in: .named("playlistEntries")).minY
-                    )
-                })
+                playlistRows(entryHeight: entryHeight)
             }
             .coordinateSpace(name: "playlistEntries")
             .background(playlistColor(colors.background))
@@ -4006,22 +3940,112 @@ private struct PlaylistView: View {
                     visibleCount: visiblePlaylistEntryCount
                 )
             }
-            .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
-                for provider in providers {
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                        guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                        var isDirectory: ObjCBool = false
-                        DispatchQueue.main.async {
-                            if ["m3u", "m3u8"].contains(url.pathExtension.lowercased()) {
-                                AppDelegate.shared?.openPlaylistURL(url)
-                            } else if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue { manager.addFolder(url, to: playlist) }
-                            else { manager.addFiles([url], to: playlist) }
-                        }
-                    }
-                }
-                return true
+        }
+    }
+
+    private func playlistRows(entryHeight: CGFloat) -> some View {
+        let colors = skin.playlistColors()
+        let dropIndicatorColor = playlistColor(colors.normalText)
+        return LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(playlist.entries.enumerated()), id: \.element.id) { index, entry in
+                playlistRow(
+                    index: index,
+                    entry: entry,
+                    entryHeight: entryHeight,
+                    colors: colors,
+                    dropIndicatorColor: dropIndicatorColor
+                )
             }
         }
+        // Stable entry IDs preserve normal row updates, while this
+        // coarse identity changes only after insertion/removal. It
+        // prevents LazyVStack from retaining stale drawing hosts for
+        // rows that moved to another index after deletion.
+        .id(playlist.structureRevision)
+        .frame(maxWidth: .infinity, minHeight: max(1, layout.height - 58), alignment: .topLeading)
+        .overlay(
+            Group {
+                if playlist.entries.isEmpty, dropInsertionIndex == 0 {
+                    Rectangle()
+                        .fill(dropIndicatorColor)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 1)
+                }
+            },
+            alignment: .top
+        )
+        .overlay(
+            Group {
+                if !playlist.entries.isEmpty, dropInsertionIndex == playlist.entries.count {
+                    Rectangle()
+                        .fill(dropIndicatorColor)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 1)
+                }
+            },
+            alignment: .bottom
+        )
+        .background(GeometryReader { geometry in
+            Color.clear.preference(
+                key: PlaylistScrollOffsetKey.self,
+                value: geometry.frame(in: .named("playlistEntries")).minY
+            )
+        })
+        .background(
+            PlaylistDropBackground(
+                manager: manager,
+                playlist: playlist,
+                entryHeight: entryHeight,
+                insertionIndex: $dropInsertionIndex
+            )
+        )
+    }
+
+    private func playlistRow(
+        index: Int,
+        entry: PlaylistEntry,
+        entryHeight: CGFloat,
+        colors: WinampSkinStore.PlaylistColors,
+        dropIndicatorColor: Color
+    ) -> some View {
+        let isSelected = playlist.selectedIDs.contains(entry.id)
+        let rowLabel = entry.hasPlaybackError ? "!" : String(index + 1)
+        return ZStack {
+            let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
+            HStack(spacing: 3) {
+                Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
+                Spacer(minLength: 2)
+                Text(entry.duration.map(formattedTime) ?? "--:--")
+            }
+            .font(Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))))
+            .foregroundColor(playlistColor(isPlayingEntry ? colors.currentText : colors.normalText))
+            .padding(.horizontal, 2)
+            .frame(maxWidth: .infinity, minHeight: entryHeight, alignment: .leading)
+            .background(playlistColor(isSelected ? colors.selectedBackground : colors.background))
+            .contentShape(Rectangle())
+
+            PlaylistRowInteractionArea(
+                manager: manager,
+                playlist: playlist,
+                entry: entry,
+                index: index,
+                insertionIndex: $dropInsertionIndex
+            )
+                .frame(maxWidth: .infinity, minHeight: entryHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(
+            Group {
+                if dropInsertionIndex == index {
+                    Rectangle()
+                        .fill(dropIndicatorColor)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 1)
+                }
+            },
+            alignment: .top
+        )
+        .id(entry.id)
     }
 
     /// Leave the original 13-pixel row untouched at 100%; larger text gains
@@ -4110,6 +4134,247 @@ private struct PlaylistScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+/// Receives a drop in the unoccupied part of the playlist, including an empty
+/// playlist and the area below the final row.
+private struct PlaylistDropBackground: NSViewRepresentable {
+    let manager: PlaylistManager
+    let playlist: PlaylistModel
+    let entryHeight: CGFloat
+    @Binding var insertionIndex: Int?
+
+    func makeNSView(context: Context) -> PlaylistDropTargetNSView {
+        let view = PlaylistDropTargetNSView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaylistDropTargetNSView, context: Context) {
+        nsView.manager = manager
+        nsView.playlist = playlist
+        nsView.insertionIndex = { insertionIndex = $0 }
+        nsView.indexForLocation = { location, bounds in
+            guard entryHeight > 0 else { return 0 }
+            // AppKit coordinates start at the bottom, unlike the SwiftUI list.
+            let fromTop = max(0, bounds.height - location.y)
+            let row = Int(fromTop / entryHeight)
+            return min(playlist.entries.count, max(0, row))
+        }
+    }
+}
+
+/// The playlist lives in a borderless AppKit window. Its rows own both the
+/// mouse gesture and the drop target so the complete transfer stays inside
+/// AppKit instead of crossing SwiftUI's unreliable drag bridge here.
+private struct PlaylistRowInteractionArea: NSViewRepresentable {
+    let manager: PlaylistManager
+    let playlist: PlaylistModel
+    let entry: PlaylistEntry
+    let index: Int
+    @Binding var insertionIndex: Int?
+
+    func makeNSView(context: Context) -> PlaylistRowInteractionNSView {
+        let view = PlaylistRowInteractionNSView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaylistRowInteractionNSView, context: Context) {
+        nsView.manager = manager
+        nsView.playlist = playlist
+        nsView.entry = entry
+        nsView.insertionIndex = { insertionIndex = $0 }
+        nsView.indexForLocation = { location, bounds in
+            // AppKit's y axis points upward: upper half is before this row,
+            // lower half is after it.
+            index + (location.y < bounds.height / 2 ? 1 : 0)
+        }
+    }
+}
+
+private class PlaylistDropTargetNSView: NSView {
+    weak var manager: PlaylistManager?
+    weak var playlist: PlaylistModel?
+    var insertionIndex: ((Int?) -> Void)?
+    var indexForLocation: ((NSPoint, NSRect) -> Int)?
+
+    override var isOpaque: Bool { false }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([
+            NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier),
+            .fileURL
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([
+            NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier),
+            .fileURL
+        ])
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let operation = dropOperation(for: sender)
+        guard operation != [] else {
+            insertionIndex?(nil)
+            return []
+        }
+        insertionIndex?(dropIndex(for: sender))
+        return operation
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        insertionIndex?(nil)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer { insertionIndex?(nil) }
+        guard let manager, let playlist, playlist.sortingProgress == nil else { return false }
+        let pasteboard = sender.draggingPasteboard
+        let index = dropIndex(for: sender)
+        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier)),
+           let payload = try? JSONDecoder().decode(PlaylistDragPayload.self, from: data),
+           payload.sourcePlaylistID != playlist.id {
+            manager.moveDraggedEntries(payload, to: playlist, at: index)
+            return true
+        }
+        let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        guard !urls.isEmpty else { return false }
+        let audioURLs = urls.filter { PlaylistManager.supportedExtensions.contains($0.pathExtension.lowercased()) }
+        manager.addFiles(audioURLs, to: playlist, at: index)
+        let nextIndex = min(index + audioURLs.count, playlist.entries.count)
+        for url in urls where !audioURLs.contains(url) {
+            if ["m3u", "m3u8"].contains(url.pathExtension.lowercased()) {
+                AppDelegate.shared?.openPlaylistURL(url)
+                continue
+            }
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                manager.addFolder(url, to: playlist, at: nextIndex)
+            }
+        }
+        return true
+    }
+
+    private func dropOperation(for sender: NSDraggingInfo) -> NSDragOperation {
+        guard let playlist, playlist.sortingProgress == nil else { return [] }
+        let pasteboard = sender.draggingPasteboard
+        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier)),
+           let payload = try? JSONDecoder().decode(PlaylistDragPayload.self, from: data) {
+            return payload.sourcePlaylistID != playlist.id ? .move : []
+        }
+        // Dropping from Finder only creates playlist entries; it must never
+        // ask Finder to remove or relocate the original filesystem objects.
+        return pasteboard.availableType(from: [.fileURL]) != nil ? .copy : []
+    }
+
+    private func dropIndex(for sender: NSDraggingInfo) -> Int {
+        let point = convert(sender.draggingLocation, from: nil)
+        return indexForLocation?(point, bounds) ?? 0
+    }
+}
+
+private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDraggingSource {
+    weak var entry: PlaylistEntry?
+
+    override func mouseDown(with event: NSEvent) {
+        guard let manager, let playlist, let entry else { return }
+        let modifiers = event.modifierFlags
+        let retainsSelectionForDrag = event.clickCount == 1
+            && modifiers.intersection([.shift, .command]).isEmpty
+            && playlist.selectedIDs.contains(entry.id)
+            && playlist.selectedIDs.count > 1
+        if !retainsSelectionForDrag {
+            manager.selectEntry(
+                entry,
+                in: playlist,
+                extending: modifiers.contains(.shift),
+                toggling: modifiers.contains(.command)
+            )
+        }
+        AppDelegate.shared?.selectInfoTarget(entry)
+        if event.clickCount == 2 {
+            AppDelegate.shared?.playPlaylistEntryFromSelection(entry, in: playlist)
+            return
+        }
+
+        guard let payload = manager.dragPayload(for: entry, in: playlist),
+              let data = try? JSONEncoder().encode(payload),
+              let window else { return }
+        let start = event.locationInWindow
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp {
+                if retainsSelectionForDrag {
+                    manager.selectEntry(entry, in: playlist, extending: false, toggling: false)
+                }
+                return
+            }
+            let point = next.locationInWindow
+            let distance = hypot(point.x - start.x, point.y - start.y)
+            guard distance >= 3 else { continue }
+
+            let pasteboardItem = NSPasteboardItem()
+            pasteboardItem.setData(
+                data,
+                forType: NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier)
+            )
+            let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+            draggingItem.setDraggingFrame(
+                NSRect(origin: bounds.origin, size: dragImageSize),
+                contents: dragImage(trackCount: payload.entryIDs.count, sampleURL: entry.url)
+            )
+            beginDraggingSession(with: [draggingItem], event: event, source: self)
+            return
+        }
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        context == .withinApplication ? .move : []
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
+
+    private var dragImageSize: NSSize { NSSize(width: 44, height: 44) }
+
+    /// Mirrors Finder's visual language: a file icon with a circular count
+    /// badge for a multi-item drag, rather than a playlist-specific label.
+    private func dragImage(trackCount: Int, sampleURL: URL) -> NSImage {
+        let size = dragImageSize
+        let image = NSImage(size: size)
+        image.lockFocus()
+        let icon = NSWorkspace.shared.icon(forFile: sampleURL.path)
+        icon.size = NSSize(width: 36, height: 36)
+        icon.draw(in: NSRect(x: 1, y: 5, width: 36, height: 36))
+        if trackCount > 1 {
+            let badgeRect = NSRect(x: 25, y: 0, width: 19, height: 19)
+            NSColor.controlAccentColor.setFill()
+            NSBezierPath(ovalIn: badgeRect).fill()
+            let text = String(trackCount)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.boldSystemFont(ofSize: 10),
+                .foregroundColor: NSColor.white
+            ]
+            let textSize = (text as NSString).size(withAttributes: attributes)
+            (text as NSString).draw(
+                at: NSPoint(x: badgeRect.midX - textSize.width / 2, y: badgeRect.midY - textSize.height / 2),
+                withAttributes: attributes
+            )
+        }
+        image.unlockFocus()
+        return image
     }
 }
 

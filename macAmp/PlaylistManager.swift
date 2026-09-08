@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 /// The persistent, window-independent playlist domain model.  Windows only
 /// render this state; hiding a window never destroys a playlist or its work.
@@ -92,6 +93,15 @@ final class PlaylistModel: ObservableObject, Identifiable {
         cachedTotalDuration += (updated ?? 0) - (previous ?? 0)
     }
     func clearTotalDuration() { cachedTotalDuration = 0 }
+}
+
+struct PlaylistDragPayload: Codable {
+    let sourcePlaylistID: UUID
+    let entryIDs: [UUID]
+}
+
+enum PlaylistDragTransfer {
+    static let typeIdentifier = "ru.aleksandr.macAmp.playlist-entry"
 }
 
 /// Single authority for opening, saving and scanning playlists.  Its queues are
@@ -926,19 +936,20 @@ final class PlaylistManager: ObservableObject {
         return source.map(\.entry)
     }
 
-    func addFiles(_ urls: [URL], to playlist: PlaylistModel) {
+    func addFiles(_ urls: [URL], to playlist: PlaylistModel, at insertionIndex: Int? = nil) {
         let audio = urls.filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
         guard !audio.isEmpty else { return }
         let entries = audio.map { PlaylistEntry(url: $0, bookmarkData: securityScopedBookmark(for: $0)) }
         propagateBookmarks(from: entries)
-        playlist.entries.append(contentsOf: entries)
+        let index = min(max(0, insertionIndex ?? playlist.entries.count), playlist.entries.count)
+        playlist.entries.insert(contentsOf: entries, at: index)
         playlist.structureRevision &+= 1
         playlist.appendToTotalDuration(entries)
         markEntriesDirty(in: playlist)
         playlist.isDirty = true; playlist.scannerState = .adding(playlist.entries.count); save(); finishEntryLoading(playlist)
     }
 
-    func addFolder(_ folder: URL, to playlist: PlaylistModel) {
+    func addFolder(_ folder: URL, to playlist: PlaylistModel, at insertionIndex: Int? = nil) {
         cancelledFolderPlaylistIDs.remove(playlist.id)
         folderQueue.async { [weak self, weak playlist] in
             guard let self, let playlist else { return }
@@ -946,13 +957,17 @@ final class PlaylistManager: ObservableObject {
             let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
             guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]) else { return }
             var batch: [URL] = []
+            var nextInsertionIndex = insertionIndex
             for case let url as URL in enumerator {
                 if Date() >= deadline || self.cancelledFolderPlaylistIDs.contains(playlist.id) { break }
                 guard Self.supportedExtensions.contains(url.pathExtension.lowercased()) else { continue }
                 batch.append(url)
-                if batch.count == 32 { self.appendBatch(batch, to: playlist); batch.removeAll() }
+                if batch.count == 32 {
+                    nextInsertionIndex = self.appendBatch(batch, to: playlist, at: nextInsertionIndex)
+                    batch.removeAll()
+                }
             }
-            self.appendBatch(batch, to: playlist)
+            _ = self.appendBatch(batch, to: playlist, at: nextInsertionIndex)
             DispatchQueue.main.async { self.finishEntryLoading(playlist) }
         }
     }
@@ -1230,6 +1245,87 @@ final class PlaylistManager: ObservableObject {
     func selectNone(in playlist: PlaylistModel) { playlist.selectedIDs.removeAll(); save() }
     func invertSelection(in playlist: PlaylistModel) { playlist.selectedIDs = Set(playlist.entries.map(\.id)).subtracting(playlist.selectedIDs); save() }
 
+    /// Dragging a selected row carries the complete selection in playlist order.
+    /// Starting a drag from an unselected row keeps the native list behaviour
+    /// useful by carrying that row alone.
+    func dragPayload(for entry: PlaylistEntry, in playlist: PlaylistModel) -> PlaylistDragPayload? {
+        let draggedEntries: [PlaylistEntry]
+        if playlist.selectedIDs.contains(entry.id) {
+            draggedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        } else {
+            draggedEntries = [entry]
+        }
+        guard !draggedEntries.isEmpty else { return nil }
+        return PlaylistDragPayload(
+            sourcePlaylistID: playlist.id,
+            entryIDs: draggedEntries.map(\.id)
+        )
+    }
+
+    /// Kept for SwiftUI drop integrations. The actual source gesture is
+    /// AppKit-owned because a borderless hosting view does not reliably start
+    /// SwiftUI's onDrag session from a Button row.
+    func dragProvider(for entry: PlaylistEntry, in playlist: PlaylistModel) -> NSItemProvider {
+        guard let payload = dragPayload(for: entry, in: playlist),
+              let data = try? JSONEncoder().encode(payload) else { return NSItemProvider() }
+        // Use an item-backed provider so AppKit advertises the custom type as
+        // soon as the drag session begins; lazy-only representations can be
+        // ignored by SwiftUI on borderless hosting windows.
+        return NSItemProvider(item: data as NSData, typeIdentifier: PlaylistDragTransfer.typeIdentifier)
+    }
+
+    /// Moves entry objects, rather than re-creating them, so bookmarks,
+    /// playback errors and metadata already read remain intact.
+    func moveDraggedEntries(_ payload: PlaylistDragPayload, to destination: PlaylistModel, at insertionIndex: Int) {
+        guard let source = playlist(id: payload.sourcePlaylistID),
+              source.id != destination.id,
+              playlists.contains(where: { $0.id == destination.id }),
+              source.sortingProgress == nil,
+              destination.sortingProgress == nil,
+              !payload.entryIDs.isEmpty else { return }
+
+        let requestedIDs = Set(payload.entryIDs)
+        let movingEntries = source.entries.filter { requestedIDs.contains($0.id) }
+        guard !movingEntries.isEmpty else { return }
+        let movingIDs = Set(movingEntries.map(\.id))
+        let targetIndex = min(max(0, insertionIndex), destination.entries.count)
+        let movedPlayingEntry = playingEntryID.map(movingIDs.contains) == true
+        let movedLastPlayedEntry = source.lastPlayedEntryID.flatMap { movingIDs.contains($0) ? $0 : nil }
+
+        source.entries.removeAll { movingIDs.contains($0.id) }
+        destination.entries.insert(contentsOf: movingEntries, at: targetIndex)
+        source.selectedIDs.subtract(movingIDs)
+        // A move establishes the transferred rows as the destination's sole
+        // active selection, matching Finder-style list dragging.
+        destination.selectedIDs = movingIDs
+        if movedLastPlayedEntry != nil {
+            source.lastPlayedEntryID = nil
+            if destination.lastPlayedEntryID == nil {
+                destination.lastPlayedEntryID = movedLastPlayedEntry
+            }
+        }
+        if movedPlayingEntry {
+            // Keep the playing object and playback engine intact, but make the
+            // destination the source for subsequent next/previous commands.
+            activePlaylistID = destination.id
+        }
+        source.scrollPosition = min(source.scrollPosition, max(0, source.entries.count - 1))
+        source.structureRevision &+= 1
+        destination.structureRevision &+= 1
+        source.recalculateTotalDuration()
+        destination.appendToTotalDuration(movingEntries)
+        source.isDirty = true
+        destination.isDirty = true
+        repairTrackReferences(in: source)
+        markEntriesDirty(in: source)
+        markEntriesDirty(in: destination)
+        metadataPriorityRevision &+= 1
+        scheduleMetadata(for: source)
+        scheduleMetadata(for: destination)
+        requestMetadataReprioritization()
+        save()
+    }
+
     func savePlaylist(_ playlist: PlaylistModel, to url: URL) throws {
         try extendedM3UContents(for: playlist).write(to: url, atomically: true, encoding: .utf8)
         playlist.fileURL = url.resolvingSymlinksInPath().standardizedFileURL
@@ -1310,12 +1406,15 @@ final class PlaylistManager: ObservableObject {
         }
     }
 
-    private func appendBatch(_ batch: [URL], to playlist: PlaylistModel) {
-        guard !batch.isEmpty else { return }
+    private func appendBatch(_ batch: [URL], to playlist: PlaylistModel, at insertionIndex: Int?) -> Int? {
+        guard !batch.isEmpty else { return insertionIndex }
+        var followingIndex: Int?
         DispatchQueue.main.sync {
             let entries = batch.map { PlaylistEntry(url: $0, bookmarkData: self.securityScopedBookmark(for: $0)) }
             self.propagateBookmarks(from: entries)
-            playlist.entries.append(contentsOf: entries)
+            let index = min(max(0, insertionIndex ?? playlist.entries.count), playlist.entries.count)
+            playlist.entries.insert(contentsOf: entries, at: index)
+            followingIndex = index + entries.count
             playlist.structureRevision &+= 1
             playlist.appendToTotalDuration(entries)
             self.markEntriesDirty(in: playlist)
@@ -1323,6 +1422,7 @@ final class PlaylistManager: ObservableObject {
             self.scheduleMetadata(for: playlist)
             self.save()
         }
+        return followingIndex
     }
 
     private func finishEntryLoading(_ playlist: PlaylistModel) {
@@ -1483,10 +1583,13 @@ final class PlaylistManager: ObservableObject {
             metadataAssetLock.unlock()
             guard metadataInFlightRequests[work.entry.id] == work.requestID else { return }
             metadataInFlightRequests.removeValue(forKey: work.entry.id)
-            guard !wasCancelled, !pausedPlaylistIDs.contains(work.playlist.id), work.playlist.sortingProgress == nil, !work.entry.metadataIsAvailable else { return }
+            guard let owner = playlists.first(where: { playlist in
+                playlist.entries.contains { $0.id == work.entry.id }
+            }) else { return }
+            guard !wasCancelled, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, !work.entry.metadataIsAvailable else { return }
             let previousDuration = work.entry.duration
             work.entry.duration = result.duration
-            work.playlist.replaceTotalDuration(previousDuration, with: result.duration)
+            owner.replaceTotalDuration(previousDuration, with: result.duration)
             let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
             let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
@@ -1510,25 +1613,25 @@ final class PlaylistManager: ObservableObject {
             // A timeout/error is still a completed attempt; retrying it forever
             // would prevent lower-priority entries from ever being scanned.
             work.entry.metadataIsAvailable = true
-            markEntriesDirty(in: work.playlist)
-            let previous = metadataProgress[work.playlist.id] ?? (0, work.total)
-            let progress = (previous.processed + 1, max(previous.total, work.total))
-            metadataProgress[work.playlist.id] = progress
+            markEntriesDirty(in: owner)
+            let previous = metadataProgress[owner.id] ?? (0, owner.entries.count)
+            let progress = (previous.processed + 1, max(previous.total, owner.entries.count))
+            metadataProgress[owner.id] = progress
             // A visible row must update as soon as its metadata arrives. Keep
             // background rows batched, however, so a large off-screen scan
             // does not invalidate the playlist editor for every file.
-            let visibleStart = min(max(0, work.playlist.scrollPosition), work.playlist.entries.count)
-            let visibleEnd = min(work.playlist.entries.count, visibleStart + work.playlist.visibleEntryCount)
-            let completedEntryIsVisible = work.playlist.entries[visibleStart..<visibleEnd]
+            let visibleStart = min(max(0, owner.scrollPosition), owner.entries.count)
+            let visibleEnd = min(owner.entries.count, visibleStart + owner.visibleEntryCount)
+            let completedEntryIsVisible = owner.entries[visibleStart..<visibleEnd]
                 .contains { $0.id == work.entry.id }
             let shouldPublishUpdate = completedEntryIsVisible
                 || progress.0 == progress.1
                 || progress.0.isMultiple(of: 8)
-            if !isLoadingEntries(work.playlist),
+            if !isLoadingEntries(owner),
                shouldPublishUpdate {
-                work.playlist.scannerState = .readingMetadata(processed: progress.0, total: progress.1)
+                owner.scannerState = .readingMetadata(processed: progress.0, total: progress.1)
             }
-            if shouldPublishUpdate { work.playlist.metadataRevision &+= 1 }
+            if shouldPublishUpdate { owner.metadataRevision &+= 1 }
         }
         DispatchQueue.main.async(execute: applyResult)
         let priorityChanged = DispatchQueue.main.sync {
