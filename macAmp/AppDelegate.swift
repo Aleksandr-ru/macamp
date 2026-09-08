@@ -2399,6 +2399,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// same URL represented by the Playlist Editor row.
     func revealInFinder(for playlist: PlaylistModel) {
         guard let url = revealInFinderTarget(for: playlist), url.isFileURL, !url.path.isEmpty else { return }
+        revealInFinder(url: url)
+    }
+
+    func revealInFinder(url: URL) {
+        guard url.isFileURL, !url.path.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
@@ -4430,6 +4435,55 @@ private class PlaylistDropTargetNSView: NSView {
 private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDraggingSource {
     weak var entry: PlaylistEntry?
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let manager, let playlist, let entry else { return nil }
+        // A context click on an unselected row establishes that row as the
+        // selection. Clicking an already selected row preserves a multi-
+        // selection for Remove/Crop/Rate operations.
+        if !playlist.selectedIDs.contains(entry.id) {
+            manager.selectEntry(entry, in: playlist, extending: false, toggling: false)
+            AppDelegate.shared?.selectInfoTarget(entry)
+        }
+        let target = PlaylistContextMenuTarget(manager: manager, playlist: playlist, entry: entry)
+        let menu = NSMenu()
+        menu.addItem(contextItem("Play item", action: #selector(PlaylistContextMenuTarget.playItem(_:)), target: target))
+        menu.addItem(contextItem("Remove item(s)", action: #selector(PlaylistContextMenuTarget.removeItems(_:)), target: target))
+        menu.addItem(contextItem("Crop files", action: #selector(PlaylistContextMenuTarget.cropFiles(_:)), target: target))
+        menu.addItem(.separator())
+        let edit = contextItem("Edit metadata", action: #selector(PlaylistContextMenuTarget.editMetadata(_:)), target: target)
+        edit.isEnabled = false
+        menu.addItem(edit)
+        let viewInfo = contextItem("View file info", action: #selector(PlaylistContextMenuTarget.viewInfo(_:)), target: target)
+        viewInfo.isEnabled = playlist.selectedIDs.count <= 1
+            && AppDelegate.shared?.fileInfoTarget(for: playlist) != nil
+        menu.addItem(viewInfo)
+
+        let rate = NSMenuItem(title: "Rate items", action: nil, keyEquivalent: "")
+        let rateMenu = NSMenu(title: "Rate items")
+        ["None", "★", "★★", "★★★", "★★★★", "★★★★★"].forEach {
+            rateMenu.addItem(contextItem($0, action: #selector(PlaylistContextMenuTarget.rateItems(_:)), target: target))
+        }
+        rate.submenu = rateMenu
+        menu.addItem(rate)
+        menu.addItem(.separator())
+        let reveal = contextItem("Reveal in Finder", action: #selector(PlaylistContextMenuTarget.revealInFinder(_:)), target: target)
+        reveal.isEnabled = entry.url.isFileURL && !entry.url.path.isEmpty
+        menu.addItem(reveal)
+        if playlist.sortingProgress != nil {
+            menu.items.forEach { $0.isEnabled = false }
+            rate.isEnabled = false
+        }
+        return menu
+    }
+
+    private func contextItem(_ title: String, action: Selector, target: PlaylistContextMenuTarget) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = target
+        // Keep the short-lived target alive while the menu is being shown.
+        item.representedObject = target
+        return item
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard let manager, let playlist, let entry else { return }
         let modifiers = event.modifierFlags
@@ -4519,6 +4573,27 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
         image.unlockFocus()
         return image
     }
+}
+
+private final class PlaylistContextMenuTarget: NSObject {
+    let manager: PlaylistManager
+    let playlist: PlaylistModel
+    let entry: PlaylistEntry
+
+    init(manager: PlaylistManager, playlist: PlaylistModel, entry: PlaylistEntry) {
+        self.manager = manager; self.playlist = playlist; self.entry = entry
+    }
+
+    @objc func playItem(_ sender: NSMenuItem) {
+        AppDelegate.shared?.playPlaylistEntryFromSelection(entry, in: playlist)
+    }
+
+    @objc func removeItems(_ sender: NSMenuItem) { manager.removeSelected(from: playlist) }
+    @objc func cropFiles(_ sender: NSMenuItem) { manager.cropToSelection(playlist) }
+    @objc func editMetadata(_ sender: NSMenuItem) {}
+    @objc func viewInfo(_ sender: NSMenuItem) { AppDelegate.shared?.showFileInfo(for: playlist) }
+    @objc func rateItems(_ sender: NSMenuItem) {}
+    @objc func revealInFinder(_ sender: NSMenuItem) { AppDelegate.shared?.revealInFinder(url: entry.url) }
 }
 
 /// AppKit receives the original mouse-down event, which is required to open a
