@@ -41,7 +41,26 @@ enum RepeatMode: Int, CaseIterable {
 /// frames do not invalidate the whole player interface.
 final class PlaybackVisualizationState: ObservableObject {
     @Published var spectrumLevels = Array(repeating: CGFloat(0), count: 16)
+    /// The peak marker is kept separately from the bar levels.  Winamp's
+    /// classic renderer lets each marker fall independently of its column.
+    @Published var spectrumPeaks = Array(repeating: CGFloat(0), count: 16)
     @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
+
+    private static let showsPeaksPreferenceKey = "macAmp.visualization.showsPeaks"
+
+    @Published var showsPeaks: Bool {
+        didSet {
+            guard oldValue != showsPeaks else { return }
+            UserDefaults.standard.set(showsPeaks, forKey: Self.showsPeaksPreferenceKey)
+        }
+    }
+
+    init() {
+        let defaults = UserDefaults.standard
+        showsPeaks = defaults.object(forKey: Self.showsPeaksPreferenceKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.showsPeaksPreferenceKey)
+    }
 }
 
 /// High-frequency clock updates are isolated from transport and settings.
@@ -205,6 +224,14 @@ final class PlaybackController: NSObject, ObservableObject {
     private var playbackGeneration = 0
     private var isSpectrumAnalysisScheduled = false
     private let spectrumQueue = DispatchQueue(label: "ru.aleksandr.macAmp.spectrum", qos: .utility)
+    /// Winamp stores the visible bar height in Q4 and the peak position in
+    /// Q8.  Keeping the same fixed-point domains preserves the old one-pixel
+    /// hold before a marker starts to fall, without adding a timer per bar.
+    private var visualBarHeightsQ4 = Array(repeating: 0, count: 16)
+    private var visualPeakPositionsQ8 = Array(repeating: 0, count: 16)
+    private var visualPeakVelocities = Array(repeating: Float(0), count: 16)
+    private let visualBarFalloffQ4 = 12
+    private let visualPeakFalloff: Float = 1.1
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
     private var isStreamingAnalysisTapInstalled = false
@@ -313,7 +340,9 @@ final class PlaybackController: NSObject, ObservableObject {
             isPlaying = false
             isPaused = false
             visualization.spectrumLevels = Array(repeating: 0, count: 16)
+            visualization.spectrumPeaks = Array(repeating: 0, count: 16)
             visualization.waveformSamples = Array(repeating: 0, count: 76)
+            resetSpectrumAnimation()
             return
         }
         playerNode.stop()
@@ -333,7 +362,9 @@ final class PlaybackController: NSObject, ObservableObject {
         isPlaying = false
         isPaused = false
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
+        resetSpectrumAnimation()
     }
 
     /// Keeps analysis work proportional to what is actually on screen.  The
@@ -345,7 +376,21 @@ final class PlaybackController: NSObject, ObservableObject {
         updateLiveAnalysisTap()
         guard !enabled else { return }
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
+        resetSpectrumAnimation()
+    }
+
+    /// State used by the classic peak animation belongs to the serial
+    /// spectrum queue.  Reset it there so stopping or hiding the visualizer
+    /// cannot race an in-flight FFT frame.
+    private func resetSpectrumAnimation() {
+        spectrumQueue.async { [weak self] in
+            guard let self else { return }
+            self.visualBarHeightsQ4 = Array(repeating: 0, count: 16)
+            self.visualPeakPositionsQ8 = Array(repeating: 0, count: 16)
+            self.visualPeakVelocities = Array(repeating: 0, count: 16)
+        }
     }
 
     /// The audio graph keeps running in the background, but rendering state
@@ -1013,14 +1058,22 @@ final class PlaybackController: NSObject, ObservableObject {
             // The skin contains fifteen physical LED rows.  Quantize before
             // publishing so imperceptible floating-point changes do not cause
             // another complete SwiftUI update.
-            let levels = self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
-                .map { CGFloat(Int(($0 * 15).rounded(.down))) / 15 }
+            let rawLevels = self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
+            let dynamics = self.classicSpectrumDynamics(for: rawLevels)
+            let levels = dynamics.bars
+            let peaks = dynamics.peaks
             let waveform: [CGFloat] = includesWaveform
                 ? (0..<76).map { CGFloat(min(1, max(-1, latestSamples[min(self.visualFFTSize - 1, $0 * (self.visualFFTSize - 1) / 75)]))) }
                 : []
             DispatchQueue.main.async {
-                guard !self.isVisualUpdatesSuspended else { return }
+                // A frame can finish after Stop or after the visualizer was
+                // hidden.  Do not let that stale asynchronous result repaint
+                // the cleared analyzer state.
+                guard !self.isVisualUpdatesSuspended,
+                      self.isPlaying,
+                      self.isVisualizationEnabled else { return }
                 if self.visualization.spectrumLevels != levels { self.visualization.spectrumLevels = levels }
+                if self.visualization.spectrumPeaks != peaks { self.visualization.spectrumPeaks = peaks }
                 if includesWaveform { self.visualization.waveformSamples = waveform }
                 if needsAdaptiveAnalysis { self.updateAdaptiveEqualizer(with: decibels) }
             }
@@ -1059,6 +1112,42 @@ final class PlaybackController: NSObject, ObservableObject {
                 return CGFloat(min(1, max(0, (db + 65) / 65)))
             }
         } ?? Array(repeating: 0, count: 16)
+    }
+
+    /// Reproduces the classic Winamp analyzer's two independent falloff
+    /// stages.  `barHeight` is the smoothed column (`bx` in draw_sa.cpp),
+    /// while `peakHeight` is the falling marker (`t_bx`/`t_vx`).
+    private func classicSpectrumDynamics(for rawLevels: [CGFloat])
+        -> (bars: [CGFloat], peaks: [CGFloat]) {
+        var bars = Array(repeating: CGFloat(0), count: 16)
+        var peaks = Array(repeating: CGFloat(0), count: 16)
+
+        for index in 0..<16 {
+            let raw = rawLevels.indices.contains(index) ? rawLevels[index] : 0
+            let value = min(15, max(0, Int((raw * 15).rounded(.down))))
+            let valueQ4 = value << 4
+
+            if valueQ4 < visualBarHeightsQ4[index] {
+                visualBarHeightsQ4[index] = max(0, visualBarHeightsQ4[index] - visualBarFalloffQ4)
+            } else {
+                visualBarHeightsQ4[index] = valueQ4
+            }
+            let displayedValue = min(15, max(0, visualBarHeightsQ4[index] >> 4))
+            bars[index] = CGFloat(displayedValue) / 15
+
+            if visualPeakPositionsQ8[index] <= displayedValue * 256 {
+                visualPeakPositionsQ8[index] = displayedValue * 256
+                visualPeakVelocities[index] = 3
+            }
+            let displayedPeak = min(15, max(0, visualPeakPositionsQ8[index] / 256))
+            peaks[index] = CGFloat(displayedPeak) / 15
+
+            visualPeakPositionsQ8[index] -= Int(visualPeakVelocities[index])
+            visualPeakVelocities[index] *= visualPeakFalloff
+            if visualPeakPositionsQ8[index] < 0 { visualPeakPositionsQ8[index] = 0 }
+        }
+
+        return (bars, peaks)
     }
 
     private func updateAdaptiveEqualizer(with levels: [Double]) {

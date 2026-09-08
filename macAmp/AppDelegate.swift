@@ -2213,6 +2213,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             timeDisplayPreference: timeDisplayPreference,
             trackNotifications: trackNotifications,
             equalizer: playback.equalizer,
+            visualization: playback.visualization,
             skin: WinampSkinStore.shared
         ))
         preferences.center()
@@ -3085,6 +3086,7 @@ private struct SettingsView: View {
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var trackNotifications: TrackNotificationController
     @ObservedObject var equalizer: EqualizerController
+    @ObservedObject var visualization: PlaybackVisualizationState
     @ObservedObject var skin: WinampSkinStore
     @State private var selectedTab: Tab = .general
 
@@ -3136,6 +3138,7 @@ private struct SettingsView: View {
             }
             Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
             Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
+            Toggle("Show Peaks", isOn: $visualization.showsPeaks)
             Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
                 ForEach(AdaptiveEQCorrectionRange.allCases) { range in
                     Text(range.title).tag(range)

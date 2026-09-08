@@ -2166,39 +2166,51 @@ final class WinampSkinStore: ObservableObject {
             return Self.defaultVisualizationPalette
         }
 
-        let colors = text.split(whereSeparator: { $0.isNewline }).compactMap { line -> NSColor? in
+        // VISCOLOR is an indexed table, not a list where malformed lines may
+        // be removed.  Preserve each line's index because color 2…17 are the
+        // spectrum gradient and color 23 is the independent peak marker.
+        var colors = Self.defaultVisualizationPalette
+        for (index, line) in text.split(whereSeparator: { $0.isNewline }).enumerated()
+            where index < colors.count {
             let values = line.split(separator: "/", maxSplits: 1).first?
                 .split(separator: ",")
                 .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            guard let values, values.count >= 3 else { return nil }
-            return NSColor(
-                calibratedRed: CGFloat(values[0]) / 255,
-                green: CGFloat(values[1]) / 255,
-                blue: CGFloat(values[2]) / 255,
+            guard let values, values.count >= 3 else { continue }
+            colors[index] = NSColor(
+                calibratedRed: CGFloat(min(255, max(0, values[0]))) / 255,
+                green: CGFloat(min(255, max(0, values[1]))) / 255,
+                blue: CGFloat(min(255, max(0, values[2]))) / 255,
                 alpha: 1
             )
         }
-        return colors.count >= 18 ? colors : Self.defaultVisualizationPalette
+        return colors
     }
 
     private static let defaultVisualizationPalette: [NSColor] = [
-        .black, NSColor(calibratedWhite: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.10, green: 0.35, blue: 1, alpha: 1),
-        NSColor(calibratedRed: 0.10, green: 0.55, blue: 1, alpha: 1),
-        NSColor(calibratedRed: 0.15, green: 0.85, blue: 0.95, alpha: 1),
-        NSColor(calibratedRed: 0.15, green: 1, blue: 0.45, alpha: 1),
-        NSColor(calibratedRed: 0.55, green: 1, blue: 0.20, alpha: 1),
-        NSColor(calibratedRed: 0.95, green: 1, blue: 0.15, alpha: 1),
-        NSColor(calibratedRed: 1, green: 0.75, blue: 0.10, alpha: 1),
-        NSColor(calibratedRed: 1, green: 0.25, blue: 0.10, alpha: 1),
-        NSColor(calibratedRed: 1, green: 0.10, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.85, green: 0.05, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.70, green: 0.04, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.55, green: 0.03, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.45, green: 0.03, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.35, green: 0.02, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.25, green: 0.02, blue: 0.08, alpha: 1),
-        NSColor(calibratedRed: 0.18, green: 0.01, blue: 0.08, alpha: 1)
+        NSColor(calibratedRed: 0, green: 0, blue: 0, alpha: 1),
+        NSColor(calibratedRed: 24 / 255, green: 24 / 255, blue: 41 / 255, alpha: 1),
+        NSColor(calibratedRed: 239 / 255, green: 49 / 255, blue: 16 / 255, alpha: 1),
+        NSColor(calibratedRed: 206 / 255, green: 41 / 255, blue: 16 / 255, alpha: 1),
+        NSColor(calibratedRed: 214 / 255, green: 90 / 255, blue: 0, alpha: 1),
+        NSColor(calibratedRed: 214 / 255, green: 102 / 255, blue: 0, alpha: 1),
+        NSColor(calibratedRed: 214 / 255, green: 115 / 255, blue: 0, alpha: 1),
+        NSColor(calibratedRed: 198 / 255, green: 123 / 255, blue: 8 / 255, alpha: 1),
+        NSColor(calibratedRed: 222 / 255, green: 165 / 255, blue: 24 / 255, alpha: 1),
+        NSColor(calibratedRed: 214 / 255, green: 181 / 255, blue: 33 / 255, alpha: 1),
+        NSColor(calibratedRed: 189 / 255, green: 222 / 255, blue: 41 / 255, alpha: 1),
+        NSColor(calibratedRed: 148 / 255, green: 222 / 255, blue: 33 / 255, alpha: 1),
+        NSColor(calibratedRed: 41 / 255, green: 206 / 255, blue: 16 / 255, alpha: 1),
+        NSColor(calibratedRed: 50 / 255, green: 190 / 255, blue: 16 / 255, alpha: 1),
+        NSColor(calibratedRed: 57 / 255, green: 181 / 255, blue: 16 / 255, alpha: 1),
+        NSColor(calibratedRed: 49 / 255, green: 156 / 255, blue: 8 / 255, alpha: 1),
+        NSColor(calibratedRed: 41 / 255, green: 148 / 255, blue: 0, alpha: 1),
+        NSColor(calibratedRed: 24 / 255, green: 132 / 255, blue: 8 / 255, alpha: 1),
+        NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 1),
+        NSColor(calibratedRed: 214 / 255, green: 214 / 255, blue: 222 / 255, alpha: 1),
+        NSColor(calibratedRed: 181 / 255, green: 189 / 255, blue: 189 / 255, alpha: 1),
+        NSColor(calibratedRed: 160 / 255, green: 170 / 255, blue: 175 / 255, alpha: 1),
+        NSColor(calibratedRed: 148 / 255, green: 156 / 255, blue: 165 / 255, alpha: 1),
+        NSColor(calibratedRed: 150 / 255, green: 150 / 255, blue: 150 / 255, alpha: 1)
     ]
 
     enum SkinError: Error { case invalidArchive, missingMainBitmap, protectedDefaultSkin, unsafePath }

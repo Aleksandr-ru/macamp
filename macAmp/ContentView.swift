@@ -1085,6 +1085,8 @@ private final class VisualizationNSView: NSView {
     private var mode: VisualizationMode = .spectrum
     private var isWindowShade = false
     private var levels = Array(repeating: CGFloat(0), count: 16)
+    private var peaks = Array(repeating: CGFloat(0), count: 16)
+    private var showsPeaks = true
     private var samples = Array(repeating: CGFloat(0), count: 76)
 
     override var isFlipped: Bool { true }
@@ -1112,6 +1114,8 @@ private final class VisualizationNSView: NSView {
         guard self.visualization !== visualization else { return }
         self.visualization = visualization
         levels = visualization.spectrumLevels
+        peaks = visualization.spectrumPeaks
+        showsPeaks = visualization.showsPeaks
         samples = visualization.waveformSamples
         cancellables.removeAll()
         visualization.$spectrumLevels
@@ -1119,6 +1123,22 @@ private final class VisualizationNSView: NSView {
             .sink { [weak self] values in
                 guard let self else { return }
                 self.levels = values
+                if self.mode == .spectrum { self.needsDisplay = true }
+            }
+            .store(in: &cancellables)
+        visualization.$spectrumPeaks
+            .removeDuplicates()
+            .sink { [weak self] values in
+                guard let self else { return }
+                self.peaks = values
+                if self.mode == .spectrum { self.needsDisplay = true }
+            }
+            .store(in: &cancellables)
+        visualization.$showsPeaks
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self else { return }
+                self.showsPeaks = value
                 if self.mode == .spectrum { self.needsDisplay = true }
             }
             .store(in: &cancellables)
@@ -1160,6 +1180,14 @@ private final class VisualizationNSView: NSView {
                 context.setFillColor(color.cgColor)
                 context.fill(CGRect(x: column * 4, y: displayRow, width: 3, height: 1))
             }
+
+            if showsPeaks {
+                let peak = peaks.indices.contains(sourceBand) ? min(1, max(0, peaks[sourceBand])) : 0
+                let peakRow = min(15, max(0, Int((peak * 15).rounded(.down))))
+                let displayRow = min(14, max(0, 14 - peakRow))
+                context.setFillColor(color(at: 23, fallback: .lightGray).cgColor)
+                context.fill(CGRect(x: column * 4, y: displayRow, width: 3, height: 1))
+            }
         }
     }
 
@@ -1176,6 +1204,7 @@ private final class VisualizationNSView: NSView {
                 context.setFillColor(color.cgColor)
                 context.fill(CGRect(x: column, y: displayRow, width: 1, height: 1))
             }
+
         }
     }
 
