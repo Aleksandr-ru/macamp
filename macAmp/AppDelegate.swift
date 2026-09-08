@@ -186,6 +186,7 @@ private final class PixelRegionMaskLayer: CALayer {
 private final class PlayerWindow: NSWindow {
     private var skinRegion: WinampSkinStore.WindowRegion?
     private var skinRegionBaseSize: NSSize?
+    private var skinVisibleBounds: CGRect?
 
     override init(
         contentRect: NSRect,
@@ -220,6 +221,7 @@ private final class PlayerWindow: NSWindow {
     func applySkinRegion(_ region: WinampSkinStore.WindowRegion?, baseSize: NSSize) {
         skinRegion = region
         skinRegionBaseSize = region == nil ? nil : baseSize
+        skinVisibleBounds = nil
         guard let contentView else { return }
         contentView.wantsLayer = true
         guard let region else {
@@ -230,10 +232,32 @@ private final class PlayerWindow: NSWindow {
         mask.frame = contentView.bounds
         mask.contentsScale = backingScaleFactor
         mask.allowsEdgeAntialiasing = false
-        mask.regionRects = region.pixelMaskRects(in: contentView.bounds.size,
-                                                 baseSize: baseSize)
+        let regionRects = region.pixelMaskRects(in: contentView.bounds.size,
+                                                baseSize: baseSize)
+        mask.regionRects = regionRects
+        if var bounds = regionRects.first {
+            for rect in regionRects.dropFirst() {
+                bounds = bounds.union(rect)
+            }
+            skinVisibleBounds = bounds
+        }
         mask.setNeedsDisplay()
         contentView.layer?.mask = mask
+    }
+
+    /// Returns the visible skin bounds in window coordinates. REGION.TXT uses
+    /// a top-left origin, while an NSWindow frame uses a bottom-left origin.
+    func visibleSkinFrame(for frame: NSRect) -> NSRect? {
+        guard let contentView, let skinVisibleBounds else { return nil }
+        let contentSize = contentView.bounds.size
+        let scaleX = frame.width / max(1, contentSize.width)
+        let scaleY = frame.height / max(1, contentSize.height)
+        return NSRect(
+            x: frame.minX + skinVisibleBounds.minX * scaleX,
+            y: frame.minY + (contentSize.height - skinVisibleBounds.maxY) * scaleY,
+            width: skinVisibleBounds.width * scaleX,
+            height: skinVisibleBounds.height * scaleY
+        )
     }
 
     override func sendEvent(_ event: NSEvent) {
@@ -1337,6 +1361,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // surface at every shared edge, so the compositor never exposes the
         // desktop between adjacent windows.
         2 / backingScale(for: frame)
+    }
+
+    private func oneDevicePixel(for frame: NSRect) -> CGFloat {
+        1 / backingScale(for: frame)
     }
 
     /// Build connected components from the pre-scale geometry.  A group can
@@ -2952,6 +2980,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let threshold: CGFloat = 12
         var frame = movingWindow.frame
         let seamOverlap = oneBackingPixel(for: frame)
+        var snappedScreenLeft: CGFloat?
+        var snappedScreenRight: CGFloat?
+        var snappedScreenBottom: CGFloat?
+        var snappedScreenTop: CGFloat?
         for neighbour in neighbours {
             let other = neighbour.frame
             // Snap to a neighbouring playlist even while the windows have not
@@ -2984,12 +3016,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Screen edges have the final priority over window-to-window alignment.
         if includeScreenEdges, let screen = screenFrame(containing: frame) ?? NSScreen.main?.visibleFrame {
-            if abs(frame.minX - screen.minX) <= threshold { frame.origin.x = screen.minX }
-            if abs(frame.maxX - screen.maxX) <= threshold { frame.origin.x = screen.maxX - frame.width }
-            if abs(frame.minY - screen.minY) <= threshold { frame.origin.y = screen.minY }
-            if abs(frame.maxY - screen.maxY) <= threshold { frame.origin.y = screen.maxY - frame.height }
+            let visibleFrame = visibleSkinFrame(for: movingWindow, frame: frame)
+            if abs(visibleFrame.minX - screen.minX) <= threshold {
+                let visibleLeftInset = visibleFrame.minX - frame.minX
+                frame.origin.x = screen.minX - visibleLeftInset
+                snappedScreenLeft = frame.origin.x
+            }
+            if abs(visibleFrame.maxX - screen.maxX) <= threshold {
+                let visibleRightOffset = visibleFrame.maxX - frame.minX
+                frame.origin.x = screen.maxX - visibleRightOffset
+                snappedScreenRight = frame.origin.x
+            }
+            if abs(visibleFrame.minY - screen.minY) <= threshold {
+                let visibleBottomInset = visibleFrame.minY - frame.minY
+                frame.origin.y = screen.minY - visibleBottomInset
+                snappedScreenBottom = frame.origin.y
+            }
+            if abs(visibleFrame.maxY - screen.maxY) <= threshold {
+                let visibleTopOffset = visibleFrame.maxY - frame.minY
+                frame.origin.y = screen.maxY - visibleTopOffset
+                snappedScreenTop = frame.origin.y
+            }
         }
         frame.origin = backingAlignedOrigin(frame.origin, for: frame)
+        // Screen edges are hard boundaries. Use directional rounding there:
+        // the left/bottom edge must not be rounded inward, and the
+        // right/top edge must not be rounded toward the screen interior.
+        // Other window origins continue to use nearest-pixel alignment.
+        if let snappedScreenLeft {
+            frame.origin.x = backingFloor(snappedScreenLeft - oneDevicePixel(for: frame), for: frame)
+        } else if let snappedScreenRight {
+            frame.origin.x = backingCeiling(snappedScreenRight + oneDevicePixel(for: frame), for: frame)
+        }
+        if let snappedScreenBottom {
+            frame.origin.y = backingFloor(snappedScreenBottom - oneDevicePixel(for: frame), for: frame)
+        } else if let snappedScreenTop {
+            frame.origin.y = backingCeiling(snappedScreenTop + oneDevicePixel(for: frame), for: frame)
+        }
         if movingWindow.frame.origin != frame.origin {
             movingWindow.setFrameOrigin(frame.origin)
         }
@@ -3013,30 +3076,56 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func magnetMainDragGroupToScreen() {
-        var groupFrame = window.frame
+        var groupFrame = visibleSkinFrame(for: window, frame: window.frame)
         for panel in mainDragGroupWindows {
-            guard let offset = mainDragWindowOffsets[ObjectIdentifier(panel)] else { continue }
-            groupFrame = groupFrame.union(NSRect(
-                origin: NSPoint(x: window.frame.minX + offset.x, y: window.frame.minY + offset.y),
-                size: panel.frame.size
-            ))
+            groupFrame = groupFrame.union(visibleSkinFrame(for: panel, frame: panel.frame))
         }
         guard let screen = screenFrame(containing: groupFrame) ?? screenFrame(containing: window.frame)
             ?? NSScreen.main?.visibleFrame else { return }
         let threshold: CGFloat = 12
-        var delta = NSPoint.zero
-        if abs(groupFrame.minX - screen.minX) <= threshold { delta.x = screen.minX - groupFrame.minX }
-        if abs(groupFrame.maxX - screen.maxX) <= threshold { delta.x = screen.maxX - groupFrame.maxX }
-        if abs(groupFrame.minY - screen.minY) <= threshold { delta.y = screen.minY - groupFrame.minY }
-        if abs(groupFrame.maxY - screen.maxY) <= threshold { delta.y = screen.maxY - groupFrame.maxY }
-        guard delta != .zero else { return }
-        window.setFrameOrigin(NSPoint(x: window.frame.minX + delta.x, y: window.frame.minY + delta.y))
+        var targetOrigin = window.frame.origin
+        var snappedLeft = false
+        var snappedRight = false
+        var snappedBottom = false
+        var snappedTop = false
+        if abs(groupFrame.minX - screen.minX) <= threshold {
+            targetOrigin.x += screen.minX - groupFrame.minX
+            snappedLeft = true
+        }
+        if abs(groupFrame.maxX - screen.maxX) <= threshold {
+            targetOrigin.x += screen.maxX - groupFrame.maxX
+            snappedRight = true
+        }
+        if abs(groupFrame.minY - screen.minY) <= threshold {
+            targetOrigin.y += screen.minY - groupFrame.minY
+            snappedBottom = true
+        }
+        if abs(groupFrame.maxY - screen.maxY) <= threshold {
+            targetOrigin.y += screen.maxY - groupFrame.maxY
+            snappedTop = true
+        }
+        guard targetOrigin != window.frame.origin else { return }
+        if snappedLeft {
+            targetOrigin.x = backingFloor(targetOrigin.x - oneDevicePixel(for: window.frame), for: window.frame)
+        } else if snappedRight {
+            targetOrigin.x = backingCeiling(targetOrigin.x + oneDevicePixel(for: window.frame), for: window.frame)
+        }
+        if snappedBottom {
+            targetOrigin.y = backingFloor(targetOrigin.y - oneDevicePixel(for: window.frame), for: window.frame)
+        } else if snappedTop {
+            targetOrigin.y = backingCeiling(targetOrigin.y + oneDevicePixel(for: window.frame), for: window.frame)
+        }
+        window.setFrameOrigin(targetOrigin)
         moveAttachedWindowsWithMain()
     }
 
     private func screenFrame(containing frame: NSRect) -> NSRect? {
         let centre = NSPoint(x: frame.midX, y: frame.midY)
         return NSScreen.screens.first(where: { $0.frame.contains(centre) })?.visibleFrame
+    }
+
+    private func visibleSkinFrame(for panel: NSWindow, frame: NSRect) -> NSRect {
+        (panel as? PlayerWindow)?.visibleSkinFrame(for: frame) ?? frame
     }
 
     private func isMagneticallyAttached(_ frame: NSRect, to other: NSRect) -> Bool {
