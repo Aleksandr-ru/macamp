@@ -3596,7 +3596,10 @@ private struct SettingsView: View {
             Group {
                 switch selectedTab {
                 case .general:
-                    generalSettings
+                    ScrollView(.vertical) {
+                        generalSettings
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
                 case .skin:
                     skinSettings
                 case .output:
@@ -3633,7 +3636,7 @@ private struct SettingsView: View {
                     Text(analyzer.title).tag(analyzer)
                 }
             }
-            .pickerStyle(.radioGroup)
+            .pickerStyle(.menu)
             Toggle("Show Peaks", isOn: $visualization.showsPeaks)
             VStack(alignment: .leading, spacing: 6) {
                 Text("When opening a music file")
