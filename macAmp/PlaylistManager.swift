@@ -34,6 +34,11 @@ final class PlaylistEntry: ObservableObject, Identifiable {
 
 final class PlaylistModel: ObservableObject, Identifiable {
     enum ScannerState: Equatable { case idle, adding(Int), scanningFolder(Int), readingMetadata(processed: Int, total: Int), paused }
+    struct SortingProgress: Equatable {
+        let processed: Int
+        let total: Int
+        let phase: String
+    }
     let id: UUID
     @Published var name: String
     @Published var entries: [PlaylistEntry]
@@ -68,6 +73,7 @@ final class PlaylistModel: ObservableObject, Identifiable {
     @Published var unshadedWindowWidth: CGFloat?
     @Published var unshadedWindowHeight: CGFloat?
     @Published var scannerState: ScannerState = .idle
+    @Published var sortingProgress: SortingProgress?
     @Published var isDirty = false
     var fileURL: URL?
     private var cachedTotalDuration: TimeInterval
@@ -91,6 +97,31 @@ final class PlaylistModel: ObservableObject, Identifiable {
 /// Single authority for opening, saving and scanning playlists.  Its queues are
 /// serial by design: network folders cannot create an unbounded number of jobs.
 final class PlaylistManager: ObservableObject {
+    enum SortOption: CaseIterable, Identifiable {
+        case title
+        case artistAlbumTrack
+        case fileName
+        case pathAndFileName
+        case reverse
+
+        var id: Self { self }
+
+        var menuTitle: String {
+            switch self {
+            case .title: return "Sort by title"
+        case .artistAlbumTrack: return "Sort by artist/album/track number"
+            case .fileName: return "Sort by file name"
+            case .pathAndFileName: return "Sort by path + file name"
+            case .reverse: return "Reverse"
+            }
+        }
+
+        init?(menuTitle: String) {
+            guard let option = Self.allCases.first(where: { $0.menuTitle == menuTitle }) else { return nil }
+            self = option
+        }
+    }
+
     struct KeyboardSelectionReveal: Equatable {
         let playlistID: UUID
         let entryID: UUID
@@ -123,6 +154,7 @@ final class PlaylistManager: ObservableObject {
     @Published private(set) var recentPlaylistURLs: [URL] = []
 
     private let folderQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.folder", qos: .utility)
+    private let sortingQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.sorting", qos: .utility)
     private let metadataQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.metadata", qos: .background, attributes: .concurrent)
     private let persistenceURL: URL
     private let playlistEntriesDirectoryURL: URL
@@ -169,6 +201,43 @@ final class PlaylistManager: ObservableObject {
         var parserFinished = false
         var isDraining = false
     }
+    private struct SortRecord {
+        let entry: PlaylistEntry
+        let key: String
+        let artist: String?
+        let album: String?
+        let trackNumber: Int?
+
+        init(entry: PlaylistEntry, key: String, artist: String? = nil, album: String? = nil, trackNumber: Int? = nil) {
+            self.entry = entry
+            self.key = key
+            self.artist = artist
+            self.album = album
+            self.trackNumber = trackNumber
+        }
+    }
+
+    private final class SortingCancellationToken {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+    }
+
+    private final class SortingTask {
+        let cancellation = SortingCancellationToken()
+    }
+
     private var pendingPlaylistLoads: [UUID: PendingPlaylistLoad] = [:]
     // The Loading counter is an exact row counter: advance it one entry at a
     // time, rather than reporting parser blocks such as 128 records.
@@ -176,6 +245,11 @@ final class PlaylistManager: ObservableObject {
     private let visibleLoadingBatchInterval: TimeInterval = 1.0 / 60.0
     private var waitingCursorPlaylistIDs = Set<UUID>()
     private var pendingSaveWorkItem: DispatchWorkItem?
+    /// Sorting never mutates the model from its worker queue. The work item is
+    /// removed before a playlist closes, so a late completion cannot reinsert
+    /// rows into a closed editor.
+    private var sortingTasks: [UUID: SortingTask] = [:]
+    private var sortingWorkItems: [UUID: DispatchWorkItem] = [:]
     /// Metadata discovery is intentionally gentle: it must never compete with
     /// audio rendering just to fill columns that are not currently visible.
     private let metadataWorkInterval: TimeInterval = 0.25
@@ -458,6 +532,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     func close(_ playlist: PlaylistModel) {
+        cancelSorting(for: playlist)
         guard playlists.count > 1 else { playlist.isVisible = false; save(); return }
         if let url = playlist.fileURL { addRecent(url) }
         let wasActive = activePlaylistID == playlist.id
@@ -483,6 +558,333 @@ final class PlaylistManager: ObservableObject {
         }
         else { pausedPlaylistIDs.insert(playlist.id); playlist.scannerState = .paused }
         save()
+    }
+
+    func canSort(_ option: SortOption, in playlist: PlaylistModel) -> Bool {
+        guard playlists.contains(where: { $0.id == playlist.id }),
+              playlist.entries.count > 1,
+              sortingTasks[playlist.id] == nil,
+              !isLoadingEntries(playlist) else { return false }
+        if option == .title {
+            return playlist.entries.allSatisfy(\.metadataIsAvailable)
+        }
+        return true
+    }
+
+    func sort(_ playlist: PlaylistModel, by option: SortOption) {
+        guard canSort(option, in: playlist) else { return }
+
+        let task = SortingTask()
+        sortingTasks[playlist.id] = task
+        let entries = playlist.entries
+        let total = entries.count
+        playlist.sortingProgress = PlaylistModel.SortingProgress(
+            processed: 0,
+            total: total,
+            phase: option == .artistAlbumTrack ? "Reading" : "Sorting"
+        )
+
+        if option == .artistAlbumTrack {
+            startArtistAlbumTrackSort(entries, playlist: playlist, task: task)
+            return
+        }
+
+        let records = entries.map { entry in
+            SortRecord(entry: entry, key: sortKey(for: entry, option: option))
+        }
+        startSort(records, option: option, playlist: playlist, task: task)
+    }
+
+    private func startSort(
+        _ records: [SortRecord],
+        option: SortOption,
+        playlist: PlaylistModel,
+        task: SortingTask
+    ) {
+        let playlistID = playlist.id
+        let total = records.count
+        let workItem = DispatchWorkItem { [weak self, weak playlist] in
+            guard let self, let playlist else { return }
+            let sortedEntries = self.sortedEntries(
+                records,
+                option: option,
+                isCancelled: { task.cancellation.isCancelled },
+                reportProgress: { processed in
+                    DispatchQueue.main.async { [weak self, weak playlist] in
+                        guard let self, let playlist,
+                              self.sortingTasks[playlistID] === task,
+                              !task.cancellation.isCancelled else { return }
+                        playlist.sortingProgress = PlaylistModel.SortingProgress(
+                            processed: min(processed, total), total: total, phase: "Sorting"
+                        )
+                    }
+                }
+            )
+            guard let sortedEntries, !task.cancellation.isCancelled else { return }
+            self.finishSorting(sortedEntries, playlist: playlist, task: task)
+        }
+        sortingWorkItems[playlistID] = workItem
+        sortingQueue.async(execute: workItem)
+    }
+
+    private func startArtistAlbumTrackSort(
+        _ entries: [PlaylistEntry],
+        playlist: PlaylistModel,
+        task: SortingTask
+    ) {
+        let playlistID = playlist.id
+        let total = entries.count
+        let workItem = DispatchWorkItem { [weak self, weak playlist] in
+            guard let self, let playlist else { return }
+            var records: [SortRecord] = []
+            records.reserveCapacity(entries.count)
+            for (index, entry) in entries.enumerated() {
+                guard !task.cancellation.isCancelled else { return }
+                guard let tags = autoreleasepool(invoking: {
+                    self.readArtistAlbumTrackTags(for: entry, isCancelled: { task.cancellation.isCancelled })
+                }) else { return }
+                records.append(SortRecord(
+                    entry: entry,
+                    key: "",
+                    artist: tags.artist,
+                    album: tags.album,
+                    trackNumber: tags.trackNumber
+                ))
+                if (index + 1).isMultiple(of: 16) || index + 1 == total {
+                    self.reportSortingProgress(
+                        playlistID: playlistID,
+                        playlist: playlist,
+                        task: task,
+                        processed: index + 1,
+                        total: total,
+                        phase: "Reading"
+                    )
+                }
+            }
+            guard !task.cancellation.isCancelled else { return }
+            self.reportSortingProgress(
+                playlistID: playlistID,
+                playlist: playlist,
+                task: task,
+                processed: 0,
+                total: total,
+                phase: "Sorting"
+            )
+            guard let sortedEntries = self.sortedEntries(
+                records,
+                option: .artistAlbumTrack,
+                isCancelled: { task.cancellation.isCancelled },
+                reportProgress: { processed in
+                    self.reportSortingProgress(
+                        playlistID: playlistID,
+                        playlist: playlist,
+                        task: task,
+                        processed: processed,
+                        total: total,
+                        phase: "Sorting"
+                    )
+                }
+            ), !task.cancellation.isCancelled else { return }
+            self.finishSorting(sortedEntries, playlist: playlist, task: task)
+        }
+        sortingWorkItems[playlistID] = workItem
+        sortingQueue.async(execute: workItem)
+    }
+
+    private func reportSortingProgress(
+        playlistID: UUID,
+        playlist: PlaylistModel,
+        task: SortingTask,
+        processed: Int,
+        total: Int,
+        phase: String
+    ) {
+        DispatchQueue.main.async { [weak self, weak playlist] in
+            guard let self, let playlist,
+                  self.sortingTasks[playlistID] === task,
+                  !task.cancellation.isCancelled else { return }
+            playlist.sortingProgress = PlaylistModel.SortingProgress(
+                processed: min(max(0, processed), total), total: total, phase: phase
+            )
+        }
+    }
+
+    private func finishSorting(_ sortedEntries: [PlaylistEntry], playlist: PlaylistModel, task: SortingTask) {
+        let playlistID = playlist.id
+        DispatchQueue.main.async { [weak self, weak playlist] in
+            guard let self, let playlist,
+                  self.sortingTasks[playlistID] === task,
+                  !task.cancellation.isCancelled,
+                  self.playlists.contains(where: { $0.id == playlistID }) else { return }
+            self.sortingTasks.removeValue(forKey: playlistID)
+            self.sortingWorkItems.removeValue(forKey: playlistID)
+            playlist.entries = sortedEntries
+            playlist.structureRevision &+= 1
+            playlist.isDirty = true
+            playlist.sortingProgress = nil
+            self.markEntriesDirty(in: playlist)
+            self.scheduleMetadata(for: playlist)
+            self.save()
+        }
+    }
+
+    func cancelSorting(for playlist: PlaylistModel) {
+        let playlistID = playlist.id
+        sortingTasks[playlistID]?.cancellation.cancel()
+        sortingTasks.removeValue(forKey: playlistID)
+        sortingWorkItems.removeValue(forKey: playlistID)?.cancel()
+        playlist.sortingProgress = nil
+    }
+
+    func cancelAllSorting() {
+        let tasks = sortingTasks
+        let workItems = sortingWorkItems
+        sortingTasks.removeAll()
+        sortingWorkItems.removeAll()
+        tasks.values.forEach { $0.cancellation.cancel() }
+        workItems.values.forEach { $0.cancel() }
+        tasks.keys.compactMap { playlist(id: $0) }.forEach { $0.sortingProgress = nil }
+    }
+
+    private func sortKey(for entry: PlaylistEntry, option: SortOption) -> String {
+        switch option {
+        case .title: return entry.title
+        case .artistAlbumTrack: return ""
+        case .fileName: return entry.url.lastPathComponent
+        case .pathAndFileName: return entry.url.isFileURL ? entry.url.path : entry.url.absoluteString
+        case .reverse: return ""
+        }
+    }
+
+    private func readArtistAlbumTrackTags(
+        for entry: PlaylistEntry,
+        isCancelled: () -> Bool
+    ) -> (artist: String?, album: String?, trackNumber: Int?)? {
+        let asset = AVURLAsset(url: entry.url)
+        let semaphore = DispatchSemaphore(value: 0)
+        asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata"]) {
+            semaphore.signal()
+        }
+
+        var didLoad = false
+        for _ in 0..<100 {
+            if semaphore.wait(timeout: .now() + 0.1) == .success {
+                didLoad = true
+                break
+            }
+            if isCancelled() { return nil }
+        }
+        guard !isCancelled() else { return nil }
+        guard didLoad else { return (nil, nil, nil) }
+
+        let metadata = asset.commonMetadata + asset.metadata
+        let artist = metadataText(in: metadata, id3Frame: "TPE1", commonKey: .commonKeyArtist)
+        let album = metadataText(in: metadata, id3Frame: "TALB", commonKey: .commonKeyAlbumName)
+        let trackNumber = metadataTrackNumber(in: metadata)
+        return (artist, album, trackNumber)
+    }
+
+    private func metadataText(
+        in metadata: [AVMetadataItem],
+        id3Frame: String,
+        commonKey: AVMetadataKey?
+    ) -> String? {
+        let frame = id3Frame.uppercased()
+        let item = metadata.first { item in
+            let key = (item.key as? String)?.uppercased()
+            let identifier = item.identifier?.rawValue.uppercased()
+            return key == frame || identifier?.hasSuffix("/\(frame)") == true
+        } ?? commonKey.flatMap { key in metadata.first { $0.commonKey == key } }
+        guard let value = item?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
+    }
+
+    private func metadataTrackNumber(in metadata: [AVMetadataItem]) -> Int? {
+        let item = metadata.first { item in
+            let key = (item.key as? String)?.uppercased()
+            let identifier = item.identifier?.rawValue.uppercased()
+            return key == "TRCK"
+                || identifier?.hasSuffix("/TRCK") == true
+                || identifier?.contains("TRACKNUMBER") == true
+        }
+        if let value = item?.stringValue,
+           let token = value.split(whereSeparator: { !$0.isNumber }).first,
+           let number = Int(token), number > 0 {
+            return number
+        }
+        if let number = item?.numberValue?.intValue, number > 0 { return number }
+        return nil
+    }
+
+    private func sortRecordPrecedes(_ lhs: SortRecord, _ rhs: SortRecord, option: SortOption) -> Bool {
+        if option == .artistAlbumTrack {
+            let lhsComplete = lhs.album != nil && lhs.trackNumber != nil
+            let rhsComplete = rhs.album != nil && rhs.trackNumber != nil
+            if lhsComplete != rhsComplete { return lhsComplete }
+
+            let artistComparison = (lhs.artist ?? "").localizedStandardCompare(rhs.artist ?? "")
+            if artistComparison != .orderedSame { return artistComparison == .orderedAscending }
+            let albumComparison = (lhs.album ?? "").localizedStandardCompare(rhs.album ?? "")
+            if albumComparison != .orderedSame { return albumComparison == .orderedAscending }
+            if lhs.trackNumber != rhs.trackNumber {
+                return (lhs.trackNumber ?? Int.max) < (rhs.trackNumber ?? Int.max)
+            }
+            return false
+        }
+        return lhs.key.localizedStandardCompare(rhs.key) == .orderedAscending
+    }
+
+    private func sortedEntries(
+        _ records: [SortRecord],
+        option: SortOption,
+        isCancelled: () -> Bool,
+        reportProgress: (Int) -> Void
+    ) -> [PlaylistEntry]? {
+        guard !records.isEmpty else { return [] }
+        if option == .reverse {
+            var reversed: [PlaylistEntry] = []
+            reversed.reserveCapacity(records.count)
+            for (index, record) in records.reversed().enumerated() {
+                if isCancelled() { return nil }
+                reversed.append(record.entry)
+                if index.isMultiple(of: 512) { reportProgress(index + 1) }
+            }
+            reportProgress(records.count)
+            return reversed
+        }
+
+        var source = records
+        var buffer = records
+        var width = 1
+        while width < records.count {
+            if isCancelled() { return nil }
+            var start = 0
+            while start < records.count {
+                let middle = min(start + width, records.count)
+                let end = min(start + width * 2, records.count)
+                var left = start
+                var right = middle
+                var destination = start
+                while left < middle || right < end {
+                    if destination.isMultiple(of: 512), isCancelled() { return nil }
+                    if right >= end || (left < middle && !sortRecordPrecedes(source[right], source[left], option: option)) {
+                        buffer[destination] = source[left]
+                        left += 1
+                    } else {
+                        buffer[destination] = source[right]
+                        right += 1
+                    }
+                    destination += 1
+                }
+                start = end
+            }
+            swap(&source, &buffer)
+            reportProgress(min(records.count, width * 2))
+            if width > records.count / 2 { break }
+            width *= 2
+        }
+        reportProgress(records.count)
+        return source.map(\.entry)
     }
 
     func addFiles(_ urls: [URL], to playlist: PlaylistModel) {
@@ -845,6 +1247,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     func statusText(for playlist: PlaylistModel, playbackIndicator: String?) -> String {
+        if let sortingProgress = playlist.sortingProgress { return sortingProgress.phase }
         switch playlist.scannerState {
         case .adding: return "Adding"
         case .scanningFolder: return "Loading"
@@ -855,6 +1258,9 @@ final class PlaylistManager: ObservableObject {
     }
 
     func statusCounter(for playlist: PlaylistModel) -> String? {
+        if let progress = playlist.sortingProgress {
+            return "\(progress.processed)/\(progress.total)"
+        }
         switch playlist.scannerState {
         case .adding(let count), .scanningFolder(let count):
             return String(count)
@@ -898,7 +1304,7 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func scheduleMetadata(for playlist: PlaylistModel) {
-        guard !pausedPlaylistIDs.contains(playlist.id) else { return }
+        guard !pausedPlaylistIDs.contains(playlist.id), playlist.sortingProgress == nil else { return }
         scannerLock.lock()
         let newWorkers = maximumMetadataOperations - metadataWorkersRunning
         metadataWorkersRunning += max(0, newWorkers)
@@ -932,7 +1338,7 @@ final class PlaylistManager: ObservableObject {
         }
         metadataAssetLock.unlock()
 
-        playlists.filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) }
+        playlists.filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) && $0.sortingProgress == nil }
             .forEach { scheduleMetadata(for: $0) }
     }
 
@@ -946,7 +1352,7 @@ final class PlaylistManager: ObservableObject {
         var work: (playlist: PlaylistModel, entry: PlaylistEntry, total: Int, priorityRevision: Int, requestID: UInt64)?
         DispatchQueue.main.sync {
             let eligible = playlists
-                .filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) }
+                .filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) && $0.sortingProgress == nil }
                 .sorted { lhs, rhs in
                     let lhsPriority = lhs.id == focusedPlaylistID ? 0 : (lhs.id == activePlaylistID ? 1 : 2)
                     let rhsPriority = rhs.id == focusedPlaylistID ? 0 : (rhs.id == activePlaylistID ? 1 : 2)
@@ -1024,7 +1430,7 @@ final class PlaylistManager: ObservableObject {
             metadataAssetLock.unlock()
             guard metadataInFlightRequests[work.entry.id] == work.requestID else { return }
             metadataInFlightRequests.removeValue(forKey: work.entry.id)
-            guard !wasCancelled, !pausedPlaylistIDs.contains(work.playlist.id), !work.entry.metadataIsAvailable else { return }
+            guard !wasCancelled, !pausedPlaylistIDs.contains(work.playlist.id), work.playlist.sortingProgress == nil, !work.entry.metadataIsAvailable else { return }
             let previousDuration = work.entry.duration
             work.entry.duration = result.duration
             work.playlist.replaceTotalDuration(previousDuration, with: result.duration)

@@ -668,6 +668,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let keyboardShortcutMonitor { NSEvent.removeMonitor(keyboardShortcutMonitor) }
         pendingPersistenceWorkItem?.cancel()
         playlistManager.cancelFolderScans()
+        playlistManager.cancelAllSorting()
         playlistManager.flushSave()
         savePersistentState()
         playback.stop()
@@ -2214,6 +2215,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func selectNoneInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectNone(in: playlist) } }
     func invertSelectionInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.invertSelection(in: playlist) } }
 
+    func canSort(_ playlist: PlaylistModel, by option: PlaylistManager.SortOption) -> Bool {
+        playlistManager.canSort(option, in: playlist)
+    }
+
+    func sort(_ playlist: PlaylistModel, by option: PlaylistManager.SortOption) {
+        playlistManager.sort(playlist, by: option)
+    }
+
     /// Returns the one file that the Playlist Editor's File Info command may
     /// act on. With no selection, the current track is valid only when this
     /// editor is the playlist that owns the active playback cursor.
@@ -3354,7 +3363,7 @@ private struct PlaylistStatusField: View {
         let textColor = skin.textForegroundColor()
         let color = textColor.usingColorSpace(.deviceRGB) ?? textColor
         return HStack(spacing: 2) {
-            if playlist.scannerState == .idle, !indicator.isEmpty { Text(indicator) }
+            if playlist.scannerState == .idle, playlist.sortingProgress == nil, !indicator.isEmpty { Text(indicator) }
             Text(verbatim: manager.statusText(for: playlist, playbackIndicator: nil).uppercased())
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
@@ -3806,7 +3815,17 @@ private struct PlaylistView: View {
             playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"], shortcuts: [
                 "Select All": .commandA
             ])
-            playlistMenuHotspot(x: 112, index: 3, titles: ["File Info", "Reveal in Finder", "Sort…", "Misc…"])
+            playlistMenuHotspot(
+                x: 112,
+                index: 3,
+                titles: [
+                    "File Info", "Reveal in Finder",
+                "Sort by title", "Sort by artist/album/track number",
+                    "Sort by file name", "Sort by path + file name", "Reverse",
+                    "Misc…"
+                ],
+                separatorsBefore: ["Sort by title", "Misc…"]
+            )
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
                 "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
             ], shortcuts: [
@@ -4040,11 +4059,13 @@ private struct PlaylistView: View {
         x: CGFloat,
         index: Int,
         titles: [String],
-        shortcuts: [String: PlaylistMenuShortcut] = [:]
+        shortcuts: [String: PlaylistMenuShortcut] = [:],
+        separatorsBefore: Set<String> = []
     ) -> some View {
         PlaylistMenuHotspot(
             titles: titles,
             shortcuts: shortcuts,
+            separatorsBefore: separatorsBefore,
             playlist: playlist,
             pressedImage: skin.playlistMenuButtonPressedImage(index: index)
         )
@@ -4065,6 +4086,7 @@ private struct PlaylistScrollOffsetKey: PreferenceKey {
 private struct PlaylistMenuHotspot: NSViewRepresentable {
     let titles: [String]
     let shortcuts: [String: PlaylistMenuShortcut]
+    let separatorsBefore: Set<String>
     let playlist: PlaylistModel
     let pressedImage: NSImage?
 
@@ -4072,6 +4094,7 @@ private struct PlaylistMenuHotspot: NSViewRepresentable {
         let view = PlaylistMenuHotspotNSView()
         view.titles = titles
         view.shortcuts = shortcuts
+        view.separatorsBefore = separatorsBefore
         view.playlist = playlist
         view.pressedImage = pressedImage
         return view
@@ -4080,6 +4103,7 @@ private struct PlaylistMenuHotspot: NSViewRepresentable {
     func updateNSView(_ nsView: PlaylistMenuHotspotNSView, context: Context) {
         nsView.titles = titles
         nsView.shortcuts = shortcuts
+        nsView.separatorsBefore = separatorsBefore
         nsView.playlist = playlist
         nsView.pressedImage = pressedImage
     }
@@ -4100,6 +4124,7 @@ private struct PlaylistMenuShortcut {
 private final class PlaylistMenuHotspotNSView: NSView {
     var titles: [String] = []
     var shortcuts: [String: PlaylistMenuShortcut] = [:]
+    var separatorsBefore: Set<String> = []
     var playlist: PlaylistModel?
     var pressedImage: NSImage? { didSet { needsDisplay = true } }
     private var isPressed = false { didSet { needsDisplay = true } }
@@ -4117,6 +4142,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
 
         let menu = NSMenu()
         for title in titles {
+            if separatorsBefore.contains(title) { menu.addItem(.separator()) }
             let shortcut = shortcuts[title]
             let item = NSMenuItem(
                 title: title,
@@ -4126,10 +4152,14 @@ private final class PlaylistMenuHotspotNSView: NSView {
             item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
             if let playlist, let appDelegate = AppDelegate.shared {
-                if title == "File Info" {
+                if playlist.sortingProgress != nil {
+                    item.isEnabled = false
+                } else if title == "File Info" {
                     item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
                 } else if title == "Reveal in Finder" {
                     item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
+                } else if let option = PlaylistManager.SortOption(menuTitle: title) {
+                    item.isEnabled = appDelegate.canSort(playlist, by: option)
                 }
             }
             menu.addItem(item)
@@ -4157,7 +4187,11 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Load Playlist…": AppDelegate.shared?.openDocument(nil)
         case "Save Playlist As…": AppDelegate.shared?.savePlaylistAs(nil)
         case "Rename Playlist": AppDelegate.shared?.renameActivePlaylist()
-        default: break
+        default:
+            if let option = PlaylistManager.SortOption(menuTitle: sender.title),
+               let playlist {
+                AppDelegate.shared?.sort(playlist, by: option)
+            }
         }
     }
 }
