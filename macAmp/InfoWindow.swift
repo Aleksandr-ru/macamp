@@ -327,7 +327,7 @@ final class InfoPanelView: NSView {
     private func makeLabel(_ text: String, alignment: NSTextAlignment = .left,
                            lineBreakMode: NSLineBreakMode = .byWordWrapping) -> NSTextField {
         let label = NSTextField(wrappingLabelWithString: text)
-        label.font = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
+        label.font = skin.resolvedFont(ofSize: 8 * textScale)
         label.textColor = skin.playlistColors().normalText
         label.alignment = alignment
         label.maximumNumberOfLines = 0
@@ -340,7 +340,7 @@ final class InfoPanelView: NSView {
 
     private func textHeight(_ text: String, width: CGFloat,
                             lineBreakMode: NSLineBreakMode = .byWordWrapping) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
+        let font = skin.resolvedFont(ofSize: 8 * textScale)
         let storage = NSTextStorage(string: text, attributes: [.font: font])
         let layoutManager = NSLayoutManager()
         let container = NSTextContainer(size: NSSize(width: max(1, width), height: .greatestFiniteMagnitude))
@@ -387,7 +387,7 @@ final class InfoPanelView: NSView {
             if detectsLinks {
                 let label = InfoWrappedTextView(
                     text: text,
-                    font: NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular),
+                    font: skin.resolvedFont(ofSize: 8 * textScale),
                     color: skin.playlistColors().normalText,
                     alignment: alignment,
                     detectsLinks: true
@@ -427,7 +427,7 @@ final class InfoPanelView: NSView {
             }
         }
 
-        let rating = InfoRatingView(rating: model.content.rating, font: NSFont.monospacedSystemFont(ofSize: 16 * pixelScale, weight: .regular), color: skin.playlistColors().normalText)
+        let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 16 * pixelScale), color: skin.playlistColors().normalText)
         rating.menu = copyMenu
         rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
                               width: usesTwoColumnLayout ? columnWidth : width,
@@ -437,7 +437,7 @@ final class InfoPanelView: NSView {
 
         let gap = 8 * pixelScale
         let tableColumnWidth = max(1, (columnWidth - gap) * 0.5)
-        let tableFont = NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular)
+        let tableFont = skin.resolvedFont(ofSize: 8 * textScale)
         let tableColor = skin.playlistColors().normalText
         for field in model.content.fields {
             let key = InfoWrappedTextView(text: field.label, font: tableFont, color: tableColor, alignment: .right)
@@ -460,7 +460,7 @@ final class InfoPanelView: NSView {
            let filename = fileURL.lastPathComponent.nilIfEmpty {
             let filenameView = InfoWrappedTextView(
                 text: filename,
-                font: NSFont.monospacedSystemFont(ofSize: 8 * textScale, weight: .regular),
+                font: skin.resolvedFont(ofSize: 8 * textScale),
                 color: skin.playlistColors().normalText,
                 alignment: .center,
                 onClick: fileURL.isFileURL ? {

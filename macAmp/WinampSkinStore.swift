@@ -126,6 +126,23 @@ final class WinampSkinStore: ObservableObject {
         }
     }
     @Published private(set) var skinCursorsAvailable = false
+    @Published var useSkinFont: Bool {
+        didSet {
+            guard oldValue != useSkinFont else { return }
+            if useSkinFont && !skinFontAvailable {
+                useSkinFont = false
+                return
+            }
+            UserDefaults.standard.set(useSkinFont, forKey: Self.useSkinFontKey)
+            resolvedFontCache.removeAll()
+        }
+    }
+    /// The font declared by the active skin's [Text] section. This remains
+    /// non-nil even when the font is not installed, so the setting can still
+    /// be enabled and the renderer can apply its documented fallback.
+    @Published private(set) var skinFontName: String? = nil
+
+    var skinFontAvailable: Bool { skinFontName != nil }
     @Published private(set) var isImporting = false
     private(set) var extractedDirectory: URL?
     /// Source sheets are immutable for a loaded skin. Keep each decoded BMP in
@@ -166,6 +183,7 @@ final class WinampSkinStore: ObservableObject {
     private var textBackgroundColorCache: NSColor?
     private var textForegroundColorResolved = false
     private var playlistColorsCache: PlaylistColors?
+    private var resolvedFontCache: [String: NSFont] = [:]
     private var skinInformationCache: [String: SkinInformation] = [:]
     private var windowRegionCache: [String: WindowRegion] = [:]
     private var missingWindowRegions: Set<String> = []
@@ -208,9 +226,11 @@ final class WinampSkinStore: ObservableObject {
     private static let activeSkinDirectoryNameKey = "macAmp.activeSkinDirectoryName.v1"
     private static let bundledDefaultSkinDirectoryName = "DefaultSkin"
     private static let useSkinCursorsKey = "macAmp.useSkinCursors.v1"
+    private static let useSkinFontKey = "macAmp.useSkinFont.v1"
 
     private init() {
         useSkinCursors = UserDefaults.standard.object(forKey: Self.useSkinCursorsKey) as? Bool ?? true
+        useSkinFont = UserDefaults.standard.object(forKey: Self.useSkinFontKey) as? Bool ?? false
         if !loadPersistedSkin() {
             _ = loadBundledDefaultSkin()
         }
@@ -457,6 +477,11 @@ final class WinampSkinStore: ObservableObject {
         skinCursorsAvailable = containsSkinCursor(in: directory)
         if !skinCursorsAvailable {
             useSkinCursors = false
+        }
+        skinFontName = loadSkinFontName(from: directory)
+        resolvedFontCache.removeAll()
+        if !skinFontAvailable {
+            useSkinFont = false
         }
         predecodeCoreBitmaps()
         visualizationPalette = loadVisualizationPalette(from: directory)
@@ -780,6 +805,51 @@ final class WinampSkinStore: ObservableObject {
         }
     }
 
+    /// Reads the optional classic playlist font declaration from the active
+    /// skin itself. Do not use the bundled-resource fallback here: the
+    /// settings control is available only when this skin explicitly declares
+    /// a font, matching Winamp's PLEDIT.TXT contract.
+    private func loadSkinFontName(from directory: URL) -> String? {
+        guard let file = fileURL(named: "PLEDIT.TXT", in: directory),
+              let contents = try? String(contentsOf: file, encoding: .utf8) else {
+            return nil
+        }
+
+        var activeSection = ""
+        for rawLine in contents.split(whereSeparator: \.isNewline) {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let commentStart = line.firstIndex(of: ";") {
+                line = String(line[..<commentStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                activeSection = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                continue
+            }
+            guard activeSection == "text", let separator = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard key == "font" else { continue }
+
+            var value = String(line[line.index(after: separator)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let secondSeparator = value.firstIndex(of: "=") {
+                value = String(value[..<secondSeparator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if value.count >= 2,
+               ((value.first == "\"" && value.last == "\"")
+                || (value.first == "'" && value.last == "'")) {
+                value.removeFirst()
+                value.removeLast()
+            }
+            let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmedValue.isEmpty ? nil : trimmedValue
+        }
+        return nil
+    }
+
     /// Classic skins are partial overlays in practice. Keep the active skin
     /// authoritative when it provides a resource, and use the bundled skin
     /// only for a resource it omits. This keeps every renderer on one lookup
@@ -963,6 +1033,7 @@ final class WinampSkinStore: ObservableObject {
         equalizerSliderCache.removeAll()
         playlistTimeCache.removeAll()
         playlistWindowShadeTrackCache.removeAll()
+        resolvedFontCache.removeAll()
         textForegroundColorCache = nil
         textBackgroundColorCache = nil
         textForegroundColorResolved = false
@@ -1289,6 +1360,35 @@ final class WinampSkinStore: ObservableObject {
             blue: CGFloat(rgb & 0xFF) / 255,
             alpha: 1
         )
+    }
+
+    /// Resolves text surfaces in skinned windows through one path. The
+    /// default remains the app's existing monospaced system font; a skin font
+    /// is selected only when it was requested and is installed on this Mac.
+    /// Native settings and dialog windows do not call this method.
+    func resolvedFont(ofSize size: CGFloat) -> NSFont {
+        let skinNameKey = skinFontName ?? ""
+        let cacheKey = "\(size)|\(useSkinFont)|\(skinNameKey)"
+        if let cached = resolvedFontCache[cacheKey] { return cached }
+
+        let resolved: NSFont
+        if useSkinFont,
+           let skinFontName,
+           let skinFont = installedFont(named: skinFontName, size: size) {
+            resolved = skinFont
+        } else {
+            resolved = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        }
+        resolvedFontCache[cacheKey] = resolved
+        return resolved
+    }
+
+    private func installedFont(named name: String, size: CGFloat) -> NSFont? {
+        if let font = NSFont(name: name, size: size) { return font }
+        guard let family = NSFontManager.shared.availableFontFamilies.first(where: {
+            $0.caseInsensitiveCompare(name) == .orderedSame
+        }) else { return nil }
+        return NSFontManager.shared.font(withFamily: family, traits: [], weight: 5, size: size)
     }
 
     /// Classic skins provide a dedicated diagonal Playlist resize cursor.

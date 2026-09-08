@@ -3068,7 +3068,7 @@ private struct PlaylistStatusField: View {
                 Image(nsImage: glyphs).interpolation(.none).frame(width: counterWidth, height: 6)
             }
         }
-        .font(.system(size: 7, weight: .regular, design: .monospaced))
+        .font(Font(skin.resolvedFont(ofSize: 7)))
         .foregroundColor(Color(red: Double(color.redComponent), green: Double(color.greenComponent), blue: Double(color.blueComponent)))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
@@ -3289,6 +3289,12 @@ private struct SkinInformationView: View {
                 Divider()
                 Toggle("Use skin cursors", isOn: $skin.useSkinCursors)
                     .disabled(skin.isImporting || !skin.skinCursorsAvailable)
+                Toggle("Use skin font", isOn: $skin.useSkinFont)
+                    .disabled(skin.isImporting || !skin.skinFontAvailable)
+                if let skinFontName = skin.skinFontName {
+                    Text("Skin font: \(skinFontName)")
+                        .foregroundColor(.secondary)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 2)
@@ -3404,7 +3410,7 @@ private struct PlaylistView: View {
             }
             if !compactIndicator.isEmpty {
                 Text(compactIndicator)
-                    .font(.system(size: 7, weight: .regular, design: .monospaced))
+                    .font(Font(skin.resolvedFont(ofSize: 7)))
                     .foregroundColor(textColor)
                     .frame(width: CGFloat(indicatorWidth), height: 10, alignment: .leading)
                     .position(x: 8 + CGFloat(indicatorWidth) / 2, y: 8)
@@ -3412,7 +3418,7 @@ private struct PlaylistView: View {
             Text(trackTitle.uppercased())
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .font(.system(size: 7, weight: .regular, design: .monospaced))
+                .font(Font(skin.resolvedFont(ofSize: 7)))
                 .foregroundColor(textColor)
                 .frame(width: CGFloat(titleWidth), height: 10, alignment: .leading)
                 .position(x: 8 + CGFloat(indicatorWidth) + CGFloat(titleWidth) / 2, y: 8)
@@ -3525,7 +3531,7 @@ private struct PlaylistView: View {
                                 Spacer(minLength: 2)
                                 Text(entry.duration.map(formattedTime) ?? "--:--")
                             }
-                            .font(.system(size: CGFloat(8 * fontScale.factor), weight: .regular, design: .monospaced))
+                            .font(Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))))
                             // draw_pe.cpp: bit 2 (current) selects the text
                             // colour; bit 1 (selection) selects only the row
                             // background.  A selected current entry is white
@@ -3626,7 +3632,8 @@ private struct PlaylistView: View {
     /// Leave the original 13-pixel row untouched at 100%; larger text gains
     /// matching line height so the glyphs never overlap or get clipped.
     private var playlistEntryHeight: CGFloat {
-        max(13, ceil(8 * CGFloat(fontScale.factor) + 5))
+        let fontHeight = skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)).boundingRectForFont.height
+        return max(13, ceil(fontHeight + 3))
     }
 
     private var visiblePlaylistEntryCount: Int {

@@ -943,7 +943,7 @@ private struct TickerDisplay: View {
         ZStack(alignment: .leading) {
             Text(tickerDisplayText)
                 .lineLimit(1)
-                .font(.system(size: 7, weight: .regular, design: .monospaced))
+                .font(Font(skin.resolvedFont(ofSize: 7)))
                 .foregroundColor(textColor)
                 .fixedSize(horizontal: true, vertical: false)
                 .offset(y: -1)
@@ -960,6 +960,8 @@ private struct TickerDisplay: View {
             tickerTimer = nil
         }
         .onChange(of: statusText) { resetTicker(for: $0) }
+        .onChange(of: skin.useSkinFont) { _ in resetTicker(for: statusText) }
+        .onChange(of: skin.activeSkinDirectoryName) { _ in resetTicker(for: statusText) }
     }
 
     private var statusText: String {
@@ -984,7 +986,7 @@ private struct TickerDisplay: View {
 
     private func tickerTextWidth(_ text: String) -> CGFloat {
         (text as NSString).size(withAttributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 7, weight: .regular)
+            .font: skin.resolvedFont(ofSize: 7)
         ]).width
     }
 

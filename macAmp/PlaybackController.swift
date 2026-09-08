@@ -1063,7 +1063,13 @@ final class PlaybackController: NSObject, ObservableObject {
             let levels = dynamics.bars
             let peaks = dynamics.peaks
             let waveform: [CGFloat] = includesWaveform
-                ? (0..<76).map { CGFloat(min(1, max(-1, latestSamples[min(self.visualFFTSize - 1, $0 * (self.visualFFTSize - 1) / 75)]))) }
+                ? (0..<76).map { column in
+                    let offset = min(self.visualFFTSize - 1, column * (self.visualFFTSize - 1) / 75)
+                    // ArraySlice keeps the source collection's indices, so use
+                    // its start index instead of assuming the slice starts at 0.
+                    let sample = latestSamples[latestSamples.index(latestSamples.startIndex, offsetBy: offset)]
+                    return CGFloat(min(1, max(-1, sample)))
+                }
                 : []
             DispatchQueue.main.async {
                 // A frame can finish after Stop or after the visualizer was
