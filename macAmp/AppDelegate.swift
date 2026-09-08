@@ -1333,8 +1333,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func oneBackingPixel(for frame: NSRect) -> CGFloat {
         // Both adjoining bitmap skins can end with a partially covered device
-        // pixel after non-integer scaling. Reserve one pixel for each surface
-        // at a horizontal seam, so the compositor never exposes the desktop.
+        // pixel after non-integer scaling. Reserve one device pixel for each
+        // surface at every shared edge, so the compositor never exposes the
+        // desktop between adjacent windows.
         2 / backingScale(for: frame)
     }
 
@@ -2253,6 +2254,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleWindowShade(_ sender: Any?) {
         windowShade.isEnabled.toggle()
         applyInterfaceScale()
+        repairWindowSeams(for: window)
     }
 
     @objc private func toggleActiveWindowShade(_ sender: Any?) {
@@ -2394,13 +2396,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let panel else { return }
         let scale = CGFloat(interfaceScale.factor)
         let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Info"))
-        let logicalWidth = max(minimumWidth, ceil(width / 25) * 25)
-        let requestedHeight = max(116, ceil(height / 29) * 29)
-        let logicalHeight = magneticallySnappedResizeHeight(for: panel, requestedLogicalHeight: requestedHeight, scale: scale)
+        let logicalWidth = snappedResizeDimension(
+            width,
+            minimum: minimumWidth,
+            step: horizontalResizeStep(for: panel, scale: scale),
+            alignment: 275
+        )
+        let logicalHeight = snappedResizeDimension(
+            height,
+            minimum: 116,
+            step: verticalResizeStep(for: panel, scale: scale),
+            alignment: 116
+        )
         let top = panel.frame.maxY
         infoLogicalSize = NSSize(width: logicalWidth, height: logicalHeight)
         panel.setContentSize(NSSize(width: logicalWidth * scale, height: logicalHeight * scale))
         panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
+        repairWindowSeams(for: panel)
         schedulePersistentStateSave()
     }
 
@@ -2464,6 +2476,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func togglePlaylistWindowShade(_ sender: Any?) {
         playlistShade.isEnabled.toggle()
         applyInterfaceScale()
+        if let playlistWindow {
+            repairWindowSeams(for: playlistWindow)
+        }
     }
 
     private func makePlaylistWindowIfNeeded() -> NSWindow {
@@ -2533,15 +2548,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func resizeFloatingPlaylist(_ panel: NSWindow, context: PlaylistWindowContext, width: CGFloat, height: CGFloat) {
         let scale = CGFloat(interfaceScale.factor)
-        let logicalWidth = max(275, (width / 25).rounded() * 25)
-        let requestedHeight = max(116, (height / 29).rounded() * 29)
-        let logicalHeight = magneticallySnappedResizeHeight(for: panel, requestedLogicalHeight: requestedHeight, scale: scale)
+        let logicalWidth = snappedResizeDimension(
+            width,
+            minimum: 275,
+            step: horizontalResizeStep(for: panel, scale: scale),
+            alignment: 275
+        )
+        let logicalHeight = context.shade.isEnabled
+            ? context.layout.height
+            : snappedResizeDimension(
+                height,
+                minimum: 116,
+                step: verticalResizeStep(for: panel, scale: scale),
+                alignment: 116
+            )
         let displayedHeight = context.shade.isEnabled ? 14 : logicalHeight
         let top = panel.frame.maxY
         context.layout.width = logicalWidth; context.layout.height = logicalHeight
         context.model.unshadedWindowWidth = logicalWidth; context.model.unshadedWindowHeight = logicalHeight
         panel.setContentSize(NSSize(width: logicalWidth * scale, height: displayedHeight * scale))
         panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
+        repairWindowSeams(for: panel)
         context.model.windowFrame = panel.frame; playlistManager.save()
     }
 
@@ -2555,6 +2582,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let height = (context.shade.isEnabled ? 14 : context.layout.height) * scale
         panel.setContentSize(NSSize(width: context.layout.width * scale, height: height))
         panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
+        repairWindowSeams(for: panel)
         panel.minSize = NSSize(width: 275 * scale, height: context.shade.isEnabled ? 14 * scale : 116 * scale)
         panel.maxSize = context.shade.isEnabled
             ? NSSize(width: CGFloat.greatestFiniteMagnitude, height: 14 * scale)
@@ -2607,11 +2635,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Info window can align exactly with both the top of the main window and
     /// the bottom of any Playlist Editor placed below it.
     func resizePlaylist(toLogicalWidth width: CGFloat, height: CGFloat) {
-        let snappedWidth = max(275, ceil(width / 25) * 25)
         guard let playlistWindow else { return }
         let scale = CGFloat(interfaceScale.factor)
-        let requestedHeight = max(116, ceil(height / 29) * 29)
-        let snappedHeight = magneticallySnappedResizeHeight(for: playlistWindow, requestedLogicalHeight: requestedHeight, scale: scale)
+        let snappedWidth = snappedResizeDimension(
+            width,
+            minimum: 275,
+            step: horizontalResizeStep(for: playlistWindow, scale: scale),
+            alignment: 275
+        )
+        let snappedHeight = snappedResizeDimension(
+            height,
+            minimum: 116,
+            step: verticalResizeStep(for: playlistWindow, scale: scale),
+            alignment: 116
+        )
         let size = NSSize(width: snappedWidth * scale, height: snappedHeight * scale)
         let frame = NSRect(x: playlistWindow.frame.minX,
                            y: playlistWindow.frame.maxY - size.height,
@@ -2621,6 +2658,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistLayout.width = snappedWidth
         playlistLayout.height = snappedHeight
         playlistWindow.setFrame(frame, display: true)
+        repairWindowSeams(for: playlistWindow)
         playlistWindow.minSize = NSSize(width: 275 * scale, height: 116 * scale)
         isRepositioningPlaylist = false
         playlistWasMoved = true
@@ -2628,42 +2666,73 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Docking is resolved only after a drag, never as a side effect here.
     }
 
-    /// A bottom-right resize keeps the window's top fixed.  When its moving
-    /// lower edge comes close to the lower edge of an adjacent skin window,
-    /// use that exact height so a right-side Info panel can span the player
-    /// and the Playlist Editor below it without a one-pixel seam.
-    private func magneticallySnappedResizeHeight(for panel: NSWindow, requestedLogicalHeight: CGFloat, scale: CGFloat) -> CGFloat {
-        let top = panel.frame.maxY
-        let requestedBottom = top - requestedLogicalHeight * scale
-        // Height is normally quantised to the 29 px Winamp row.  The target
-        // edge can therefore be up to half a row away after quantisation;
-        // use a half-row capture zone in *screen* coordinates so snapping is
-        // equally reliable at 1× and 2× interface scale.
-        let threshold: CGFloat = 15 * scale
-        let candidates = [window, equalizerWindow, infoWindow].compactMap { $0 }
-            + playlistWindows.values.filter { $0 !== panel }
-        for candidate in candidates where candidate.isVisible && candidate !== panel {
-            let frame = candidate.frame
-            let horizontallyAdjacent = panel.frame.maxX >= frame.minX - threshold
-                && panel.frame.minX <= frame.maxX + threshold
-            guard horizontallyAdjacent, abs(requestedBottom - frame.minY) <= threshold else { continue }
-            return max(116, (top - frame.minY) / scale)
+    /// Main and Equalizer use 275×116 logical pixels. Keep resize increments
+    /// no larger than the classic 25/29 px grid, but choose a smaller increment
+    /// when the current interface scale would turn it into a fractional device
+    /// pixel. This keeps successive resizable frames on one compositor grid.
+    private func horizontalResizeStep(for panel: NSWindow, scale: CGFloat) -> CGFloat {
+        resizeStep(maximum: 25, scale: scale, frame: panel.frame)
+    }
+
+    private func verticalResizeStep(for panel: NSWindow, scale: CGFloat) -> CGFloat {
+        resizeStep(maximum: 29, scale: scale, frame: panel.frame)
+    }
+
+    private func resizeStep(maximum: CGFloat, scale: CGFloat, frame: NSRect) -> CGFloat {
+        let deviceScale = scale * backingScale(for: frame)
+        let upperBound = max(1, Int(maximum.rounded(.down)))
+        for candidate in stride(from: upperBound, through: 1, by: -1) {
+            let devicePixels = CGFloat(candidate) * deviceScale
+            if abs(devicePixels - devicePixels.rounded()) < 0.0001 {
+                return CGFloat(candidate)
+            }
         }
-        return requestedLogicalHeight
+        // This fallback is only possible on an unusual non-rational display
+        // scale. It still obeys the user's upper bound and never enlarges the
+        // existing resize step.
+        return 1
+    }
+
+    private func snappedResizeDimension(
+        _ value: CGFloat,
+        minimum: CGFloat,
+        step: CGFloat,
+        alignment: CGFloat
+    ) -> CGFloat {
+        let lowerBound = max(0, minimum)
+        let distance = max(0, value - lowerBound)
+        let stepped = lowerBound + ceil(distance / max(1, step)) * max(1, step)
+        // Keep Main/Equalizer landmarks reachable even when a scale-specific
+        // pixel-safe step (for example 25 instead of 29) is active.
+        let aligned = max(lowerBound, (value / alignment).rounded() * alignment)
+        return abs(aligned - value) <= max(1, step) * 0.5 ? aligned : stepped
+    }
+
+    private func repairWindowSeams(for panel: NSWindow) {
+        let neighbours = [window, equalizerWindow, infoWindow].compactMap { $0 }
+            + playlistWindows.values
+        let visibleNeighbours = neighbours.filter { $0 !== panel && $0.isVisible }
+        magnet(panel, against: visibleNeighbours, includeScreenEdges: false)
     }
 
     /// In WindowShade mode the Playlist Editor exposes only its 9 px horizontal
     /// resize grip. Width remains on Winamp's 25 px grid; height stays 14 px.
     func resizePlaylistWindowShade(toLogicalWidth width: CGFloat) {
         guard playlistShade.isEnabled, let playlistWindow else { return }
-        let snappedWidth = max(275, ceil(width / 25) * 25)
         let scale = CGFloat(interfaceScale.factor)
+        let snappedWidth = snappedResizeDimension(
+            width,
+            minimum: 275,
+            step: horizontalResizeStep(for: playlistWindow, scale: scale),
+            alignment: 275
+        )
         playlistLayout.width = snappedWidth
         let frame = NSRect(x: playlistWindow.frame.minX,
                            y: playlistWindow.frame.minY,
                            width: snappedWidth * scale,
                            height: 14 * scale)
         playlistWindow.setFrame(frame, display: true)
+        repairWindowSeams(for: playlistWindow)
         playlistWindow.minSize = NSSize(width: 275 * scale, height: 14 * scale)
         playlistWindow.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: 14 * scale)
         playlistWasMoved = true
@@ -2882,7 +2951,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ) {
         let threshold: CGFloat = 12
         var frame = movingWindow.frame
-        let verticalSeamOverlap = oneBackingPixel(for: frame)
+        let seamOverlap = oneBackingPixel(for: frame)
         for neighbour in neighbours {
             let other = neighbour.frame
             // Snap to a neighbouring playlist even while the windows have not
@@ -2891,12 +2960,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let verticallyClose = frame.maxY >= other.minY - threshold && frame.minY <= other.maxY + threshold
             let horizontallyClose = frame.maxX >= other.minX - threshold && frame.minX <= other.maxX + threshold
             if verticallyClose {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
             }
             if horizontallyClose {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - verticalSeamOverlap }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + verticalSeamOverlap }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
             }
             // Side-by-side windows also align to a common top or bottom edge.
             if abs(frame.maxY - other.maxY) <= threshold { frame.origin.y = other.maxY - frame.height }
@@ -2905,12 +2974,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if abs(frame.minX - other.minX) <= threshold { frame.origin.x = other.minX }
             if abs(frame.maxX - other.maxX) <= threshold { frame.origin.x = other.maxX - frame.width }
             if frame.maxY > other.minY && frame.minY < other.maxY {
-                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX }
-                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width }
+                if abs(frame.minX - other.maxX) <= threshold { frame.origin.x = other.maxX - seamOverlap }
+                if abs(frame.maxX - other.minX) <= threshold { frame.origin.x = other.minX - frame.width + seamOverlap }
             }
             if frame.maxX > other.minX && frame.minX < other.maxX {
-                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - verticalSeamOverlap }
-                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + verticalSeamOverlap }
+                if abs(frame.minY - other.maxY) <= threshold { frame.origin.y = other.maxY - seamOverlap }
+                if abs(frame.maxY - other.minY) <= threshold { frame.origin.y = other.minY - frame.height + seamOverlap }
             }
         }
         // Screen edges have the final priority over window-to-window alignment.
@@ -2990,6 +3059,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleEqualizerWindowShade(_ sender: Any?) {
         equalizerShade.isEnabled.toggle()
         applyInterfaceScale()
+        if let equalizerWindow {
+            repairWindowSeams(for: equalizerWindow)
+        }
     }
 
     private func dockEqualizerBelowPlayer() {
