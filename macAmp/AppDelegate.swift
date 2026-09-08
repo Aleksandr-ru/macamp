@@ -398,6 +398,92 @@ final class SkinTitleControlNSView: NSView {
     }
 }
 
+private enum StatusBarIconMode: String, CaseIterable, Identifiable {
+    case application, playbackStatus
+    var id: String { rawValue }
+    var title: String { self == .application ? "Application icon" : "Playback status" }
+}
+
+private enum StatusBarClickAction: String, CaseIterable, Identifiable {
+    case showApplication, togglePlayback, nextTrack, playbackMenu
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .showApplication: return "Show application"
+        case .togglePlayback: return "Toggle play/pause"
+        case .nextTrack: return "Next track"
+        case .playbackMenu: return "Playback menu"
+        }
+    }
+}
+
+private final class StatusBarPreferences: ObservableObject {
+    private enum Key { static let tray = "statusBar.showTray"; static let icon = "statusBar.icon"; static let left = "statusBar.left"; static let right = "statusBar.right" }
+    @Published private(set) var showsTray: Bool
+    @Published var iconMode: StatusBarIconMode { didSet { store() } }
+    @Published var leftAction: StatusBarClickAction { didSet { store() } }
+    @Published var rightAction: StatusBarClickAction { didSet { store() } }
+    var onChange: (() -> Void)?
+
+    init(defaults: UserDefaults = .standard) {
+        let savedTray = defaults.object(forKey: Key.tray) as? Bool ?? false
+        showsTray = savedTray
+        iconMode = StatusBarIconMode(rawValue: defaults.string(forKey: Key.icon) ?? "") ?? .application
+        leftAction = StatusBarClickAction(rawValue: defaults.string(forKey: Key.left) ?? "") ?? .showApplication
+        rightAction = StatusBarClickAction(rawValue: defaults.string(forKey: Key.right) ?? "") ?? .playbackMenu
+    }
+
+    func setShowsTray(_ value: Bool) { showsTray = value; store() }
+    private func store() {
+        let defaults = UserDefaults.standard
+        defaults.set(showsTray, forKey: Key.tray)
+        defaults.set(iconMode.rawValue, forKey: Key.icon); defaults.set(leftAction.rawValue, forKey: Key.left); defaults.set(rightAction.rawValue, forKey: Key.right)
+        onChange?()
+    }
+}
+
+private enum StatusBarImages {
+    static let application = makeApplication()
+    static let play = makeGlyph("play")
+    static let pause = makeGlyph("pause")
+    static let stop = makeGlyph("stop")
+
+    private static func canvas(_ draw: () -> Void) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18)); image.lockFocus(); draw(); image.unlockFocus(); return image
+    }
+    private static func makeApplication() -> NSImage {
+        canvas {
+            NSColor.black.setFill()
+            let diamond = NSBezierPath(); diamond.move(to: NSPoint(x: 9, y: 17)); diamond.line(to: NSPoint(x: 18, y: 9)); diamond.line(to: NSPoint(x: 9, y: 1)); diamond.line(to: NSPoint(x: 0, y: 9)); diamond.close(); diamond.fill()
+            // Match the application mark: the bolt runs bottom-left to
+            // top-right and deliberately protrudes beyond the diamond at both
+            // ends instead of being contained by it.
+            let bolt = NSBezierPath()
+            bolt.move(to: NSPoint(x: 18, y: 15.5))
+            bolt.line(to: NSPoint(x: 9.5, y: 9.5))
+            bolt.line(to: NSPoint(x: 14, y: 8.6))
+            bolt.line(to: NSPoint(x: 0, y: 0.5))
+            bolt.line(to: NSPoint(x: 7.5, y: 7.4))
+            bolt.line(to: NSPoint(x: 4, y: 8.4))
+            bolt.close()
+            NSGraphicsContext.current?.compositingOperation = .clear; bolt.lineWidth = 3.2; bolt.stroke()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            NSColor.black.setFill(); bolt.fill()
+            NSColor.black.setStroke(); bolt.lineWidth = 0.8; bolt.stroke()
+        }
+    }
+    private static func makeGlyph(_ glyph: String) -> NSImage {
+        canvas {
+            NSColor.black.setFill()
+            switch glyph {
+            case "play": let path = NSBezierPath(); path.move(to: NSPoint(x: 5, y: 3)); path.line(to: NSPoint(x: 15, y: 9)); path.line(to: NSPoint(x: 5, y: 15)); path.close(); path.fill()
+            case "pause": NSBezierPath(roundedRect: NSRect(x: 4, y: 3, width: 3.5, height: 12), xRadius: 1, yRadius: 1).fill(); NSBezierPath(roundedRect: NSRect(x: 10.5, y: 3, width: 3.5, height: 12), xRadius: 1, yRadius: 1).fill()
+            default: NSBezierPath(roundedRect: NSRect(x: 4, y: 4, width: 10, height: 10), xRadius: 1, yRadius: 1).fill()
+            }
+        }
+    }
+}
+
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
@@ -421,6 +507,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let playlistLayout = PlaylistLayout()
     private let playback = PlaybackController()
     private let trackNotifications = TrackNotificationController()
+    private let statusBarPreferences = StatusBarPreferences()
+    private var statusItem: NSStatusItem?
     private var pendingTrackNotification: (entry: PlaylistEntry, shouldNotify: Bool)?
     /// A file opened with the "Play file" preference is not inserted into a
     /// playlist. Keep its source separate so reaching the end does not
@@ -640,6 +728,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         connectPreferencesMenu()
         connectQuitMenu()
         connectControlsMenu()
+        statusBarPreferences.onChange = { [weak self] in self?.refreshStatusItem() }
+        refreshStatusItem()
+        playback.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateStatusItemImage() }
+        }.store(in: &persistenceCancellables)
         connectWindowMenu()
         installPlaybackShortcuts()
         installMediaKeyHandling()
@@ -2337,6 +2430,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshInterfaceVisibility()
     }
 
+    private func refreshStatusItem() {
+        if statusBarPreferences.showsTray {
+            if statusItem == nil {
+                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+                item.button?.target = self
+                item.button?.action = #selector(statusItemClicked(_:))
+                item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+                statusItem = item
+            }
+            updateStatusItemImage()
+        } else if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
+    }
+
+    private func updateStatusItemImage() {
+        guard let button = statusItem?.button else { return }
+        let image: NSImage
+        if statusBarPreferences.iconMode == .application { image = StatusBarImages.application }
+        else if playback.isPlaying { image = StatusBarImages.play }
+        else if playback.isPaused { image = StatusBarImages.pause }
+        else { image = StatusBarImages.stop }
+        image.isTemplate = true
+        button.image = image
+        button.toolTip = playback.isPlaying || playback.isPaused ? playback.title : "macAmp"
+    }
+
+    @objc private func statusItemClicked(_ sender: Any?) {
+        let action = NSApp.currentEvent?.type == .rightMouseUp ? statusBarPreferences.rightAction : statusBarPreferences.leftAction
+        switch action {
+        case .showApplication: showWindowsFromNotification()
+        case .togglePlayback: if playback.isPlaying { pausePlayback() } else { playFromActivePlaylist() }
+        case .nextTrack: playlistTransportAction(4)
+        case .playbackMenu: if let controlsMenu { statusItem?.popUpMenu(controlsMenu) }
+        }
+    }
+
     private func showWindowsFromNotification() {
         let auxiliary = [equalizerState.isVisible ? equalizerWindow : nil,
                          infoState.isVisible ? infoWindow : nil,
@@ -2400,7 +2531,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let preferences = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -2415,7 +2546,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             trackNotifications: trackNotifications,
             equalizer: playback.equalizer,
             visualization: playback.visualization,
-            skin: WinampSkinStore.shared
+            skin: WinampSkinStore.shared,
+            statusBarPreferences: statusBarPreferences
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -3439,6 +3571,7 @@ private struct SettingsView: View {
     @ObservedObject var equalizer: EqualizerController
     @ObservedObject var visualization: PlaybackVisualizationState
     @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var statusBarPreferences: StatusBarPreferences
     @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
     @State private var selectedTab: Tab = .general
 
@@ -3467,7 +3600,7 @@ private struct SettingsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(width: 620, height: 420, alignment: .topLeading)
+        .frame(width: 620, height: 560, alignment: .topLeading)
     }
 
     private var generalSettings: some View {
@@ -3500,6 +3633,16 @@ private struct SettingsView: View {
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Application visibility")
+                Toggle("Show application icon in menu bar", isOn: Binding(get: { statusBarPreferences.showsTray }, set: { statusBarPreferences.setShowsTray($0) }))
+                Group {
+                    Picker("Menu bar icon", selection: $statusBarPreferences.iconMode) { ForEach(StatusBarIconMode.allCases) { Text($0.title).tag($0) } }
+                    Picker("Left click", selection: $statusBarPreferences.leftAction) { ForEach(StatusBarClickAction.allCases) { Text($0.title).tag($0) } }
+                    Picker("Right click", selection: $statusBarPreferences.rightAction) { ForEach(StatusBarClickAction.allCases) { Text($0.title).tag($0) } }
+                }
+                .disabled(!statusBarPreferences.showsTray)
             }
             Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
                 ForEach(AdaptiveEQCorrectionRange.allCases) { range in
