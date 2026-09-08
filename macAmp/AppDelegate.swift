@@ -706,6 +706,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
+        if handlePlaylistTitleRebuildShortcut(event, modifiers: modifiers) { return true }
         if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
         if handleWindowToggleShortcut(event, modifiers: modifiers) { return true }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
@@ -905,6 +906,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
         playlistManager.removePlaybackErrorEntries(from: playlist)
+        return true
+    }
+
+    /// ⌘⌥E refreshes the selected rows in the key Playlist Editor.  The
+    /// physical E key matches the other context-aware Winamp shortcuts and
+    /// avoids changing behaviour with a different keyboard layout.
+    private func handlePlaylistTitleRebuildShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 14, // physical E key
+              modifiers == [.command, .option],
+              let sourceWindow = event.window,
+              sourceWindow.isKeyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID),
+              playlistManager.canRebuildTitles(in: playlist) else {
+            return false
+        }
+        playlistManager.rebuildTitlesForSelection(in: playlist)
         return true
     }
 
@@ -2221,6 +2242,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func sort(_ playlist: PlaylistModel, by option: PlaylistManager.SortOption) {
         playlistManager.sort(playlist, by: option)
+    }
+
+    func canRebuildTitles(for playlist: PlaylistModel) -> Bool {
+        playlistManager.canRebuildTitles(in: playlist)
+    }
+
+    func rebuildTitles(for playlist: PlaylistModel) {
+        playlistManager.rebuildTitlesForSelection(in: playlist)
     }
 
     /// Returns the one file that the Playlist Editor's File Info command may
@@ -3820,11 +3849,14 @@ private struct PlaylistView: View {
                 index: 3,
                 titles: [
                     "File Info", "Reveal in Finder",
-                "Sort by title", "Sort by artist/album/track number",
+                    "Sort by title", "Sort by artist/album/track number",
                     "Sort by file name", "Sort by path + file name", "Reverse",
-                    "Misc…"
+                    "Rebuild titles on selection"
                 ],
-                separatorsBefore: ["Sort by title", "Misc…"]
+                shortcuts: [
+                    "Rebuild titles on selection": .commandOptionE
+                ],
+                separatorsBefore: ["Sort by title", "Rebuild titles on selection"]
             )
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
                 "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
@@ -4119,6 +4151,7 @@ private struct PlaylistMenuShortcut {
     static let commandN = Self(keyEquivalent: "n", modifierFlags: [.command])
     static let commandO = Self(keyEquivalent: "o", modifierFlags: [.command])
     static let commandShiftS = Self(keyEquivalent: "s", modifierFlags: [.command, .shift])
+    static let commandOptionE = Self(keyEquivalent: "e", modifierFlags: [.command, .option])
 }
 
 private final class PlaylistMenuHotspotNSView: NSView {
@@ -4158,6 +4191,8 @@ private final class PlaylistMenuHotspotNSView: NSView {
                     item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
                 } else if title == "Reveal in Finder" {
                     item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
+                } else if title == "Rebuild titles on selection" {
+                    item.isEnabled = appDelegate.canRebuildTitles(for: playlist)
                 } else if let option = PlaylistManager.SortOption(menuTitle: title) {
                     item.isEnabled = appDelegate.canSort(playlist, by: option)
                 }
@@ -4183,6 +4218,8 @@ private final class PlaylistMenuHotspotNSView: NSView {
             if let playlist { AppDelegate.shared?.showFileInfo(for: playlist) }
         case "Reveal in Finder":
             if let playlist { AppDelegate.shared?.revealInFinder(for: playlist) }
+        case "Rebuild titles on selection":
+            if let playlist { AppDelegate.shared?.rebuildTitles(for: playlist) }
         case "New Playlist": AppDelegate.shared?.newPlaylist(nil)
         case "Load Playlist…": AppDelegate.shared?.openDocument(nil)
         case "Save Playlist As…": AppDelegate.shared?.savePlaylistAs(nil)

@@ -595,6 +595,45 @@ final class PlaylistManager: ObservableObject {
         startSort(records, option: option, playlist: playlist, task: task)
     }
 
+    func canRebuildTitles(in playlist: PlaylistModel) -> Bool {
+        guard playlists.contains(where: { $0.id == playlist.id }),
+              !playlist.selectedIDs.isEmpty,
+              playlist.sortingProgress == nil,
+              !isLoadingEntries(playlist) else { return false }
+        return playlist.entries.contains { playlist.selectedIDs.contains($0.id) }
+    }
+
+    /// Invalidates the selected rows and sends them through the same serial
+    /// metadata reader used for newly added files.  Keeping the regular queue
+    /// here preserves its playback/visibility priority and its status counter.
+    func rebuildTitlesForSelection(in playlist: PlaylistModel) {
+        guard canRebuildTitles(in: playlist) else { return }
+        let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        guard !selectedEntries.isEmpty else { return }
+
+        for entry in selectedEntries {
+            entry.metadataIsAvailable = false
+            entry.artist = nil
+            entry.trackTitle = nil
+            entry.title = entry.url.deletingPathExtension().lastPathComponent
+            entry.duration = nil
+        }
+        playlist.recalculateTotalDuration()
+
+        let pendingCount = playlist.entries.reduce(into: 0) { count, entry in
+            if !entry.metadataIsAvailable { count += 1 }
+        }
+        metadataProgress[playlist.id] = (0, pendingCount)
+        playlist.scannerState = .readingMetadata(processed: 0, total: pendingCount)
+        playlist.metadataRevision &+= 1
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist)
+        metadataPriorityRevision &+= 1
+        scheduleMetadata(for: playlist)
+        requestMetadataReprioritization()
+        save()
+    }
+
     private func startSort(
         _ records: [SortRecord],
         option: SortOption,
@@ -1326,6 +1365,7 @@ final class PlaylistManager: ObservableObject {
             preferredEntryIDs.insert(playingEntryID)
         }
         for playlist in playlists where playlist.isVisible && !pausedPlaylistIDs.contains(playlist.id) {
+            preferredEntryIDs.formUnion(playlist.selectedIDs)
             let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
             let end = min(playlist.entries.count, start + playlist.visibleEntryCount)
             preferredEntryIDs.formUnion(playlist.entries[start..<end].map(\.id))
@@ -1369,6 +1409,19 @@ final class PlaylistManager: ObservableObject {
                 metadataInFlightRequests[entry.id] = requestID
                 work = (active, entry, active.entries.count, metadataPriorityRevision, requestID)
                 return
+            }
+            for playlist in eligible {
+                if let entry = playlist.entries.first(where: {
+                    playlist.selectedIDs.contains($0.id)
+                        && !$0.metadataIsAvailable
+                        && metadataInFlightRequests[$0.id] == nil
+                }) {
+                    let requestID = nextMetadataRequestID
+                    nextMetadataRequestID &+= 1
+                    metadataInFlightRequests[entry.id] = requestID
+                    work = (playlist, entry, playlist.entries.count, metadataPriorityRevision, requestID)
+                    return
+                }
             }
             for playlist in eligible {
                 let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
