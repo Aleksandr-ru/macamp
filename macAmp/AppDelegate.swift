@@ -2186,20 +2186,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func savePlaylistAs(_ sender: Any?) {
         guard let playlist = playlistManager.editingPlaylist else { return }
-        let panel = NSSavePanel(); panel.allowedFileTypes = ["m3u"]; panel.nameFieldStringValue = "\(playlist.name).m3u"
+        let panel = playlistSavePanel(for: playlist)
         if panel.runModal() == .OK, let url = panel.url { try? playlistManager.savePlaylist(playlist, to: url); connectFileMenu() }
     }
 
     private func savePlaylistForClose(_ playlist: PlaylistModel) -> Bool {
-        if let url = playlist.fileURL {
-            do { try playlistManager.savePlaylist(playlist, to: url); return true }
-            catch { NSSound.beep(); return false }
-        }
-        let panel = NSSavePanel(); panel.allowedFileTypes = ["m3u"]
-        panel.nameFieldStringValue = "\(playlist.name).m3u"
+        let panel = playlistSavePanel(for: playlist)
         guard panel.runModal() == .OK, let url = panel.url else { return false }
         do { try playlistManager.savePlaylist(playlist, to: url); connectFileMenu(); return true }
         catch { NSSound.beep(); return false }
+    }
+
+    /// Creates the native save panel used by both Save As and the save step
+    /// of the close confirmation. A playlist's display name is intentionally
+    /// independent from the name of its currently bound file, so it is always
+    /// the proposed filename. A local file binding only supplies the initial
+    /// directory; it never bypasses the panel by silently overwriting the
+    /// existing file.
+    private func playlistSavePanel(for playlist: PlaylistModel) -> NSSavePanel {
+        let panel = NSSavePanel()
+        panel.allowedFileTypes = ["m3u"]
+        panel.nameFieldStringValue = "\(playlist.name).m3u"
+
+        guard let fileURL = playlist.fileURL, fileURL.isFileURL else { return panel }
+        let directoryURL = fileURL.deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: directoryURL.path) else { return panel }
+        panel.directoryURL = directoryURL
+        return panel
     }
 
     @objc func openRecentPlaylist(_ sender: NSMenuItem) {
@@ -3114,9 +3127,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func closePlaylistWindow(for model: PlaylistModel) {
-        if model.isDirty {
-            let alert = NSAlert(); alert.messageText = "Save changes to \(model.name)?"
-            alert.informativeText = "This playlist has unsaved changes."
+        // A playlist without a file binding has no external saved version to
+        // preserve when it is closed, so it must go through the same decision
+        // even when it has not yet acquired the dirty flag.
+        if model.isDirty || model.fileURL == nil {
+            let alert = NSAlert()
+            alert.messageText = model.isDirty ? "Save changes to \(model.name)?" : "Save \(model.name)?"
+            alert.informativeText = model.isDirty
+                ? "This playlist has unsaved changes."
+                : "This playlist has not been saved to a file."
             alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Don't Save"); alert.addButton(withTitle: "Cancel")
             switch alert.runModal() {
             case .alertFirstButtonReturn: guard savePlaylistForClose(model) else { return }
