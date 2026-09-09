@@ -287,6 +287,12 @@ final class PlaybackController: NSObject, ObservableObject {
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
     private var isStreamingAnalysisTapInstalled = false
+    /// The classic analyzer and MilkDrop are separate consumers of the same
+    /// PCM snapshot.  Keeping their demands independent lets closing one view
+    /// stop its work without turning the other view off.
+    private var mainVisualizationEnabled = true
+    private var mainNeedsWaveformSamples = false
+    private var milkDropVisualizationEnabled = false
     private var isVisualizationEnabled = true
     private var needsWaveformSamples = false
     private var isInterfaceVisible = true
@@ -423,10 +429,25 @@ final class PlaybackController: NSObject, ObservableObject {
     /// audio engine is independent of the visualizer, so turning it off must
     /// also stop disk reads and DSP work rather than merely hiding the view.
     func setVisualization(enabled: Bool, waveform: Bool) {
-        isVisualizationEnabled = enabled
-        needsWaveformSamples = enabled && waveform
+        mainVisualizationEnabled = enabled
+        mainNeedsWaveformSamples = enabled && waveform
+        updateVisualizationDemand()
+    }
+
+    /// MilkDrop reuses the analyzer's live PCM tap instead of decoding a
+    /// second stream.  It is enabled only while the visualization window is
+    /// visible and playback is active.
+    func setMilkDropVisualization(enabled: Bool) {
+        guard milkDropVisualizationEnabled != enabled else { return }
+        milkDropVisualizationEnabled = enabled
+        updateVisualizationDemand()
+    }
+
+    private func updateVisualizationDemand() {
+        isVisualizationEnabled = mainVisualizationEnabled || milkDropVisualizationEnabled
+        needsWaveformSamples = mainNeedsWaveformSamples || milkDropVisualizationEnabled
         updateLiveAnalysisTap()
-        guard !enabled else { return }
+        guard !isVisualizationEnabled else { return }
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
         visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)

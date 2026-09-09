@@ -307,6 +307,10 @@ final class InfoWindowState: ObservableObject {
     @Published var isVisible = false
 }
 
+final class VisualizationWindowState: ObservableObject {
+    @Published var isVisible = false
+}
+
 final class AlwaysOnTopState: ObservableObject {
     @Published var isEnabled = false
 }
@@ -498,6 +502,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let equalizerState = EqualizerWindowState()
     private let playlistState = PlaylistWindowState()
     private let infoState = InfoWindowState()
+    private let visualizationState = VisualizationWindowState()
     private let alwaysOnTopState = AlwaysOnTopState()
     private let settingsWindowState = SettingsWindowState()
     private let equalizerFocus = EqualizerFocusState()
@@ -519,10 +524,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var equalizerWindow: NSWindow?
     private var playlistWindow: NSWindow?
     private var infoWindow: NSWindow?
+    private var visualizationWindow: NSWindow?
     private let infoFocus = WindowFocusState()
+    private let visualizationFocus = WindowFocusState()
     private let infoModel = InfoWindowModel()
     private var infoTargetURL: URL?
     private var infoLogicalSize = NSSize(width: 250, height: 300)
+    private var visualizationLogicalSize = NSSize(width: 250, height: 300)
     private var playlistWindows: [UUID: NSWindow] = [:]
     private var playlistWindowContexts: [UUID: PlaylistWindowContext] = [:]
     private weak var lastActivePlaylistWindow: NSWindow?
@@ -590,6 +598,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var infoHeight: Double?
         var infoOriginX: Double?
         var infoOriginY: Double?
+        var visualizationVisible: Bool?
+        var visualizationWidth: Double?
+        var visualizationHeight: Double?
+        var visualizationOriginX: Double?
+        var visualizationOriginY: Double?
         var equalizerDocked: Bool
         var playlistDocked: Bool
         var equalizer: EqualizerPersistentState
@@ -642,6 +655,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.trackNotifications.show(artist: artist, title: title, duration: duration)
                 }
             }
+            // The visualizer uses a distinct profile for every new track. The
+            // state change is inexpensive while hidden; rendering remains
+            // paused until VisualizationPanelView considers the window visible.
+            DispatchQueue.main.async { [weak self] in
+                (self?.visualizationWindow?.contentView as? VisualizationPanelView)?
+                    .playbackDidStartNewTrack()
+            }
         }
         // Create the SwiftUI view that provides the window contents.
         let contentView = ContentView(
@@ -653,6 +673,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             equalizerState: equalizerState,
             playlistState: playlistState,
             infoState: infoState,
+            visualizationState: visualizationState,
             alwaysOnTopState: alwaysOnTopState,
             settingsWindowState: settingsWindowState
         )
@@ -909,6 +930,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               sourceWindow === window
                 || sourceWindow === equalizerWindow
                 || sourceWindow === infoWindow
+                || sourceWindow === visualizationWindow
                 || playlistWindows.values.contains(where: { $0 === sourceWindow }) else {
             return false
         }
@@ -1023,7 +1045,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// The same keys control the visual scale of the active player surface:
-    /// Main/EQ use the skin/interface scale, while Playlist/Info use their
+    /// Main/EQ use the skin/interface scale, while Playlist/Info/Visualization use their
     /// shared content-font scale.  Keeping this at the local event monitor
     /// preserves routing for non-activating panels and never intercepts the
     /// shortcut from Settings or another application window.
@@ -1055,7 +1077,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             interfaceScale.percent += delta
             return true
         }
-        if sourceWindow === infoWindow || playlistWindows.values.contains(where: { $0 === sourceWindow }) {
+        if sourceWindow === infoWindow || sourceWindow === visualizationWindow
+            || playlistWindows.values.contains(where: { $0 === sourceWindow }) {
             playlistFontScale.percent += delta
             return true
         }
@@ -1194,6 +1217,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var restoredPlaylistOrigin: NSPoint?
     private var shouldRestoreInfoWindow = false
     private var restoredInfoOrigin: NSPoint?
+    private var shouldRestoreVisualizationWindow = false
+    private var restoredVisualizationOrigin: NSPoint?
 
     private func restorePersistentState() {
         guard let data = UserDefaults.standard.data(forKey: persistentStateKey),
@@ -1208,6 +1233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistState.isVisible = state.playlistVisible
         playlistShade.isEnabled = state.playlistShade
         infoState.isVisible = state.infoVisible ?? false
+        visualizationState.isVisible = state.visualizationVisible ?? false
         playlistLayout.width = max(275, CGFloat(state.playlistWidth))
         playlistLayout.height = max(116, CGFloat(state.playlistHeight))
         restoredMainOrigin = NSPoint(x: state.mainOriginX, y: state.mainOriginY)
@@ -1219,6 +1245,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             infoLogicalSize = NSSize(width: max(250, CGFloat(width)), height: max(116, CGFloat(height)))
         }
         if let x = state.infoOriginX, let y = state.infoOriginY { restoredInfoOrigin = NSPoint(x: x, y: y) }
+        shouldRestoreVisualizationWindow = state.visualizationVisible ?? false
+        if let width = state.visualizationWidth, let height = state.visualizationHeight {
+            visualizationLogicalSize = NSSize(width: max(250, CGFloat(width)), height: max(116, CGFloat(height)))
+        }
+        if let x = state.visualizationOriginX, let y = state.visualizationOriginY {
+            restoredVisualizationOrigin = NSPoint(x: x, y: y)
+        }
         isEqualizerDocked = state.equalizerDocked
         equalizerWasMoved = !state.equalizerDocked
         isPlaylistDocked = state.playlistDocked
@@ -1251,6 +1284,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             info.makeKeyAndOrderFront(nil)
             infoState.isVisible = true
         }
+        if shouldRestoreVisualizationWindow {
+            let visualization = makeVisualizationWindowIfNeeded()
+            if let restoredVisualizationOrigin { visualization.setFrameOrigin(restoredVisualizationOrigin) }
+            visualization.makeKeyAndOrderFront(nil)
+            visualizationState.isVisible = true
+            (visualization.contentView as? VisualizationPanelView)?.updateRenderingState()
+        }
     }
 
     private func savePersistentState() {
@@ -1267,6 +1307,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             infoVisible: infoState.isVisible,
             infoWidth: Double(infoLogicalSize.width), infoHeight: Double(infoLogicalSize.height),
             infoOriginX: infoWindow.map { Double($0.frame.origin.x) }, infoOriginY: infoWindow.map { Double($0.frame.origin.y) },
+            visualizationVisible: visualizationState.isVisible,
+            visualizationWidth: Double(visualizationLogicalSize.width), visualizationHeight: Double(visualizationLogicalSize.height),
+            visualizationOriginX: visualizationWindow.map { Double($0.frame.origin.x) }, visualizationOriginY: visualizationWindow.map { Double($0.frame.origin.y) },
             equalizerDocked: isEqualizerDocked, playlistDocked: isPlaylistDocked,
             equalizer: playback.equalizer.persistentState()
         )
@@ -1282,7 +1325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             windowShade.objectWillChange, equalizerState.objectWillChange,
             equalizerShade.objectWillChange, playlistState.objectWillChange,
             playlistShade.objectWillChange, playlistLayout.objectWillChange,
-            infoState.objectWillChange
+            infoState.objectWillChange, visualizationState.objectWillChange
         ]
         observableStates.forEach { publisher in
             publisher.sink { [weak self] _ in self?.schedulePersistentStateSave() }
@@ -1411,6 +1454,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             infoWindow.minSize = NSSize(width: backingCeiling(minimumWidth * scale, for: infoWindow.frame),
                                         height: backingFloor(116 * scale, for: infoWindow.frame))
         }
+        if let visualizationWindow {
+            let top = visualizationWindow.frame.maxY
+            let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Visualization"))
+            visualizationLogicalSize.width = max(minimumWidth, visualizationLogicalSize.width)
+            visualizationLogicalSize.height = max(116, visualizationLogicalSize.height)
+            visualizationWindow.setContentSize(NSSize(width: visualizationLogicalSize.width * scale,
+                                                       height: visualizationLogicalSize.height * scale))
+            visualizationWindow.setFrameOrigin(NSPoint(x: visualizationWindow.frame.minX,
+                                                       y: top - visualizationWindow.frame.height))
+            alignFrameToBackingPixels(visualizationWindow, preservingTop: true)
+            visualizationWindow.minSize = NSSize(
+                width: backingCeiling(minimumWidth * scale, for: visualizationWindow.frame),
+                height: backingFloor(116 * scale, for: visualizationWindow.frame)
+            )
+        }
         if scaleChanged {
             restoreAttachedWindowScaleGroups(attachedScaleGroups, scaleRatio: scaleRatio)
             for (id, panel) in playlistWindows {
@@ -1501,10 +1559,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Build connected components from the pre-scale geometry.  A group can
-    /// contain any combination of Main, EQ, Playlist and Info, including a
+    /// contain any combination of Main, EQ, Playlist, Info and Visualization, including a
     /// floating group that is not attached to Main.
     private func captureAttachedWindowScaleGroups() -> [AttachedWindowScaleGroup] {
-        var remaining = ([window, equalizerWindow, infoWindow].compactMap { $0 }
+        var remaining = ([window, equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 }
             + playlistWindows.values).filter(\.isVisible)
         var groups: [AttachedWindowScaleGroup] = []
         while let first = remaining.first {
@@ -1672,6 +1730,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         infoItem.keyEquivalentModifierMask = [.option]
         infoItem.isEnabled = true
 
+        let visualizationItem = menu.items.first(where: { $0.title == "Visualization" })
+            ?? NSMenuItem(title: "Visualization", action: #selector(toggleVisualization(_:)), keyEquivalent: "")
+        if visualizationItem.menu == nil { menu.addItem(visualizationItem) }
+        visualizationItem.target = self
+        visualizationItem.action = #selector(toggleVisualization(_:))
+        visualizationItem.keyEquivalent = "k"
+        visualizationItem.keyEquivalentModifierMask = [.command, .shift]
+        visualizationItem.isEnabled = true
+
         let windowshadeItem = menu.items.first(where: { $0.title == "Windowshade" })
             ?? NSMenuItem(title: "Windowshade", action: #selector(toggleActiveWindowShade(_:)), keyEquivalent: "")
         windowshadeItem.target = self
@@ -1704,13 +1771,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateWindowMenuState(in: menu)
 
         // Keep the panel toggles next to their related Info command.
-        for item in [windowshadeItem, equalizerItem, playlistItem] {
+        for item in [windowshadeItem, equalizerItem, playlistItem, visualizationItem] {
             if item.menu != nil { menu.removeItem(item) }
         }
         guard let infoIndex = menu.items.firstIndex(of: infoItem) else { return }
         menu.insertItem(windowshadeItem, at: infoIndex)
         menu.insertItem(equalizerItem, at: infoIndex + 1)
         menu.insertItem(playlistItem, at: infoIndex + 2)
+        menu.insertItem(visualizationItem, at: infoIndex + 3)
     }
 
     @objc private func zoomIn(_ sender: Any?) {
@@ -1805,6 +1873,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let isPlaylistVisible = playlistState.isVisible || playlistWindows.values.contains(where: \.isVisible)
         menu.items.first(where: { $0.title == "Playlist(s)" })?.state = isPlaylistVisible ? .on : .off
         menu.items.first(where: { $0.title == "Info" })?.state = infoState.isVisible ? .on : .off
+        menu.items.first(where: { $0.title == "Visualization" })?.state = visualizationState.isVisible ? .on : .off
     }
 
     private func configureZoomShortcutLabels(in menu: NSMenu) {
@@ -2095,6 +2164,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if sourceWindow === infoWindow {
             sourceWindow.orderOut(nil)
             infoState.isVisible = false
+            schedulePersistentStateSave()
+        } else if sourceWindow === visualizationWindow {
+            sourceWindow.orderOut(nil)
+            visualizationState.isVisible = false
+            (sourceWindow.contentView as? VisualizationPanelView)?.updateRenderingState()
             schedulePersistentStateSave()
         } else if let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
                   let playlist = playlistManager.playlist(id: playlistID) {
@@ -2476,6 +2550,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showWindowsFromNotification() {
         let auxiliary = [equalizerState.isVisible ? equalizerWindow : nil,
                          infoState.isVisible ? infoWindow : nil,
+                         visualizationState.isVisible ? visualizationWindow : nil,
                          settingsWindowState.isVisible ? preferencesWindow : nil].compactMap { $0 }
         let playlists = playlistState.isVisible ? Array(playlistWindows.values) : []
         NSApp.unhide(nil)
@@ -2493,6 +2568,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         equalizerWindow?.orderOut(nil)
         playlistWindows.values.forEach { $0.orderOut(nil) }
         infoWindow?.orderOut(nil)
+        visualizationWindow?.orderOut(nil)
         refreshInterfaceVisibility()
     }
 
@@ -2503,6 +2579,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             && !window.isMiniaturized
             && window.occlusionState.contains(.visible)
         playback.setInterfaceVisible(isVisible)
+        (visualizationWindow?.contentView as? VisualizationPanelView)?.updateRenderingState()
     }
 
     /// The classic player is a set of panels: activating any one panel must
@@ -2524,6 +2601,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if equalizerState.isVisible { equalizerWindow?.orderFrontRegardless() }
         if playlistState.isVisible { playlistWindows.values.forEach { $0.orderFrontRegardless() } }
         if infoState.isVisible { infoWindow?.orderFrontRegardless() }
+        if visualizationState.isVisible { visualizationWindow?.orderFrontRegardless() }
+        (visualizationWindow?.contentView as? VisualizationPanelView)?.updateRenderingState()
     }
 
     @objc func showPreferences(_ sender: Any?) {
@@ -2576,7 +2655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleAlwaysOnTop(_ sender: Any?) {
         alwaysOnTopState.isEnabled.toggle()
-        [window, preferencesWindow, equalizerWindow, infoWindow]
+        [window, preferencesWindow, equalizerWindow, infoWindow, visualizationWindow]
             .compactMap { $0 }
             .forEach(applyAlwaysOnTopLevel(to:))
         playlistWindows.values.forEach(applyAlwaysOnTopLevel(to:))
@@ -2659,6 +2738,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         infoModel.show(resolvedInfoTargetURL())
         panel.makeKeyAndOrderFront(nil)
         infoState.isVisible = true
+        schedulePersistentStateSave()
+    }
+
+    @objc func toggleVisualization(_ sender: Any?) {
+        if let visualizationWindow, visualizationWindow.isVisible {
+            visualizationWindow.orderOut(nil)
+            visualizationState.isVisible = false
+            (visualizationWindow.contentView as? VisualizationPanelView)?.updateRenderingState()
+            schedulePersistentStateSave()
+            return
+        }
+        let panel = makeVisualizationWindowIfNeeded()
+        panel.makeKeyAndOrderFront(nil)
+        visualizationState.isVisible = true
+        (panel.contentView as? VisualizationPanelView)?.updateRenderingState()
         schedulePersistentStateSave()
     }
 
@@ -2747,6 +2841,92 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         let top = panel.frame.maxY
         infoLogicalSize = NSSize(width: logicalWidth, height: logicalHeight)
+        panel.setContentSize(NSSize(width: logicalWidth * scale, height: logicalHeight * scale))
+        panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
+        repairWindowSeams(for: panel)
+        schedulePersistentStateSave()
+    }
+
+    private func makeVisualizationWindowIfNeeded() -> NSWindow {
+        if let visualizationWindow { return visualizationWindow }
+        let scale = CGFloat(interfaceScale.factor)
+        let skin = WinampSkinStore.shared
+        let minimumWidth = CGFloat(skin.genericMinimumWindowWidth(title: "Visualization"))
+        visualizationLogicalSize.width = max(minimumWidth, visualizationLogicalSize.width)
+        let panel = PlayerWindow(
+            contentRect: NSRect(x: 0, y: 0,
+                                width: visualizationLogicalSize.width * scale,
+                                height: visualizationLogicalSize.height * scale),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = false
+        applyAlwaysOnTopLevel(to: panel)
+        panel.minSize = NSSize(width: minimumWidth * scale, height: 116 * scale)
+        panel.contentView = VisualizationPanelView(
+            scale: interfaceScale,
+            focus: visualizationFocus,
+            playback: playback,
+            onClose: { [weak self, weak panel] in
+                panel?.orderOut(nil)
+                self?.visualizationState.isVisible = false
+                (panel?.contentView as? VisualizationPanelView)?.updateRenderingState()
+                self?.schedulePersistentStateSave()
+            },
+            onResize: { [weak self, weak panel] width, height in
+                self?.resizeVisualization(panel, width: width, height: height)
+            },
+            onDragChanged: { [weak self, weak panel] in
+                if let panel { self?.magnetWindowWhileDragging(panel) }
+            },
+            onDragEnded: { [weak self] in self?.schedulePersistentStateSave() }
+        )
+        panel.setFrameOrigin(NSPoint(x: window.frame.maxX,
+                                     y: window.frame.maxY - panel.frame.height))
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in self?.visualizationFocus.isKey = true }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in self?.visualizationFocus.isKey = false }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.isMovingMainDragGroup else { return }
+            self.schedulePersistentStateSave()
+        }
+        visualizationWindow = panel
+        return panel
+    }
+
+    private func resizeVisualization(_ panel: NSWindow?, width: CGFloat, height: CGFloat) {
+        guard let panel else { return }
+        let scale = CGFloat(interfaceScale.factor)
+        let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Visualization"))
+        let logicalWidth = snappedResizeDimension(
+            width,
+            minimum: minimumWidth,
+            step: horizontalResizeStep(for: panel, scale: scale),
+            alignment: 275
+        )
+        let logicalHeight = snappedResizeDimension(
+            height,
+            minimum: 116,
+            step: verticalResizeStep(for: panel, scale: scale),
+            alignment: 116
+        )
+        let top = panel.frame.maxY
+        visualizationLogicalSize = NSSize(width: logicalWidth, height: logicalHeight)
         panel.setContentSize(NSSize(width: logicalWidth * scale, height: logicalHeight * scale))
         panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
         repairWindowSeams(for: panel)
@@ -2929,7 +3109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func finishFloatingPlaylistGesture(_ panel: NSWindow, model: PlaylistModel) {
-        magnet(panel, against: [window, equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values.filter { $0 !== panel })
+        magnet(panel, against: [window, equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 } + playlistWindows.values.filter { $0 !== panel })
         model.windowFrame = panel.frame; playlistManager.save()
     }
 
@@ -2963,7 +3143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistWasMoved = true
         snapPlaylistIfNeeded()
         if let playlistWindow {
-            magnet(playlistWindow, against: [window, equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values.filter { $0 !== playlistWindow })
+            magnet(playlistWindow, against: [window, equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 } + playlistWindows.values.filter { $0 !== playlistWindow })
             updatePlaylistDocking()
         }
     }
@@ -3046,7 +3226,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func repairWindowSeams(for panel: NSWindow) {
-        let neighbours = [window, equalizerWindow, infoWindow].compactMap { $0 }
+        let neighbours = [window, equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 }
             + playlistWindows.values
         let visibleNeighbours = neighbours.filter { $0 !== panel && $0.isVisible }
         magnet(panel, against: visibleNeighbours, includeScreenEdges: false)
@@ -3152,7 +3332,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         equalizerWasMoved = true
         snapEqualizerIfNeeded()
         if let equalizerWindow {
-            magnet(equalizerWindow, against: [window, infoWindow].compactMap { $0 } + playlistWindows.values)
+            magnet(equalizerWindow, against: [window, infoWindow, visualizationWindow].compactMap { $0 } + playlistWindows.values)
             updateEqualizerDocking()
         }
     }
@@ -3184,7 +3364,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // infer it solely from frame contact: after interface scaling AppKit
         // can leave a sub-pixel gap even though the windows are still docked.
         let dockedEqualizer = isEqualizerDocked && equalizerState.isVisible ? equalizerWindow : nil
-        let candidates = ([equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values)
+        let candidates = ([equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 } + playlistWindows.values)
             .filter { candidate in dockedEqualizer.map { candidate !== $0 } ?? true }
         var group: [NSWindow] = [window]
         if let dockedEqualizer { group.append(dockedEqualizer) }
@@ -3203,7 +3383,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         mainDragGroupWindows = group.filter { $0 !== window }
         let groupIDs = Set(group.map(ObjectIdentifier.init))
-        mainDragExternalWindows = ([equalizerWindow, infoWindow].compactMap { $0 } + playlistWindows.values)
+        mainDragExternalWindows = ([equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 } + playlistWindows.values)
             .filter { $0.isVisible && !groupIDs.contains(ObjectIdentifier($0)) }
         mainDragWindowOffsets = Dictionary(uniqueKeysWithValues: mainDragGroupWindows.map {
             return (ObjectIdentifier($0), NSPoint(
@@ -3239,7 +3419,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainDragShadowStates.removeAll()
     }
 
-    /// Moves every playlist/EQ attached to the player by the same delta.  The
+    /// Moves every attached player panel by the same delta. The
     /// model frame is updated immediately, so its persisted position matches
     /// what the user sees even before the drag finishes.
     func moveAttachedWindowsWithMain() {
@@ -3270,11 +3450,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             magnetMainDragGroupToScreen()
         } else {
             let allPlaylistWindows = playlistWindows.values.filter { $0 !== movingWindow }
-            let visibleInfo = infoWindow?.isVisible == true && infoWindow !== movingWindow ? [infoWindow!] : []
+            let visibleAuxiliary = [infoWindow, visualizationWindow].compactMap { panel -> NSWindow? in
+                guard let panel, panel.isVisible, panel !== movingWindow else { return nil }
+                return panel
+            }
             if movingWindow === equalizerWindow {
-                magnet(movingWindow, against: [window].compactMap { $0 } + visibleInfo + allPlaylistWindows)
+                magnet(movingWindow, against: [window].compactMap { $0 } + visibleAuxiliary + allPlaylistWindows)
             } else {
-                magnet(movingWindow, against: [window, equalizerWindow].compactMap { $0 } + visibleInfo + allPlaylistWindows)
+                magnet(movingWindow, against: [window, equalizerWindow].compactMap { $0 } + visibleAuxiliary + allPlaylistWindows)
             }
         }
     }

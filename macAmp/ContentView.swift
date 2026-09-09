@@ -13,6 +13,7 @@ struct ContentView: View {
     @ObservedObject var equalizerState: EqualizerWindowState
     @ObservedObject var playlistState: PlaylistWindowState
     @ObservedObject var infoState: InfoWindowState
+    @ObservedObject var visualizationState: VisualizationWindowState
     @ObservedObject var alwaysOnTopState: AlwaysOnTopState
     @ObservedObject var settingsWindowState: SettingsWindowState
     @State private var isAdjustingVolume = false
@@ -24,7 +25,6 @@ struct ContentView: View {
     @State private var isRepeatPressed = false
     @State private var pressedClutterbarButton: Int?
     @State private var isDoubleSizeIndicatorActive = false
-    @State private var isVisualizationIndicatorActive = false
     @State private var pressedWindowShadeControl: Int?
     @State private var visualizationMode: VisualizationMode = .spectrum
 
@@ -37,6 +37,7 @@ struct ContentView: View {
         equalizerState: EqualizerWindowState,
         playlistState: PlaylistWindowState,
         infoState: InfoWindowState,
+        visualizationState: VisualizationWindowState,
         alwaysOnTopState: AlwaysOnTopState,
         settingsWindowState: SettingsWindowState
     ) {
@@ -49,6 +50,7 @@ struct ContentView: View {
         self.equalizerState = equalizerState
         self.playlistState = playlistState
         self.infoState = infoState
+        self.visualizationState = visualizationState
         self.alwaysOnTopState = alwaysOnTopState
         self.settingsWindowState = settingsWindowState
         self._visualizationMode = State(initialValue: playback.visualization.analyzer.visualizationMode)
@@ -588,7 +590,7 @@ extension ContentView {
                     .frame(width: 8, height: 8)
                     .position(x: 4, y: 29)
             }
-            if isVisualizationIndicatorActive, pressedClutterbarButton != 4,
+            if visualizationState.isVisible, pressedClutterbarButton != 4,
                let image = skin.clutterbarSelectedButtonImage(4) {
                 Image(nsImage: image)
                     .interpolation(.none)
@@ -618,7 +620,7 @@ extension ContentView {
         case 3:
             isDoubleSizeIndicatorActive.toggle()
         case 4:
-            isVisualizationIndicatorActive.toggle()
+            AppDelegate.shared?.toggleVisualization(nil)
         default:
             break
         }
@@ -837,6 +839,7 @@ struct ContentView_Previews: PreviewProvider {
             equalizerState: EqualizerWindowState(),
             playlistState: PlaylistWindowState(),
             infoState: InfoWindowState(),
+            visualizationState: VisualizationWindowState(),
             alwaysOnTopState: AlwaysOnTopState(),
             settingsWindowState: SettingsWindowState()
         )

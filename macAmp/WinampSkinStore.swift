@@ -1128,7 +1128,7 @@ final class WinampSkinStore: ObservableObject {
     /// Exact generic-dialog compositor from Winamp's draw_embed.cpp.
     /// GEN.BMP has a 20 px title bar, tiled 29 px side rails, and a 38 px
     /// lower frame; none of these sprites is scaled with the content.
-    func genericWindowImage(width: Int, height: Int, isActive: Bool) -> NSImage? {
+    func genericWindowImage(width: Int, height: Int, isActive: Bool, title: String = "Info") -> NSImage? {
         guard width >= 125, height >= 58,
               let sheet = bitmap(named: "GEN.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -1146,8 +1146,8 @@ final class WinampSkinStore: ObservableObject {
         NSColor.black.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
 
         let stateY = isActive ? 0 : 21
-        let title = genericTitleGlyphImage("Info", isActive: isActive)
-        let exactTextWidth = Int(title?.size.width ?? 0)
+        let titleImage = genericTitleGlyphImage(title, isActive: isActive)
+        let exactTextWidth = Int(titleImage?.size.width ?? 0)
         // The title field is a skin resource, not a fixed macOS title label.
         // It must be wide enough for the actual GEN.BMP glyph sequence.
         let textWidth = min(width - 100, max(25, exactTextWidth))
@@ -1170,9 +1170,9 @@ final class WinampSkinStore: ObservableObject {
         // edge (therefore height−11 in AppKit's bottom-left coordinates).
         // It is centred inside its dedicated 25-px title field, preserving
         // the native left and right field tiles.
-        if let title {
+        if let titleImage {
             let textX = titleStart + (textWidth - exactTextWidth) / 2
-            draw(title, CGFloat(textX), CGFloat(height - 11), title.size.width, 7)
+            draw(titleImage, CGFloat(textX), CGFloat(height - 11), titleImage.size.width, 7)
         }
         draw(sprite(78, stateY, 25, 20), CGFloat(x), CGFloat(height - 20), 25, 20); x += 25
         let remaining = width - 25 - x
