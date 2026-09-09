@@ -24,7 +24,6 @@ struct ContentView: View {
     @State private var isShufflePressed = false
     @State private var isRepeatPressed = false
     @State private var pressedClutterbarButton: Int?
-    @State private var isDoubleSizeIndicatorActive = false
     @State private var pressedWindowShadeControl: Int?
     @State private var visualizationMode: VisualizationMode = .spectrum
 
@@ -583,13 +582,6 @@ extension ContentView {
                     .frame(width: 8, height: 7)
                     .position(x: 4, y: 21.5)
             }
-            if isDoubleSizeIndicatorActive, pressedClutterbarButton != 3,
-               let image = skin.clutterbarSelectedButtonImage(3) {
-                Image(nsImage: image)
-                    .interpolation(.none)
-                    .frame(width: 8, height: 8)
-                    .position(x: 4, y: 29)
-            }
             if visualizationState.isVisible, pressedClutterbarButton != 4,
                let image = skin.clutterbarSelectedButtonImage(4) {
                 Image(nsImage: image)
@@ -603,13 +595,13 @@ extension ContentView {
         .overlay(
             ClutterbarHitTarget(
                 onPressed: { pressedClutterbarButton = $0 },
-                onActivate: activateClutterbarButton(_:)
+                onActivate: activateClutterbarButton(_:with:)
             )
         )
         .position(x: 14, y: 43.5)
     }
 
-    private func activateClutterbarButton(_ button: Int) {
+    private func activateClutterbarButton(_ button: Int, with event: NSEvent) {
         switch button {
         case 0:
             AppDelegate.shared?.togglePreferences(nil)
@@ -618,7 +610,7 @@ extension ContentView {
         case 2:
             AppDelegate.shared?.toggleInfo(nil)
         case 3:
-            isDoubleSizeIndicatorActive.toggle()
+            AppDelegate.shared?.showOutputDeviceMenu(with: event)
         case 4:
             AppDelegate.shared?.toggleVisualization(nil)
         default:
@@ -895,7 +887,7 @@ private final class PlaybackToggleHotspotNSView: NSView {
 /// be cancelled when the non-activating player panel becomes key mid-gesture.
 private struct ClutterbarHitTarget: NSViewRepresentable {
     let onPressed: (Int?) -> Void
-    let onActivate: (Int) -> Void
+    let onActivate: (Int, NSEvent) -> Void
 
     func makeNSView(context: Context) -> ClutterbarHitTargetNSView {
         let view = ClutterbarHitTargetNSView()
@@ -912,7 +904,7 @@ private struct ClutterbarHitTarget: NSViewRepresentable {
 
 private final class ClutterbarHitTargetNSView: NSView {
     var onPressed: ((Int?) -> Void)?
-    var onActivate: ((Int) -> Void)?
+    var onActivate: ((Int, NSEvent) -> Void)?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -922,14 +914,18 @@ private final class ClutterbarHitTargetNSView: NSView {
         onPressed?(pressedButton)
 
         var releasedButton: Int?
+        var releaseEvent: NSEvent?
         while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             if next.type == .leftMouseUp {
                 releasedButton = clutterbarButton(at: clutterbarPoint(for: next))
+                releaseEvent = next
                 break
             }
         }
         onPressed?(nil)
-        if releasedButton == pressedButton { onActivate?(pressedButton) }
+        if releasedButton == pressedButton, let releaseEvent {
+            onActivate?(pressedButton, releaseEvent)
+        }
     }
 
     private func clutterbarPoint(for event: NSEvent) -> CGPoint {

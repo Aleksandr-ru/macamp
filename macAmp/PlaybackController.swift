@@ -2,6 +2,9 @@ import AVFoundation
 import AppKit
 import Combine
 import Accelerate
+import CoreAudio
+import AudioToolbox
+import os
 
 /// A title-bar drag has a much stricter latency budget than normal playback.
 /// Timers use this main-thread gate to defer cosmetic updates until mouse-up.
@@ -178,6 +181,396 @@ private final class FFTWorkspace {
     }
 }
 
+struct AudioOutputDevice: Identifiable, Equatable {
+    let id: AudioDeviceID
+    let uid: String
+    let name: String
+    let type: String
+    let isDefault: Bool
+}
+
+/// Keeps the output-device list in sync with Core Audio and remembers the
+/// user's last explicit choice separately from the currently available route.
+/// The preferred UID is intentionally retained when a device is unplugged so
+/// the next launch can try that device again.
+final class AudioOutputDeviceManager: ObservableObject {
+    @Published private(set) var devices: [AudioOutputDevice] = []
+    @Published private(set) var selectedDeviceID: AudioDeviceID?
+    @Published private(set) var selectedDeviceUID: String?
+    @Published private(set) var defaultDeviceID: AudioDeviceID?
+
+    var onDeviceSelected: ((AudioDeviceID) -> Void)?
+    var onSelectedDeviceUnavailable: ((AudioDeviceID?) -> Void)?
+
+    private static let preferredDeviceUIDKey = "macAmp.audio.preferredOutputDeviceUID"
+    private static let deviceLogger = Logger(
+        subsystem: "ru.aleksandr.macAmp",
+        category: "AudioOutputDevices"
+    )
+    private let defaults: UserDefaults
+    private let listenerQueue = DispatchQueue(label: "ru.aleksandr.macAmp.audio.devices", qos: .utility)
+    private let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
+    private var devicesListener: AudioObjectPropertyListenerBlock?
+    private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    private var hasResolvedInitialSelection = false
+    private var preferredDeviceUID: String?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        preferredDeviceUID = defaults.string(forKey: Self.preferredDeviceUIDKey)
+        refreshDevices()
+        installListeners()
+    }
+
+    deinit {
+        var devicesAddress = Self.propertyAddress(kAudioHardwarePropertyDevices)
+        if let devicesListener {
+            AudioObjectRemovePropertyListenerBlock(systemObjectID, &devicesAddress, listenerQueue, devicesListener)
+        }
+        var defaultAddress = Self.propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        if let defaultOutputListener {
+            AudioObjectRemovePropertyListenerBlock(systemObjectID, &defaultAddress, listenerQueue, defaultOutputListener)
+        }
+    }
+
+    func selectDevice(_ deviceID: AudioDeviceID) {
+        guard let device = devices.first(where: { $0.id == deviceID }) else { return }
+        preferredDeviceUID = device.uid
+        defaults.set(device.uid, forKey: Self.preferredDeviceUIDKey)
+        guard selectedDeviceID != device.id else { return }
+        selectedDeviceID = device.id
+        selectedDeviceUID = device.uid
+        onDeviceSelected?(device.id)
+    }
+
+    func refreshDevices() {
+        let defaultID = Self.defaultOutputDeviceID()
+        let refreshedDevices = Self.availableOutputDevices(defaultID: defaultID)
+        let oldSelectedID = selectedDeviceID
+        let oldSelectedUID = selectedDeviceUID
+
+        devices = refreshedDevices
+        defaultDeviceID = defaultID
+        Self.deviceLogger.notice(
+            "refreshed output devices count=\(refreshedDevices.count, privacy: .public) defaultID=\(defaultID ?? AudioDeviceID(kAudioObjectUnknown), privacy: .public)"
+        )
+
+        if !hasResolvedInitialSelection {
+            let initialDevice = preferredDeviceUID.flatMap { uid in
+                refreshedDevices.first(where: { $0.uid == uid })
+            } ?? refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
+            setCurrentDevice(initialDevice)
+            hasResolvedInitialSelection = true
+            return
+        }
+
+        if let oldSelectedUID,
+           let stillAvailable = refreshedDevices.first(where: { $0.uid == oldSelectedUID }) {
+            // A reconnect can expose a new AudioDeviceID for the same device.
+            // Keep the route selected without treating it as a new user choice.
+            let deviceIDChanged = selectedDeviceID != stillAvailable.id
+            setCurrentDevice(stillAvailable)
+            if deviceIDChanged { onDeviceSelected?(stillAvailable.id) }
+            return
+        }
+
+        if oldSelectedID != nil {
+            let fallback = refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
+            setCurrentDevice(fallback)
+            onSelectedDeviceUnavailable?(fallback?.id)
+        } else {
+            let fallback = refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
+            setCurrentDevice(fallback)
+            if let fallback { onDeviceSelected?(fallback.id) }
+        }
+    }
+
+    private func setCurrentDevice(_ device: AudioOutputDevice?) {
+        selectedDeviceID = device?.id
+        selectedDeviceUID = device?.uid
+    }
+
+    private func installListeners() {
+        var devicesAddress = Self.propertyAddress(kAudioHardwarePropertyDevices)
+        let devicesListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async { self?.refreshDevices() }
+        }
+        if AudioObjectAddPropertyListenerBlock(systemObjectID, &devicesAddress, listenerQueue, devicesListener) == noErr {
+            self.devicesListener = devicesListener
+        }
+
+        var defaultAddress = Self.propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        let defaultOutputListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async { self?.refreshDevices() }
+        }
+        if AudioObjectAddPropertyListenerBlock(systemObjectID, &defaultAddress, listenerQueue, defaultOutputListener) == noErr {
+            self.defaultOutputListener = defaultOutputListener
+        }
+    }
+
+    private static func propertyAddress(
+        _ selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+        element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain
+    ) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+    }
+
+    private static func defaultOutputDeviceID() -> AudioDeviceID? {
+        var address = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        ) == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+        return deviceID
+    }
+
+    private static func availableOutputDevices(defaultID: AudioDeviceID?) -> [AudioOutputDevice] {
+        var address = propertyAddress(kAudioHardwarePropertyDevices)
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize
+        ) == noErr else { return [] }
+
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.stride
+        guard count > 0 else { return [] }
+        var deviceIDs = Array(repeating: AudioDeviceID(kAudioObjectUnknown), count: count)
+        let status = deviceIDs.withUnsafeMutableBufferPointer { buffer in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, buffer.baseAddress!
+            )
+        }
+        guard status == noErr else { return [] }
+
+        return deviceIDs.compactMap { deviceID in
+            guard deviceID != AudioDeviceID(kAudioObjectUnknown),
+                  isAlive(deviceID),
+                  outputChannelCount(deviceID) > 0,
+                  let uid = stringProperty(deviceID, selector: kAudioDevicePropertyDeviceUID),
+                  let rawName = stringProperty(deviceID, selector: kAudioObjectPropertyName),
+                  let rawTransport = transportTypeID(deviceID),
+                  let presentation = outputPresentation(deviceID),
+                  !uid.isEmpty else { return nil }
+            let isServiceDevice = isSystemRouteProxy(name: rawName, uid: uid)
+            logDevice(
+                id: deviceID,
+                uid: uid,
+                rawName: rawName,
+                rawTransport: rawTransport,
+                presentation: presentation,
+                isIncluded: !isServiceDevice
+            )
+            guard !isServiceDevice else { return nil }
+            return AudioOutputDevice(
+                id: deviceID,
+                uid: uid,
+                name: presentation.name,
+                type: presentation.type,
+                isDefault: deviceID == defaultID
+            )
+        }
+        .sorted {
+            if $0.isDefault != $1.isDefault { return $0.isDefault }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private static func logDevice(
+        id: AudioDeviceID,
+        uid: String,
+        rawName: String,
+        rawTransport: UInt32,
+        presentation: (name: String, type: String),
+        isIncluded: Bool
+    ) {
+        let activeSubdeviceIDs = activeSubdeviceIDs(id)
+        let mainSubdeviceUID = stringProperty(id, selector: kAudioAggregateDevicePropertyMainSubDevice) ?? ""
+        let fullSubdeviceUIDs = stringArrayProperty(
+            id,
+            selector: kAudioAggregateDevicePropertyFullSubDeviceList
+        )
+        deviceLogger.notice(
+            "device id=\(id, privacy: .public) uid=\(uid, privacy: .public) rawName=\(rawName, privacy: .public) rawTransport=\(rawTransport, privacy: .public) presentationName=\(presentation.name, privacy: .public) presentationType=\(presentation.type, privacy: .public) included=\(isIncluded, privacy: .public) activeSubdevices=\(String(describing: activeSubdeviceIDs), privacy: .public) mainSubdeviceUID=\(mainSubdeviceUID, privacy: .public) fullSubdeviceUIDs=\(String(describing: fullSubdeviceUIDs), privacy: .public)"
+        )
+    }
+
+    private static func isAlive(_ deviceID: AudioDeviceID) -> Bool {
+        var address = propertyAddress(kAudioDevicePropertyDeviceIsAlive)
+        var value: UInt32 = 1
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return true }
+        return value != 0
+    }
+
+    private static func outputPresentation(_ deviceID: AudioDeviceID) -> (name: String, type: String)? {
+        guard let rawName = stringProperty(deviceID, selector: kAudioObjectPropertyName),
+              let rawTransport = transportTypeID(deviceID) else { return nil }
+
+        if rawTransport == kAudioDeviceTransportTypeAggregate ||
+           rawTransport == kAudioDeviceTransportTypeAutoAggregate,
+           let airPlaySubdevice = airPlaySubdeviceID(in: deviceID),
+           let airPlayName = stringProperty(airPlaySubdevice, selector: kAudioObjectPropertyName),
+           !airPlayName.isEmpty {
+            return (airPlayName, "AirPlay")
+        }
+
+        return (rawName, transportTypeName(rawTransport))
+    }
+
+    /// AVFoundation can create a per-process `CADefaultDeviceAggregate-*` route.
+    /// It is an implementation detail (rather than a selectable hardware or
+    /// network output), so it must never be shown in the device picker.
+    private static func isSystemRouteProxy(name: String, uid: String) -> Bool {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedName.range(of: "CADefaultDevice", options: [.caseInsensitive, .anchored]) != nil ||
+            uid.range(of: "CADefaultDeviceAggregate-", options: [.caseInsensitive, .anchored]) != nil
+    }
+
+    /// AirPlay can be wrapped in an automatically created aggregate device.
+    /// The active list is not always populated for that wrapper, so also use
+    /// its declared main subdevice and resolve the persistent UID back to an
+    /// AudioDeviceID. This is a bounded lookup, not recursive traversal.
+    private static func airPlaySubdeviceID(in aggregateID: AudioDeviceID) -> AudioDeviceID? {
+        aggregateSubdeviceIDs(aggregateID).first(where: {
+            transportTypeID($0) == kAudioDeviceTransportTypeAirPlay
+        })
+    }
+
+    private static func aggregateSubdeviceIDs(_ aggregateID: AudioDeviceID) -> [AudioDeviceID] {
+        var identifiers = activeSubdeviceIDs(aggregateID)
+        if let mainSubdeviceUID = stringProperty(
+            aggregateID,
+            selector: kAudioAggregateDevicePropertyMainSubDevice
+        ), let mainSubdeviceID = deviceID(forUID: mainSubdeviceUID) {
+            identifiers.append(mainSubdeviceID)
+        }
+        for uid in stringArrayProperty(
+            aggregateID,
+            selector: kAudioAggregateDevicePropertyFullSubDeviceList
+        ) {
+            if let subdeviceID = deviceID(forUID: uid) {
+                identifiers.append(subdeviceID)
+            }
+        }
+        var seen = Set<AudioDeviceID>()
+        return identifiers.filter { $0 != AudioDeviceID(kAudioObjectUnknown) && seen.insert($0).inserted }
+    }
+
+    private static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        var address = propertyAddress(kAudioHardwarePropertyTranslateUIDToDevice)
+        let cfUID = uid as CFString
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = withUnsafePointer(to: cfUID) { pointer in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                UInt32(MemoryLayout<CFString>.size),
+                pointer,
+                &size,
+                &deviceID
+            )
+        }
+        guard status == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+        return deviceID
+    }
+
+    private static func transportTypeID(_ deviceID: AudioDeviceID) -> UInt32? {
+        var address = propertyAddress(kAudioDevicePropertyTransportType)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value
+    }
+
+    private static func transportTypeName(_ value: UInt32) -> String {
+        switch value {
+        case kAudioDeviceTransportTypeBuiltIn: return "Built-in"
+        case kAudioDeviceTransportTypeAggregate: return "Aggregate"
+        case kAudioDeviceTransportTypeAutoAggregate: return "Aggregate"
+        case kAudioDeviceTransportTypeVirtual: return "Virtual"
+        case kAudioDeviceTransportTypePCI: return "PCI"
+        case kAudioDeviceTransportTypeUSB: return "USB"
+        case kAudioDeviceTransportTypeFireWire: return "FireWire"
+        case kAudioDeviceTransportTypeBluetooth: return "Bluetooth"
+        case kAudioDeviceTransportTypeBluetoothLE: return "Bluetooth LE"
+        case kAudioDeviceTransportTypeHDMI: return "HDMI"
+        case kAudioDeviceTransportTypeDisplayPort: return "DisplayPort"
+        case kAudioDeviceTransportTypeAirPlay: return "AirPlay"
+        case kAudioDeviceTransportTypeAVB: return "AVB"
+        case kAudioDeviceTransportTypeThunderbolt: return "Thunderbolt"
+        default: return "Other"
+        }
+    }
+
+    private static func activeSubdeviceIDs(_ deviceID: AudioDeviceID) -> [AudioDeviceID] {
+        var address = propertyAddress(kAudioAggregateDevicePropertyActiveSubDeviceList)
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize) == noErr else { return [] }
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.stride
+        guard count > 0 else { return [] }
+
+        var subdeviceIDs = Array(repeating: AudioDeviceID(kAudioObjectUnknown), count: count)
+        let status = subdeviceIDs.withUnsafeMutableBufferPointer { buffer in
+            AudioObjectGetPropertyData(
+                deviceID, &address, 0, nil, &dataSize, buffer.baseAddress!
+            )
+        }
+        guard status == noErr else { return [] }
+        return subdeviceIDs
+    }
+
+    private static func stringArrayProperty(
+        _ deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector
+    ) -> [String] {
+        var address = propertyAddress(selector)
+        var value: Unmanaged<CFArray>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFArray>?>.size)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr, let value else { return [] }
+        let values = value.takeRetainedValue() as NSArray
+        return values.compactMap { $0 as? String }
+    }
+
+    private static func outputChannelCount(_ deviceID: AudioDeviceID) -> Int {
+        var address = propertyAddress(
+            kAudioDevicePropertyStreamConfiguration,
+            scope: kAudioObjectPropertyScopeOutput
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize) == noErr,
+              dataSize >= UInt32(MemoryLayout<AudioBufferList>.size) else { return 0 }
+
+        let rawList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize), alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawList.deallocate() }
+        let bufferList = rawList.assumingMemoryBound(to: AudioBufferList.self)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, bufferList) == noErr else { return 0 }
+        return UnsafeMutableAudioBufferListPointer(bufferList).reduce(0) {
+            $0 + Int($1.mNumberChannels)
+        }
+    }
+
+    private static func stringProperty(
+        _ deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector
+    ) -> String? {
+        var address = propertyAddress(selector)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr, let value else { return nil }
+        return value.takeRetainedValue() as String
+    }
+}
+
 final class PlaybackController: NSObject, ObservableObject {
     var onTrackFinished: (() -> Void)?
     /// These callbacks identify the source rather than relying on a global UI
@@ -229,6 +622,7 @@ final class PlaybackController: NSObject, ObservableObject {
     var currentURL: URL? { scopedURL }
 
     let equalizer = EqualizerController()
+    let outputDeviceManager = AudioOutputDeviceManager()
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let equalizerNode = AVAudioUnitEQ(numberOfBands: 10)
@@ -332,6 +726,13 @@ final class PlaybackController: NSObject, ObservableObject {
             repeatMode = .currentTrack
         }
         configureAudioGraph()
+        outputDeviceManager.onDeviceSelected = { [weak self] deviceID in
+            self?.switchOutputDevice(to: deviceID)
+        }
+        outputDeviceManager.onSelectedDeviceUnavailable = { [weak self] fallbackID in
+            self?.handleOutputDeviceUnavailable(fallbackID: fallbackID)
+        }
+        applyOutputDevice(outputDeviceManager.selectedDeviceID)
         equalizer.onChange = { [weak self] in self?.applyEqualizer() }
     }
 
@@ -530,6 +931,73 @@ final class PlaybackController: NSObject, ObservableObject {
         }
         equalizerNode.globalGain = 0
         applyEqualizer()
+    }
+
+    private func applyOutputDevice(_ deviceID: AudioDeviceID?) {
+        guard let deviceID else { return }
+        if let streamingPlayer {
+            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.selectedDeviceUID
+            return
+        }
+        guard let outputUnit = engine.outputNode.audioUnit else { return }
+        var currentDeviceID = deviceID
+        _ = AudioUnitSetProperty(
+            outputUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &currentDeviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+    }
+
+    private func switchOutputDevice(to deviceID: AudioDeviceID) {
+        if let streamingPlayer {
+            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.selectedDeviceUID
+            return
+        }
+
+        guard let file = sourceFile else {
+            applyOutputDevice(deviceID)
+            return
+        }
+
+        let wasPlaying = isPlaying || playerNode.isPlaying
+        let wasPaused = isPaused
+        let resumeFrame = scheduledStartFrame + (playerNode.isPlaying ? currentPlayedFrames() : 0)
+
+        playbackGeneration += 1
+        playerNode.stop()
+        timer?.invalidate()
+        timer = nil
+        engine.stop()
+        engine.reset()
+        applyOutputDevice(deviceID)
+        connectAudioGraph(for: file.processingFormat)
+        if wasPlaying {
+            engine.prepare()
+        }
+
+        do {
+            if wasPlaying { try engine.start() }
+            scheduledStartFrame = min(max(0, resumeFrame), file.length)
+            if wasPlaying {
+                start(at: scheduledStartFrame)
+            } else {
+                engine.mainMixerNode.removeTap(onBus: 0)
+                isLiveAnalysisTapInstalled = false
+                isPlaying = false
+                isPaused = wasPaused
+            }
+        } catch {
+            reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
+        }
+    }
+
+    private func handleOutputDeviceUnavailable(fallbackID: AudioDeviceID?) {
+        let hadPlayback = isPlaying || isPaused || playerNode.isPlaying || streamingPlayer != nil
+        if hadPlayback { stop() }
+        applyOutputDevice(fallbackID)
     }
 
     private func applyEqualizer() {
@@ -828,6 +1296,7 @@ final class PlaybackController: NSObject, ObservableObject {
                     return
                 }
                 let player = AVPlayer(playerItem: item)
+                player.audioOutputDeviceUniqueID = self.outputDeviceManager.selectedDeviceUID
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
                 self.bitrateKbps = bitrateKbps

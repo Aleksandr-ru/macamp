@@ -2032,6 +2032,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSMenu.popUpContextMenu(makeRepeatMenu(), with: event, for: view)
     }
 
+    private func makeOutputDeviceMenu() -> NSMenu {
+        let menu = NSMenu(title: "Output device")
+        let selectedDeviceID = playback.outputDeviceManager.selectedDeviceID
+        if playback.outputDeviceManager.devices.isEmpty {
+            let item = NSMenuItem(title: "No output devices available", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            for device in playback.outputDeviceManager.devices {
+                let item = NSMenuItem(title: device.name,
+                                      action: #selector(selectOutputDevice(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = NSNumber(value: device.id)
+                item.state = device.id == selectedDeviceID ? .on : .off
+                menu.addItem(item)
+            }
+        }
+        return menu
+    }
+
+    @objc private func selectOutputDevice(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? NSNumber else { return }
+        playback.outputDeviceManager.selectDevice(AudioDeviceID(value.uint32Value))
+    }
+
+    func showOutputDeviceMenu(with event: NSEvent) {
+        guard let view = event.window?.contentView else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        makeOutputDeviceMenu().popUp(positioning: nil, at: point, in: view)
+    }
+
     private func configureFileItem(_ title: String, action: Selector, in menu: NSMenu) {
         guard let item = menu.items.first(where: { $0.title == title }) else { return }
         item.target = self; item.action = action; item.isEnabled = true
@@ -2644,7 +2676,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             equalizer: playback.equalizer,
             visualization: playback.visualization,
             skin: WinampSkinStore.shared,
-            statusBarPreferences: statusBarPreferences
+            statusBarPreferences: statusBarPreferences,
+            outputDevices: playback.outputDeviceManager
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -3795,6 +3828,7 @@ private struct SettingsView: View {
     @ObservedObject var visualization: PlaybackVisualizationState
     @ObservedObject var skin: WinampSkinStore
     @ObservedObject var statusBarPreferences: StatusBarPreferences
+    @ObservedObject var outputDevices: AudioOutputDeviceManager
     @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
     @State private var selectedTab: Tab = .general
 
@@ -3934,8 +3968,55 @@ private struct SettingsView: View {
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
             }
+
+            SettingsGroup(title: "Output device") {
+                if outputDevices.devices.isEmpty {
+                    Text("No output devices available")
+                        .foregroundColor(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(spacing: 10) {
+                            Text("Name")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text("Type")
+                                .frame(width: 110, alignment: .leading)
+                        }
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+
+                        List(selection: selectedOutputDevice) {
+                            ForEach(outputDevices.devices) { device in
+                                HStack(spacing: 10) {
+                                    Text(device.name)
+                                        .lineLimit(1)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Text(device.type)
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 110, alignment: .leading)
+                                }
+                                .tag(device.id as AudioDeviceID?)
+                            }
+                        }
+                        .listStyle(.inset)
+                    }
+                    .frame(minHeight: 96, maxHeight: 145)
+                }
+
+            }
         }
         .padding(20)
+    }
+
+    private var selectedOutputDevice: Binding<AudioDeviceID?> {
+        Binding(
+            get: { outputDevices.selectedDeviceID },
+            set: { newValue in
+                guard let newValue else { return }
+                outputDevices.selectDevice(newValue)
+            }
+        )
     }
 
     private var trayIconSelection: Binding<TrayIconSelection> {
