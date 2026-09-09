@@ -3771,6 +3771,22 @@ private struct SettingsView: View {
         case output
     }
 
+    private enum TrayIconSelection: String, CaseIterable, Identifiable {
+        case off
+        case application
+        case playbackStatus
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .off: return "Off"
+            case .application: return "Application icon"
+            case .playbackStatus: return "Playback status"
+            }
+        }
+    }
+
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var playlistFontScale: PlaylistFontScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
@@ -3805,7 +3821,10 @@ private struct SettingsView: View {
                 case .skin:
                     skinSettings
                 case .output:
-                    Color.clear
+                    ScrollView(.vertical) {
+                        outputSettings
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -3814,34 +3833,36 @@ private struct SettingsView: View {
     }
 
     private var generalSettings: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Interface")
-                .font(.headline)
-            HStack {
-                Text("Scale")
-                Slider(value: $interfaceScale.percent, in: 100...300, step: 10)
-                Text("\(Int(interfaceScale.percent))%")
-                    .frame(width: 38, alignment: .trailing)
-                    .font(.system(.body, design: .monospaced))
-            }
-            HStack {
-                Text("Playlist font")
-                Slider(value: $playlistFontScale.percent, in: 100...200, step: 10)
-                Text("\(Int(playlistFontScale.percent))%")
-                    .frame(width: 38, alignment: .trailing)
-                    .font(.system(.body, design: .monospaced))
-            }
-            Toggle("Show remaining time", isOn: $timeDisplayPreference.showsRemainingTime)
-            Toggle("Track change notifications", isOn: $trackNotifications.isEnabled)
-            Picker("Spectrum analyzer", selection: $visualization.analyzer) {
-                ForEach(VisualizationAnalyzer.allCases) { analyzer in
-                    Text(analyzer.title).tag(analyzer)
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsGroup(title: "Interface") {
+                VStack(alignment: .leading, spacing: 12) {
+                    SettingsSlider(title: "Scale", value: $interfaceScale.percent, range: 100...300, step: 10, valueText: "\(Int(interfaceScale.percent))%")
+                    SettingsSlider(title: "Playlist font", value: $playlistFontScale.percent, range: 100...200, step: 10, valueText: "\(Int(playlistFontScale.percent))%")
                 }
             }
-            .pickerStyle(.menu)
-            Toggle("Show Peaks", isOn: $visualization.showsPeaks)
-            VStack(alignment: .leading, spacing: 6) {
-                Text("When opening a music file")
+
+            SettingsGroup(title: "Time display") {
+                Picker("Time display", selection: $timeDisplayPreference.showsRemainingTime) {
+                    Text("Show elapsed time").tag(false)
+                    Text("Show remaining time").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+            }
+
+            SettingsGroup(title: "Notifications") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Enable track change notifications", isOn: $trackNotifications.isEnabled)
+                    if !trackNotifications.permissionMessage.isEmpty {
+                        Text(trackNotifications.permissionMessage)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            SettingsGroup(title: "Open file action") {
                 Picker("When opening a music file", selection: $openMusicFileActionRawValue) {
                     ForEach(OpenMusicFileAction.allCases) { action in
                         Text(action.title).tag(action.rawValue)
@@ -3850,33 +3871,158 @@ private struct SettingsView: View {
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
             }
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Application visibility")
-                Toggle("Show application icon in menu bar", isOn: Binding(get: { statusBarPreferences.showsTray }, set: { statusBarPreferences.setShowsTray($0) }))
-                Group {
-                    Picker("Menu bar icon", selection: $statusBarPreferences.iconMode) { ForEach(StatusBarIconMode.allCases) { Text($0.title).tag($0) } }
-                    Picker("Left click", selection: $statusBarPreferences.leftAction) { ForEach(StatusBarClickAction.allCases) { Text($0.title).tag($0) } }
-                    Picker("Right click", selection: $statusBarPreferences.rightAction) { ForEach(StatusBarClickAction.allCases) { Text($0.title).tag($0) } }
+
+            SettingsGroup(title: "Tray icon") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Tray icon", selection: trayIconSelection) {
+                        ForEach(TrayIconSelection.allCases) { selection in
+                            Text(selection.title).tag(selection)
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        SettingsLabeledRow(label: "Left click") {
+                            Picker("Left click", selection: $statusBarPreferences.leftAction) {
+                                ForEach(StatusBarClickAction.allCases) { action in
+                                    Text(action.title).tag(action)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                        }
+
+                        SettingsLabeledRow(label: "Right click") {
+                            Picker("Right click", selection: $statusBarPreferences.rightAction) {
+                                ForEach(StatusBarClickAction.allCases) { action in
+                                    Text(action.title).tag(action)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                        }
+                    }
+                    .disabled(!statusBarPreferences.showsTray)
                 }
-                .disabled(!statusBarPreferences.showsTray)
-            }
-            Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
-                ForEach(AdaptiveEQCorrectionRange.allCases) { range in
-                    Text(range.title).tag(range)
-                }
-            }
-            if !trackNotifications.permissionMessage.isEmpty {
-                Text(trackNotifications.permissionMessage)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(20)
     }
 
+    private var outputSettings: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsGroup(title: "Spectrum analyzer") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Spectrum analyzer", selection: $visualization.analyzer) {
+                        ForEach(VisualizationAnalyzer.allCases) { analyzer in
+                            Text(analyzer.title).tag(analyzer)
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                    Toggle("Show peaks", isOn: $visualization.showsPeaks)
+                }
+            }
+
+            SettingsGroup(title: "Automatic EQ") {
+                Picker("Automatic EQ range", selection: $equalizer.adaptiveCorrectionRange) {
+                    ForEach(AdaptiveEQCorrectionRange.allCases) { range in
+                        Text("Range: \(range.title)").tag(range)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+            }
+        }
+        .padding(20)
+    }
+
+    private var trayIconSelection: Binding<TrayIconSelection> {
+        Binding(
+            get: {
+                guard statusBarPreferences.showsTray else { return .off }
+                switch statusBarPreferences.iconMode {
+                case .application: return .application
+                case .playbackStatus: return .playbackStatus
+                }
+            },
+            set: { selection in
+                switch selection {
+                case .off:
+                    statusBarPreferences.setShowsTray(false)
+                case .application:
+                    statusBarPreferences.iconMode = .application
+                    statusBarPreferences.setShowsTray(true)
+                case .playbackStatus:
+                    statusBarPreferences.iconMode = .playbackStatus
+                    statusBarPreferences.setShowsTray(true)
+                }
+            }
+        )
+    }
+
     private var skinSettings: some View {
         SkinSettingsView(skin: skin)
+    }
+}
+
+private struct SettingsGroup<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            Text(title)
+                .font(.headline)
+                .frame(width: 145, alignment: .leading)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct SettingsLabeledRow<Content: View>: View {
+    let label: String
+    let content: Content
+
+    init(label: String, @ViewBuilder content: () -> Content) {
+        self.label = label
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .frame(width: 78, alignment: .leading)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct SettingsSlider: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let valueText: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                Spacer(minLength: 8)
+                Text(valueText)
+                    .font(.system(.body, design: .monospaced))
+            }
+            Slider(value: $value, in: range, step: step)
+        }
     }
 }
 
