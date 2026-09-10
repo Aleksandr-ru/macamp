@@ -1,7 +1,21 @@
 import AppKit
 import AVFoundation
 import Combine
+import os
 import UniformTypeIdentifiers
+
+private let tagEditorLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp",
+    category: "metadata-editor"
+)
+
+private func logTagEditorFailure(_ operation: String, url: URL?, error: Error) {
+    let nsError = error as NSError
+    let path = url?.path ?? "<none>"
+    tagEditorLogger.error(
+        "\(operation, privacy: .public) failed; path=\(path, privacy: .public); domain=\(nsError.domain, privacy: .public); code=\(nsError.code); error=\(String(describing: error), privacy: .public)"
+    )
+}
 
 struct TagEditorFields: Equatable {
     var trackNumber = ""
@@ -88,13 +102,23 @@ private enum TagEditorArtworkChange {
     case replace(Data)
 }
 
+private extension TagEditorArtworkChange {
+    var logName: String {
+        switch self {
+        case .unchanged: return "unchanged"
+        case .remove: return "remove"
+        case .replace: return "replace"
+        }
+    }
+}
+
 enum TagEditorError: LocalizedError {
     case invalidFile
     case unsupportedFormat(String)
     case metadataReadFailed
     case exportTimedOut
     case exportFailed(String)
-    case fileReplacementFailed(String)
+    case fileWriteFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -108,8 +132,8 @@ enum TagEditorError: LocalizedError {
             return "Writing the metadata took too long and was cancelled."
         case .exportFailed(let reason):
             return reason
-        case .fileReplacementFailed(let reason):
-            return "The audio file was not replaced: \(reason)"
+        case .fileWriteFailed(let reason):
+            return "The audio file was not saved: \(reason)"
         }
     }
 }
@@ -132,24 +156,27 @@ final class TagEditorModel: ObservableObject {
     private var originalTagEnabled = true
     private var originalArtworkData: Data?
 
-    func load(_ url: URL) {
+    func load(_ url: URL, bookmarkData: Data? = nil) {
+        let accessibleURL = Self.resolve(url, bookmarkData: bookmarkData)
+        tagEditorLogger.debug("Loading metadata from \(accessibleURL.path, privacy: .public); bookmark=\(bookmarkData != nil)")
         let token = UUID()
         generation = token
-        currentURL = url
-        fileName = url.path
+        currentURL = accessibleURL
+        fileName = accessibleURL.path
         isLoading = true
         isSaving = false
         errorMessage = nil
         artworkChange = .unchanged
-        values = Self.initialValues(for: url)
+        values = Self.initialValues(for: accessibleURL)
         originalFields = values.fields
         originalTagEnabled = values.tagEnabled
         originalArtworkData = values.artworkData
 
         queue.async { [weak self] in
-            let beganScope = url.startAccessingSecurityScopedResource()
-            let loaded = Self.read(url)
-            if beganScope { url.stopAccessingSecurityScopedResource() }
+            let beganScope = accessibleURL.startAccessingSecurityScopedResource()
+            let loaded = Self.read(accessibleURL)
+            tagEditorLogger.debug("Loaded metadata from \(accessibleURL.path, privacy: .public); securityScope=\(beganScope); writable=\(loaded.canWrite)")
+            if beganScope { accessibleURL.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
                 self.isLoading = false
@@ -161,12 +188,25 @@ final class TagEditorModel: ObservableObject {
         }
     }
 
+    private static func resolve(_ url: URL, bookmarkData: Data?) -> URL {
+        guard let bookmarkData else { return url }
+        var isStale = false
+        return (try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )) ?? url
+    }
+
     func save(_ fields: TagEditorFields, completion: @escaping (Result<Void, Error>) -> Void) {
         guard let url = currentURL else {
+            tagEditorLogger.error("Metadata save rejected: there is no current file")
             completion(.failure(TagEditorError.invalidFile))
             return
         }
         guard values.canWrite else {
+            tagEditorLogger.error("Metadata save rejected for \(url.path, privacy: .public): unsupported format")
             completion(.failure(TagEditorError.unsupportedFormat(url.pathExtension)))
             return
         }
@@ -177,12 +217,16 @@ final class TagEditorModel: ObservableObject {
         errorMessage = nil
         queue.async { [weak self] in
             let beganScope = url.startAccessingSecurityScopedResource()
+            tagEditorLogger.debug("Saving metadata to \(url.path, privacy: .public); securityScope=\(beganScope); tagEnabled=\(tagEnabled); artwork=\(artworkChange.logName)")
             let result: Result<Void, Error>
             do {
                 try AudioTagWriter.write(fields, artwork: artworkChange, tagEnabled: tagEnabled, to: url)
                 result = .success(())
+                tagEditorLogger.debug("Metadata saved to \(url.path, privacy: .public)")
             } catch {
                 result = .failure(error)
+                logTagEditorFailure("Metadata save", url: url, error: error)
+                tagEditorLogger.error("Metadata save securityScope=\(beganScope)")
             }
             if beganScope { url.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
@@ -449,7 +493,22 @@ final class TagEditorModel: ObservableObject {
         }
         result.tagEnabled = hasMetadataTag(for: url, metadata: metadata)
         result.formatInfo = formatInfoLines(for: url, asset: asset, metadata: metadata).joined(separator: "\n")
+        Self.applyWriteAccess(to: &result, for: url)
         return result
+    }
+
+    private static func applyWriteAccess(to values: inout TagEditorValues, for url: URL) {
+        guard values.canWrite else { return }
+
+        do {
+            let handle = try FileHandle(forUpdating: url)
+            try handle.close()
+            tagEditorLogger.debug("Write preflight passed; path=\(url.path, privacy: .public)")
+        } catch {
+            logTagEditorFailure("Write preflight", url: url, error: error)
+            values.canWrite = false
+            values.supportMessage = "Read-only: you don't have permission to save this file."
+        }
     }
 
     private static func readID3v1Fields(from url: URL) -> TagEditorFields {
@@ -903,6 +962,7 @@ final class TagEditorModel: ObservableObject {
 private enum AudioTagWriter {
     static func write(_ fields: TagEditorFields, artwork: TagEditorArtworkChange, tagEnabled: Bool, to url: URL) throws {
         guard isSafeRegularFile(url) else { throw TagEditorError.invalidFile }
+        tagEditorLogger.debug("Writing \(url.pathExtension.lowercased(), privacy: .public) metadata; path=\(url.path, privacy: .public); tagEnabled=\(tagEnabled)")
         switch url.pathExtension.lowercased() {
         case "mp3", "aac":
             if tagEnabled {
@@ -935,101 +995,61 @@ private enum AudioTagWriter {
     private static func writeID3(_ fields: TagEditorFields, artwork: TagEditorArtworkChange, to url: URL) throws {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
-        var output: FileHandle?
         let fileLength = try input.seekToEnd()
         input.seek(toFileOffset: 0)
 
-        do {
-            let header = try readID3Header(from: input, fileLength: fileLength)
-            let version = header.version
-            var preservedFrames: [Data] = []
-            if !header.tagData.isEmpty {
-                preservedFrames = try preservedID3Frames(from: header.tagData, version: version)
-            }
-            let replacementIDs = Set(["TPE1", "TIT2", "TALB", "TPE2", "TYER", "TDRC", "TCON", "COMM", "TCOM", "TPUB", "TPOS", "TRCK", "TBPM", "TOPE", "TCOP", "WXXX", "TENC"])
-            preservedFrames.removeAll { frame in
-                guard frame.count >= 4, let id = String(bytes: frame.prefix(4), encoding: .ascii) else { return false }
-                return replacementIDs.contains(id) || (id == "APIC" && !isUnchanged(artwork))
-            }
-
-            var newFrames = preservedFrames
-            newFrames.append(contentsOf: makeID3Frames(fields, version: version))
-            if case .replace(let data) = artwork {
-                newFrames.append(makeID3ArtworkFrame(data, version: version))
-            }
-            let payload = newFrames.reduce(into: Data()) { $0.append($1) }
-            guard payload.count <= 0x0FFFFFFF else { throw TagEditorError.exportFailed("The metadata tag is too large.") }
-
-            let temporaryURL = try temporaryURL(for: url, suffix: "id3")
-            do {
-                guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
-                    throw TagEditorError.fileReplacementFailed("Could not create a temporary file.")
-                }
-                output = try FileHandle(forWritingTo: temporaryURL)
-                var newHeader = Data([0x49, 0x44, 0x33, UInt8(version), 0, 0])
-                newHeader.append(contentsOf: synchsafe(payload.count))
-                try output?.write(contentsOf: newHeader)
-                try output?.write(contentsOf: payload)
-
-                let audioEnd = oldAudioEnd(fileLength: fileLength, audioStart: header.audioStart, input: input)
-                guard audioEnd >= header.audioStart else { throw TagEditorError.invalidFile }
-                input.seek(toFileOffset: header.audioStart)
-                var remaining = audioEnd - header.audioStart
-                while remaining > 0 {
-                    let readLength = Int(min(UInt64(1024 * 1024), remaining))
-                    guard let chunk = try input.read(upToCount: readLength), !chunk.isEmpty else {
-                        throw TagEditorError.fileReplacementFailed("The audio stream ended unexpectedly.")
-                    }
-                    try output?.write(contentsOf: chunk)
-                    remaining -= UInt64(chunk.count)
-                }
-                try output?.close()
-                output = nil
-                try replace(original: url, with: temporaryURL)
-            } catch {
-                try? output?.close()
-                removeTemporary(temporaryURL, for: url)
-                throw error
-            }
+        let header = try readID3Header(from: input, fileLength: fileLength)
+        let version = header.version
+        var preservedFrames: [Data] = []
+        if !header.tagData.isEmpty {
+            preservedFrames = try preservedID3Frames(from: header.tagData, version: version)
         }
+        let replacementIDs = Set(["TPE1", "TIT2", "TALB", "TPE2", "TYER", "TDRC", "TCON", "COMM", "TCOM", "TPUB", "TPOS", "TRCK", "TBPM", "TOPE", "TCOP", "WXXX", "TENC"])
+        preservedFrames.removeAll { frame in
+            guard frame.count >= 4, let id = String(bytes: frame.prefix(4), encoding: .ascii) else { return false }
+            return replacementIDs.contains(id) || (id == "APIC" && !isUnchanged(artwork))
+        }
+
+        var newFrames = preservedFrames
+        newFrames.append(contentsOf: makeID3Frames(fields, version: version))
+        if case .replace(let data) = artwork {
+            newFrames.append(makeID3ArtworkFrame(data, version: version))
+        }
+        let payload = newFrames.reduce(into: Data()) { $0.append($1) }
+        guard payload.count <= 0x0FFFFFFF else { throw TagEditorError.exportFailed("The metadata tag is too large.") }
+
+        let audioEnd = oldAudioEnd(fileLength: fileLength, audioStart: header.audioStart, input: input)
+        guard audioEnd >= header.audioStart else { throw TagEditorError.invalidFile }
+        let tag = makeID3TagData(payload, version: version, paddedTo: header.audioStart)
+        try input.close()
+        try rewriteID3InPlace(
+            to: url,
+            oldTagSize: header.audioStart,
+            contentEnd: audioEnd,
+            fileLength: fileLength,
+            newTag: tag,
+            preserveTrailingID3v1: true
+        )
     }
 
     private static func removeID3Tag(from url: URL) throws {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
-        var output: FileHandle?
         let fileLength = try input.seekToEnd()
         input.seek(toFileOffset: 0)
 
-        do {
-            let header = try readID3Header(from: input, fileLength: fileLength)
-            let temporaryURL = try temporaryURL(for: url, suffix: "notag")
-            do {
-                guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
-                    throw TagEditorError.fileReplacementFailed("Could not create a temporary file.")
-                }
-                output = try FileHandle(forWritingTo: temporaryURL)
-                let audioEnd = oldAudioEnd(fileLength: fileLength, audioStart: header.audioStart, input: input)
-                guard audioEnd >= header.audioStart else { throw TagEditorError.invalidFile }
-                input.seek(toFileOffset: header.audioStart)
-                var remaining = audioEnd - header.audioStart
-                while remaining > 0 {
-                    let readLength = Int(min(UInt64(1024 * 1024), remaining))
-                    guard let chunk = try input.read(upToCount: readLength), !chunk.isEmpty else {
-                        throw TagEditorError.fileReplacementFailed("The audio stream ended unexpectedly.")
-                    }
-                    try output?.write(contentsOf: chunk)
-                    remaining -= UInt64(chunk.count)
-                }
-                try output?.close()
-                output = nil
-                try replace(original: url, with: temporaryURL)
-            } catch {
-                try? output?.close()
-                removeTemporary(temporaryURL, for: url)
-                throw error
-            }
-        }
+        let header = try readID3Header(from: input, fileLength: fileLength)
+        let audioEnd = oldAudioEnd(fileLength: fileLength, audioStart: header.audioStart, input: input)
+        guard audioEnd >= header.audioStart else { throw TagEditorError.invalidFile }
+        try input.close()
+        try rewriteID3InPlace(
+            to: url,
+            oldTagSize: header.audioStart,
+            contentEnd: audioEnd,
+            fileLength: fileLength,
+            newTag: Data(),
+            preserveTrailingID3v1: false
+        )
     }
 
     private static func readID3Header(from input: FileHandle, fileLength: UInt64) throws -> ID3Header {
@@ -1196,17 +1216,24 @@ private enum AudioTagWriter {
     }
 
     private static func writeM4A(_ fields: TagEditorFields, tagEnabled: Bool, to url: URL) throws {
+        tagEditorLogger.debug("Preparing M4A export; path=\(url.path, privacy: .public)")
         let asset = AVURLAsset(url: url)
         let semaphore = DispatchSemaphore(value: 0)
         asset.loadValuesAsynchronously(forKeys: ["metadata"]) { semaphore.signal() }
-        guard semaphore.wait(timeout: .now() + 10) == .success else { throw TagEditorError.metadataReadFailed }
+        guard semaphore.wait(timeout: .now() + 10) == .success else {
+            tagEditorLogger.error("M4A metadata load timed out; path=\(url.path, privacy: .public)")
+            throw TagEditorError.metadataReadFailed
+        }
 
         guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough),
               exporter.supportedFileTypes.contains(.m4a) else {
+            tagEditorLogger.error("M4A exporter unavailable; path=\(url.path, privacy: .public)")
             throw TagEditorError.unsupportedFormat(url.pathExtension)
         }
 
-        let temporaryURL = try temporaryURL(for: url, suffix: "m4a")
+        let temporaryURL = try makeTemporaryFile(for: url, suffix: "m4a")
+        removeTemporary(temporaryURL, for: url)
+        tagEditorLogger.debug("M4A export output: \(temporaryURL.path, privacy: .public)")
         exporter.outputURL = temporaryURL
         exporter.outputFileType = .m4a
         exporter.shouldOptimizeForNetworkUse = false
@@ -1224,16 +1251,25 @@ private enum AudioTagWriter {
             exporter.cancelExport()
             _ = exportSemaphore.wait(timeout: .now() + 5)
             removeTemporary(temporaryURL, for: url)
+            tagEditorLogger.error("M4A metadata export timed out; path=\(url.path, privacy: .public)")
             throw TagEditorError.exportTimedOut
         }
         guard exporter.status == .completed else {
             removeTemporary(temporaryURL, for: url)
-            throw TagEditorError.exportFailed(exporter.error?.localizedDescription ?? "The metadata export failed.")
+            let error = exporter.error ?? TagEditorError.exportFailed("The metadata export failed.")
+            logTagEditorFailure("M4A metadata export", url: url, error: error)
+            throw TagEditorError.exportFailed(error.localizedDescription)
         }
         do {
-            try replace(original: url, with: temporaryURL)
+            // A security-scoped file selection grants access to the file's
+            // contents, but it does not necessarily grant permission to
+            // replace the directory entry itself. Updating the existing file
+            // avoids that extra parent-directory permission requirement and
+            // also preserves the file's identity and permissions.
+            try overwrite(original: url, with: temporaryURL)
         } catch {
             removeTemporary(temporaryURL, for: url)
+            logTagEditorFailure("M4A file write", url: url, error: error)
             throw error
         }
     }
@@ -1292,31 +1328,184 @@ private enum AudioTagWriter {
         }
     }
 
-    private static func temporaryURL(for original: URL, suffix: String) throws -> URL {
+    private static func makeID3TagData(_ payload: Data, version: Int, paddedTo oldTagSize: UInt64) -> Data {
+        var tag = Data([0x49, 0x44, 0x33, UInt8(version), 0, 0])
+        tag.append(contentsOf: synchsafe(payload.count))
+        tag.append(contentsOf: payload)
+
+        // Keep the existing tag area when the new data fits. This avoids
+        // moving the audio stream for ordinary edits and leaves room for the
+        // next small change, as ID3-aware taggers commonly do.
+        if oldTagSize >= UInt64(tag.count), oldTagSize <= UInt64(Int.max) {
+            tag.append(Data(repeating: 0, count: Int(oldTagSize) - tag.count))
+        }
+        return tag
+    }
+
+    /// Rewrites the leading ID3 block without replacing the directory entry.
+    /// The audio and optional trailing ID3v1 bytes are shifted in overlapping-
+    /// safe order, then the file is truncated to its exact new length.
+    private static func rewriteID3InPlace(
+        to url: URL,
+        oldTagSize: UInt64,
+        contentEnd: UInt64,
+        fileLength: UInt64,
+        newTag: Data,
+        preserveTrailingID3v1: Bool
+    ) throws {
+        guard oldTagSize <= contentEnd, contentEnd <= fileLength else {
+            throw TagEditorError.invalidFile
+        }
+
+        let trailingLength = preserveTrailingID3v1 ? fileLength - contentEnd : 0
+        let preservedLength = (contentEnd - oldTagSize) + trailingLength
+        let newTagSize = UInt64(newTag.count)
+        guard newTagSize <= UInt64.max - preservedLength else {
+            throw TagEditorError.exportFailed("The metadata tag is too large.")
+        }
+        let newFileLength = newTagSize + preservedLength
+        tagEditorLogger.debug("MP3 update preflight; path=\(url.path, privacy: .public); writable=\(FileManager.default.isWritableFile(atPath: url.path)); oldSize=\(fileLength); newSize=\(newFileLength)")
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forUpdating: url)
+        } catch {
+            logTagEditorFailure("Opening MP3 for update", url: url, error: error)
+            throw TagEditorError.fileWriteFailed(error.localizedDescription)
+        }
+        defer { try? handle.close() }
+
+        let oldContentStart = oldTagSize
+        let newContentStart = newTagSize
+        if newContentStart > oldContentStart {
+            // Grow before moving right so the destination cannot run past
+            // the current EOF. The source range ends at contentEnd when the
+            // old ID3v1 tag is being removed.
+            try handle.truncate(atOffset: newFileLength)
+            var remaining = preservedLength
+            while remaining > 0 {
+                let readLength = Int(min(UInt64(1024 * 1024), remaining))
+                let sourceOffset = oldContentStart + remaining - UInt64(readLength)
+                let destinationOffset = newContentStart + remaining - UInt64(readLength)
+                handle.seek(toFileOffset: sourceOffset)
+                guard let chunk = try handle.read(upToCount: readLength), chunk.count == readLength else {
+                    throw TagEditorError.fileWriteFailed("The audio stream ended unexpectedly.")
+                }
+                handle.seek(toFileOffset: destinationOffset)
+                try handle.write(contentsOf: chunk)
+                remaining -= UInt64(readLength)
+            }
+        } else if newContentStart < oldContentStart {
+            // Move left from the beginning. Reading a complete chunk before
+            // writing it makes the overlap safe, while the next source chunk
+            // remains untouched.
+            var moved: UInt64 = 0
+            while moved < preservedLength {
+                let readLength = Int(min(UInt64(1024 * 1024), preservedLength - moved))
+                handle.seek(toFileOffset: oldContentStart + moved)
+                guard let chunk = try handle.read(upToCount: readLength), chunk.count == readLength else {
+                    throw TagEditorError.fileWriteFailed("The audio stream ended unexpectedly.")
+                }
+                handle.seek(toFileOffset: newContentStart + moved)
+                try handle.write(contentsOf: chunk)
+                moved += UInt64(readLength)
+            }
+        }
+
+        handle.seek(toFileOffset: 0)
+        if !newTag.isEmpty {
+            try handle.write(contentsOf: newTag)
+        }
+        try handle.truncate(atOffset: newFileLength)
+        try handle.synchronize()
+    }
+
+    private static func makeTemporaryFile(for original: URL, suffix: String) throws -> URL {
         let parent = original.deletingLastPathComponent().standardizedFileURL
         guard parent.path != "/",
               (try? parent.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
-            throw TagEditorError.fileReplacementFailed("The parent folder is unavailable.")
+            throw TagEditorError.fileWriteFailed("The parent folder is unavailable.")
         }
         let name = ".macamp-tag-\(UUID().uuidString).\(suffix)"
         let candidate = parent.appendingPathComponent(name, isDirectory: false)
         guard candidate.deletingLastPathComponent().standardizedFileURL == parent else {
-            throw TagEditorError.fileReplacementFailed("The temporary path is invalid.")
+            throw TagEditorError.fileWriteFailed("The temporary path is invalid.")
         }
-        return candidate
+        if FileManager.default.createFile(atPath: candidate.path, contents: nil) {
+            return candidate
+        }
+
+        // A security-scoped bookmark may authorize the audio file itself but
+        // not creation of a sibling in its directory. Use the process
+        // temporary directory as a safe fallback while keeping the same
+        // atomic replacement path for the original file.
+        let fallbackParent = FileManager.default.temporaryDirectory.standardizedFileURL
+        let fallback = fallbackParent.appendingPathComponent(name, isDirectory: false)
+        guard fallback.deletingLastPathComponent().standardizedFileURL == fallbackParent else {
+            throw TagEditorError.fileWriteFailed("The fallback temporary path is invalid.")
+        }
+        guard FileManager.default.createFile(atPath: fallback.path, contents: nil) else {
+            throw TagEditorError.fileWriteFailed("Could not create a temporary file next to the audio file or in the system temporary folder.")
+        }
+        return fallback
     }
 
-    private static func replace(original: URL, with temporary: URL) throws {
-        do {
-            _ = try FileManager.default.replaceItemAt(original, withItemAt: temporary, backupItemName: nil, options: .usingNewMetadataOnly)
-        } catch {
-            throw TagEditorError.fileReplacementFailed(error.localizedDescription)
+    private static func overwrite(original: URL, with temporary: URL) throws {
+        guard isSafeRegularFile(original), isSafeRegularFile(temporary),
+              original.standardizedFileURL != temporary.standardizedFileURL else {
+            tagEditorLogger.error("M4A overwrite rejected; original=\(original.path, privacy: .public); temporary=\(temporary.path, privacy: .public)")
+            throw TagEditorError.fileWriteFailed("The source or destination file is unavailable.")
         }
+
+        tagEditorLogger.debug("Overwriting existing file contents; original=\(original.path, privacy: .public); temporary=\(temporary.path, privacy: .public)")
+
+        let source: FileHandle
+        do {
+            source = try FileHandle(forReadingFrom: temporary)
+        } catch {
+            logTagEditorFailure("Opening M4A export", url: temporary, error: error)
+            throw TagEditorError.fileWriteFailed(error.localizedDescription)
+        }
+        defer { try? source.close() }
+
+        let sourceLength: UInt64
+        do {
+            sourceLength = try source.seekToEnd()
+            try source.seek(toOffset: 0)
+        } catch {
+            logTagEditorFailure("Inspecting M4A export", url: temporary, error: error)
+            throw TagEditorError.fileWriteFailed(error.localizedDescription)
+        }
+        tagEditorLogger.debug("M4A export size=\(sourceLength) bytes")
+
+        let destination: FileHandle
+        do {
+            destination = try FileHandle(forUpdating: original)
+        } catch {
+            logTagEditorFailure("Opening original file for update", url: original, error: error)
+            throw TagEditorError.fileWriteFailed(error.localizedDescription)
+        }
+        defer { try? destination.close() }
+
+        do {
+            try destination.seek(toOffset: 0)
+            while true {
+                guard let chunk = try source.read(upToCount: 1024 * 1024), !chunk.isEmpty else { break }
+                try destination.write(contentsOf: chunk)
+            }
+            try destination.truncate(atOffset: sourceLength)
+            try destination.synchronize()
+        } catch {
+            logTagEditorFailure("Writing M4A contents", url: original, error: error)
+            throw TagEditorError.fileWriteFailed(error.localizedDescription)
+        }
+        tagEditorLogger.debug("M4A contents written successfully; path=\(original.path, privacy: .public); size=\(sourceLength) bytes")
     }
 
     private static func removeTemporary(_ temporary: URL, for original: URL) {
         let parent = original.deletingLastPathComponent().standardizedFileURL
-        guard temporary.deletingLastPathComponent().standardizedFileURL == parent,
+        let processTemporaryDirectory = FileManager.default.temporaryDirectory.standardizedFileURL
+        guard temporary.deletingLastPathComponent().standardizedFileURL == parent
+                || temporary.deletingLastPathComponent().standardizedFileURL == processTemporaryDirectory,
               temporary.lastPathComponent.hasPrefix(".macamp-tag-") else { return }
         try? FileManager.default.removeItem(at: temporary)
     }
@@ -1341,6 +1530,8 @@ final class TagEditorPanelView: NSView {
     private let model: TagEditorModel
     private let onSave: (TagEditorFields) -> Void
     private let onCancel: () -> Void
+    private let onPrevious: () -> Void
+    private let onNext: () -> Void
     private var observations = Set<AnyCancellable>()
 
     private let fileLabel = NSTextField(labelWithString: "")
@@ -1368,15 +1559,27 @@ final class TagEditorPanelView: NSView {
     private let artworkBox = NSBox()
     private let formatBox = NSBox()
     private let metadataContent: TagEditorFormContentView
+    private let previousButton = NSButton(title: "←", target: nil, action: nil)
+    private let nextButton = NSButton(title: "→", target: nil, action: nil)
     private lazy var saveButton = NSButton(title: "OK", target: self, action: #selector(save(_:)))
     private lazy var cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancel(_:)))
+    private var hasPreviousFile = false
+    private var hasNextFile = false
 
     var initialFirstResponder: NSView { titleField }
 
-    init(model: TagEditorModel, onSave: @escaping (TagEditorFields) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        model: TagEditorModel,
+        onSave: @escaping (TagEditorFields) -> Void,
+        onCancel: @escaping () -> Void,
+        onPrevious: @escaping () -> Void,
+        onNext: @escaping () -> Void
+    ) {
         self.model = model
         self.onSave = onSave
         self.onCancel = onCancel
+        self.onPrevious = onPrevious
+        self.onNext = onNext
         self.metadataContent = TagEditorFormContentView(
             trackField: trackField,
             titleField: titleField,
@@ -1447,6 +1650,8 @@ final class TagEditorPanelView: NSView {
         configureReadOnlyText(formatView)
         configureTextScroll(commentScroll, document: commentView, border: .bezelBorder)
         configureTextScroll(formatScroll, document: formatView, border: .bezelBorder)
+        configureNavigationButton(previousButton, toolTip: "Previous file in playlist", action: #selector(previous(_:)))
+        configureNavigationButton(nextButton, toolTip: "Next file in playlist", action: #selector(next(_:)))
 
         configureBox(metadataBox, title: "Metadata", content: metadataContent)
         configureBox(artworkBox, title: "Album art", content: artworkContent)
@@ -1456,6 +1661,8 @@ final class TagEditorPanelView: NSView {
         addSubview(artworkBox)
         addSubview(formatBox)
         addSubview(statusLabel)
+        addSubview(previousButton)
+        addSubview(nextButton)
         addSubview(cancelButton)
         addSubview(saveButton)
 
@@ -1515,6 +1722,15 @@ final class TagEditorPanelView: NSView {
         view.autoresizingMask = [.width, .height]
     }
 
+    private func configureNavigationButton(_ button: NSButton, toolTip: String, action: Selector) {
+        button.target = self
+        button.action = action
+        button.toolTip = toolTip
+        button.controlSize = .small
+        button.bezelStyle = .smallSquare
+        button.font = NSFont.systemFont(ofSize: 14)
+    }
+
     override func layout() {
         super.layout()
         let bounds = self.bounds
@@ -1524,7 +1740,19 @@ final class TagEditorPanelView: NSView {
         let mainBottom = buttonY + buttonHeight + 12
         let fileHeight: CGFloat = 18
         let fileY = max(mainBottom + 10, bounds.height - margin - fileHeight)
-        fileLabel.frame = NSRect(x: margin, y: fileY, width: max(0, bounds.width - margin * 2), height: fileHeight)
+        let navigationGap: CGFloat = 0
+        let navigationWidth: CGFloat = 40
+        let nextButtonX = bounds.width - margin - navigationWidth
+        let previousButtonX = nextButtonX - navigationGap - navigationWidth
+        let navigationY = fileY - 2
+        fileLabel.frame = NSRect(
+            x: margin,
+            y: fileY,
+            width: max(0, previousButtonX - navigationGap - margin),
+            height: fileHeight
+        )
+        previousButton.frame = NSRect(x: previousButtonX, y: navigationY, width: navigationWidth, height: 22)
+        nextButton.frame = NSRect(x: nextButtonX, y: navigationY, width: navigationWidth, height: 22)
 
         let mainTop = fileY - 9
         let mainHeight = max(420, mainTop - mainBottom)
@@ -1557,6 +1785,7 @@ final class TagEditorPanelView: NSView {
 
     private func applyModel() {
         let fields = model.values.fields
+        let canEdit = model.values.canWrite && !model.isLoading && !model.isSaving
         trackField.stringValue = fields.trackNumber
         titleField.stringValue = fields.title
         artistField.stringValue = fields.artist
@@ -1574,14 +1803,15 @@ final class TagEditorPanelView: NSView {
         formatView.string = model.values.formatInfo
         fileLabel.stringValue = model.fileName
         artworkContent.image = model.values.artworkData.flatMap { NSImage(data: $0) }
-        artworkContent.isEditingEnabled = model.values.supportsArtworkEditing && !model.isLoading && !model.isSaving
+        artworkContent.isEditingEnabled = model.values.supportsArtworkEditing && canEdit
         metadataContent.setMetadataTypeName(
             model.values.metadataTypeName,
             isOn: model.values.tagEnabled,
-            isEnabled: model.values.canToggleTag && !model.isLoading && !model.isSaving
+            isEnabled: model.values.canToggleTag && canEdit
         )
-        metadataContent.setMetadataFieldsEnabled(model.values.tagEnabled)
-        metadataContent.setID3FieldsEnabled(model.values.supportsID3Fields && model.values.tagEnabled)
+        metadataContent.setMetadataFieldsEnabled(model.values.tagEnabled && canEdit)
+        metadataContent.setID3FieldsEnabled(model.values.supportsID3Fields && model.values.tagEnabled && canEdit)
+        updateNavigationButtonState()
 
         if let error = model.errorMessage {
             statusLabel.stringValue = error
@@ -1603,6 +1833,43 @@ final class TagEditorPanelView: NSView {
 
     @objc private func save(_ sender: Any?) {
         onSave(currentFields())
+    }
+
+    func setNavigationAvailability(previous: Bool, next: Bool) {
+        hasPreviousFile = previous
+        hasNextFile = next
+        updateNavigationButtonState()
+    }
+
+    private func updateNavigationButtonState() {
+        let enabled = !model.isLoading && !model.isSaving
+        previousButton.isEnabled = hasPreviousFile && enabled
+        nextButton.isEnabled = hasNextFile && enabled
+    }
+
+    @objc private func previous(_ sender: Any?) {
+        navigateToAnotherFile(onPrevious)
+    }
+
+    @objc private func next(_ sender: Any?) {
+        navigateToAnotherFile(onNext)
+    }
+
+    private func navigateToAnotherFile(_ action: () -> Void) {
+        guard !model.isLoading, !model.isSaving else { return }
+        guard model.hasUnsavedChanges(fields: currentFields()) else {
+            action()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Discard changes?"
+        alert.informativeText = "Your changes will be lost when you open another file."
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            action()
+        }
     }
 
     private func currentFields() -> TagEditorFields {
@@ -1630,11 +1897,12 @@ final class TagEditorPanelView: NSView {
 
     private func updateActionButtons() {
         let isBusy = model.isLoading || model.isSaving
+        let canEdit = model.values.canWrite && !isBusy
         metadataContent.setActionAvailability(
-            getFromFilename: model.values.canWrite && model.canGetFromFilename && !isBusy,
-            copyFromID3v1: model.values.canCopyID3v1 && !isBusy,
-            reloadWithEncoding: model.values.tagEnabled && model.values.supportsEncodingReload && !isBusy,
-            undoChanges: model.hasUnsavedChanges(fields: currentFields()) && !isBusy
+            getFromFilename: canEdit && model.canGetFromFilename,
+            copyFromID3v1: canEdit && model.values.canCopyID3v1,
+            reloadWithEncoding: canEdit && model.values.tagEnabled && model.values.supportsEncodingReload,
+            undoChanges: canEdit && model.hasUnsavedChanges(fields: currentFields())
         )
     }
 

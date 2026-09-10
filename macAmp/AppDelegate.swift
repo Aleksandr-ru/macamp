@@ -525,6 +525,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var playlistWindow: NSWindow?
     private var infoWindow: NSWindow?
     private var tagEditorWindow: NSWindow?
+    private weak var tagEditorPanelView: TagEditorPanelView?
     private var visualizationWindow: NSWindow?
     private let infoFocus = WindowFocusState()
     private let visualizationFocus = WindowFocusState()
@@ -2659,7 +2660,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tagEditorContext = (playlist.id, entry.id)
         tagEditorStandaloneURL = nil
         let panel = makeTagEditorWindowIfNeeded()
-        tagEditorModel.load(url)
+        tagEditorModel.load(url, bookmarkData: entry.bookmarkData)
+        updateTagEditorNavigation()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -2670,8 +2672,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tagEditorStandaloneURL = url
         let panel = makeTagEditorWindowIfNeeded()
         tagEditorModel.load(url)
+        updateTagEditorNavigation()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func navigateTagEditor(by offset: Int) {
+        guard offset == -1 || offset == 1,
+              let context = tagEditorContext,
+              let playlist = playlistManager.playlist(id: context.playlistID),
+              let currentIndex = playlist.entries.firstIndex(where: { $0.id == context.entryID }) else {
+            updateTagEditorNavigation()
+            return
+        }
+        let targetIndex = currentIndex + offset
+        guard playlist.entries.indices.contains(targetIndex) else {
+            updateTagEditorNavigation()
+            return
+        }
+        let target = playlist.entries[targetIndex]
+        guard target.url.isFileURL, !target.url.path.isEmpty else { return }
+        openTagEditor(for: target.url, playlist: playlist, entry: target)
+    }
+
+    private func updateTagEditorNavigation() {
+        guard let tagEditorPanelView,
+              let context = tagEditorContext,
+              let playlist = playlistManager.playlist(id: context.playlistID),
+              let currentIndex = playlist.entries.firstIndex(where: { $0.id == context.entryID }) else {
+            tagEditorPanelView?.setNavigationAvailability(previous: false, next: false)
+            return
+        }
+        tagEditorPanelView.setNavigationAvailability(
+            previous: currentIndex > playlist.entries.startIndex,
+            next: currentIndex + 1 < playlist.entries.endIndex
+        )
     }
 
     private func saveTagEditor(_ fields: TagEditorFields) {
@@ -3118,8 +3153,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let content = TagEditorPanelView(
             model: tagEditorModel,
             onSave: { [weak self] fields in self?.saveTagEditor(fields) },
-            onCancel: { [weak self] in self?.closeTagEditor() }
+            onCancel: { [weak self] in self?.closeTagEditor() },
+            onPrevious: { [weak self] in self?.navigateTagEditor(by: -1) },
+            onNext: { [weak self] in self?.navigateTagEditor(by: 1) }
         )
+        tagEditorPanelView = content
         panel.contentView = content
         panel.initialFirstResponder = content.initialFirstResponder
         panel.center()
