@@ -91,12 +91,17 @@ final class InfoWindowModel: ObservableObject {
 
     func show(_ url: URL?) { show(url, metadataDelay: 0) }
 
+    /// Re-reads a file that is already displayed. The tag editor uses this
+    /// after an in-place metadata replacement so the separate read-only Info
+    /// window never keeps showing the old values.
+    func reload(_ url: URL?) { show(url, metadataDelay: 0, force: true) }
+
     /// Metadata/APIC extraction often performs another long sequential read of
     /// a network file. Let the audio renderer establish its buffer first.
     func showForPlayback(_ url: URL?) { show(url, metadataDelay: 2) }
 
-    private func show(_ url: URL?, metadataDelay: TimeInterval) {
-        guard content.url != url else { return }
+    private func show(_ url: URL?, metadataDelay: TimeInterval, force: Bool = false) {
+        guard force || content.url != url else { return }
         let token = UUID()
         generation = token
         content = Content(url: url, artwork: url.flatMap { artworkCache[$0] })
@@ -146,8 +151,17 @@ final class InfoWindowModel: ObservableObject {
             }
         }
         func text(_ item: AVMetadataItem?) -> String? {
-            guard let value = item?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
-            return value
+            guard let value = item?.stringValue else { return nil }
+            // Metadata containers may use CRLF or a lone CR for paragraph
+            // breaks. Normalize those separators without flattening the
+            // actual multiline value.
+            let normalized = value
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+                .replacingOccurrences(of: "\u{2028}", with: "\n")
+                .replacingOccurrences(of: "\u{2029}", with: "\n")
+            guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return normalized
         }
         func firstText(id3Frame: String, commonKey: AVMetadataKey? = nil) -> String? {
             text(id3(id3Frame)) ?? commonKey.flatMap { key in text(metadata.first { $0.commonKey == key }) }
@@ -328,35 +342,6 @@ final class InfoPanelView: NSView {
         }
     }
 
-    private func makeLabel(_ text: String, alignment: NSTextAlignment = .left,
-                           lineBreakMode: NSLineBreakMode = .byWordWrapping) -> NSTextField {
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.font = skin.resolvedFont(ofSize: 8 * textScale)
-        label.textColor = skin.playlistColors().normalText
-        label.alignment = alignment
-        label.maximumNumberOfLines = 0
-        label.lineBreakMode = lineBreakMode
-        label.cell?.wraps = true
-        label.cell?.usesSingleLineMode = false
-        label.cell?.lineBreakMode = lineBreakMode
-        return label
-    }
-
-    private func textHeight(_ text: String, width: CGFloat,
-                            lineBreakMode: NSLineBreakMode = .byWordWrapping) -> CGFloat {
-        let font = skin.resolvedFont(ofSize: 8 * textScale)
-        let storage = NSTextStorage(string: text, attributes: [.font: font])
-        let layoutManager = NSLayoutManager()
-        let container = NSTextContainer(size: NSSize(width: max(1, width), height: .greatestFiniteMagnitude))
-        container.lineFragmentPadding = 0
-        container.lineBreakMode = lineBreakMode
-        container.maximumNumberOfLines = 0
-        layoutManager.addTextContainer(container)
-        storage.addLayoutManager(layoutManager)
-        layoutManager.ensureLayout(for: container)
-        return max(ceil(font.boundingRectForFont.height), ceil(layoutManager.usedRect(for: container).height))
-    }
-
     private func rebuildContent(resetScrollPosition: Bool = false) {
         guard !isRebuilding, scrollView.bounds.width > 0 else { return }
         isRebuilding = true
@@ -383,28 +368,20 @@ final class InfoPanelView: NSView {
         let rightColumnX = leftColumnX + columnWidth + outerColumnGap
         var y = inset
         var leftArtworkHeight: CGFloat = 0
-        func addLabel(_ text: String, alignment: NSTextAlignment = .left,
-                      lineBreakMode: NSLineBreakMode = .byWordWrapping, height: CGFloat? = nil,
+        func addLabel(_ text: String, alignment: NSTextAlignment = .left, height: CGFloat? = nil,
                       x: CGFloat = inset, width: CGFloat = usableWidth,
                       detectsLinks: Bool = false) {
-            let rowHeight = height ?? textHeight(text, width: width, lineBreakMode: lineBreakMode)
-            if detectsLinks {
-                let label = InfoWrappedTextView(
-                    text: text,
-                    font: skin.resolvedFont(ofSize: 8 * textScale),
-                    color: skin.playlistColors().normalText,
-                    alignment: alignment,
-                    detectsLinks: true
-                )
-                label.menu = copyMenu
-                label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
-                documentView.addSubview(label)
-            } else {
-                let label = makeLabel(text, alignment: alignment, lineBreakMode: lineBreakMode)
-                label.menu = copyMenu
-                label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
-                documentView.addSubview(label)
-            }
+            let label = InfoWrappedTextView(
+                text: text,
+                font: skin.resolvedFont(ofSize: 8 * textScale),
+                color: skin.playlistColors().normalText,
+                alignment: alignment,
+                detectsLinks: detectsLinks
+            )
+            let rowHeight = height ?? label.requiredHeight(for: width)
+            label.menu = copyMenu
+            label.frame = NSRect(x: x, y: y, width: width, height: rowHeight)
+            documentView.addSubview(label)
             y += rowHeight + spacing
         }
 

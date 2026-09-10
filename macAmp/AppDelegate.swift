@@ -524,11 +524,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var equalizerWindow: NSWindow?
     private var playlistWindow: NSWindow?
     private var infoWindow: NSWindow?
+    private var tagEditorWindow: NSWindow?
     private var visualizationWindow: NSWindow?
     private let infoFocus = WindowFocusState()
     private let visualizationFocus = WindowFocusState()
     private let infoModel = InfoWindowModel()
+    private let tagEditorModel = TagEditorModel()
     private var infoTargetURL: URL?
+    private var tagEditorContext: (playlistID: UUID, entryID: UUID)?
     private var infoLogicalSize = NSSize(width: 250, height: 300)
     private var visualizationLogicalSize = NSSize(width: 250, height: 300)
     private var playlistWindows: [UUID: NSWindow] = [:]
@@ -810,6 +813,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Local monitoring is the only AppKit path that consistently carries the
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
+        // The metadata editor owns its keyboard navigation and editing shortcuts.
+        // Text events stay with AppKit, while other key events are consumed
+        // here so the main Playback menu cannot reinterpret them as player
+        // shortcuts (notably the arrow keys).
+        if (event.window ?? NSApp.keyWindow) === tagEditorWindow {
+            if isEditingText(for: event) || isSelectableTextViewFocused(for: event) {
+                return false
+            }
+            switch event.keyCode {
+            case 36, 48, 49, 53, 76: // Return, Tab, Space, Escape, keypad Enter
+                return false
+            default:
+                return true
+            }
+        }
+
         // Modal dialogs and text fields still pass through the application's
         // local event monitor. Let AppKit deliver those key events to the
         // field editor; otherwise a one-letter transport shortcut (Z/X/C/V,
@@ -819,6 +838,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if handleWindowShadeShortcut(event, modifiers: modifiers) { return true }
         if handleFileCloseShortcut(event, modifiers: modifiers) { return true }
         if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
+        if handlePlaylistMetadataShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
@@ -894,6 +914,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    private func isSelectableTextViewFocused(for event: NSEvent) -> Bool {
+        let window = event.window ?? NSApp.keyWindow
+        var responder = window?.firstResponder
+        while let current = responder {
+            if let textView = current as? NSTextView, textView.isSelectable { return true }
+            responder = current.nextResponder
+        }
+        return false
+    }
+
     /// Windowshade is assigned to the physical W key so ⌘W remains stable
     /// across keyboard layouts. Windows without a compact skin fall back to
     /// the main player's Windowshade, matching classic Winamp behaviour.
@@ -932,6 +962,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               sourceWindow === window
                 || sourceWindow === equalizerWindow
                 || sourceWindow === infoWindow
+                || sourceWindow === tagEditorWindow
                 || sourceWindow === visualizationWindow
                 || playlistWindows.values.contains(where: { $0 === sourceWindow }) else {
             return false
@@ -965,6 +996,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
         panel.copySummary()
+        return true
+    }
+
+    /// Winamp's Playlist Editor opens File Info for the one selected row with
+    /// Shift+E. It is routed from the source Playlist window, so selection in
+    /// another editor cannot accidentally be edited.
+    private func handlePlaylistMetadataShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 14, // physical E key
+              modifiers == [.shift],
+              let sourceWindow = event.window,
+              sourceWindow.isKeyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID),
+              playlist.selectedIDs.count == 1,
+              let entry = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) }) else {
+            return false
+        }
+        showTagEditor(for: playlist, entry: entry)
         return true
     }
 
@@ -2248,6 +2300,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sourceWindow.orderOut(nil)
             infoState.isVisible = false
             schedulePersistentStateSave()
+        } else if sourceWindow === tagEditorWindow {
+            closeTagEditor()
         } else if sourceWindow === visualizationWindow {
             sourceWindow.orderOut(nil)
             visualizationState.isVisible = false
@@ -2548,6 +2602,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         schedulePersistentStateSave()
     }
 
+    /// Opens the separate native File Info editor for exactly one Playlist
+    /// Editor row. The existing skinned Info panel deliberately remains a
+    /// read-only metadata summary.
+    func showTagEditor(for playlist: PlaylistModel, entry: PlaylistEntry) {
+        guard playlist.selectedIDs.count == 1,
+              playlist.selectedIDs.contains(entry.id),
+              entry.url.isFileURL,
+              !entry.url.path.isEmpty else { return }
+        tagEditorContext = (playlist.id, entry.id)
+        let panel = makeTagEditorWindowIfNeeded()
+        tagEditorModel.load(entry.url)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func saveTagEditor(_ fields: TagEditorFields) {
+        guard let context = tagEditorContext,
+              let playlist = playlistManager.playlist(id: context.playlistID),
+              let entry = playlist.entries.first(where: { $0.id == context.entryID }) else { return }
+        let url = entry.url
+        tagEditorModel.save(fields) { [weak self] result in
+            guard let self,
+                  self.tagEditorContext?.playlistID == context.playlistID,
+                  self.tagEditorContext?.entryID == context.entryID else { return }
+            switch result {
+            case .success:
+                let appliedFields = self.tagEditorModel.values.tagEnabled ? fields : TagEditorFields()
+                self.playlistManager.applyEditedMetadata(appliedFields, to: entry, in: playlist)
+                self.infoModel.reload(url)
+                if self.playback.currentURL == url,
+                   let updatedEntry = playlist.entries.first(where: { $0.id == context.entryID }) {
+                    self.playback.updateDisplayTitle(updatedEntry.title)
+                }
+                self.tagEditorWindow?.orderOut(nil)
+                self.tagEditorContext = nil
+            case .failure:
+                NSSound.beep()
+            }
+        }
+    }
+
+    private func closeTagEditor() {
+        tagEditorWindow?.orderOut(nil)
+        tagEditorContext = nil
+    }
+
     /// Returns the one file that the Playlist Editor's Reveal in Finder
     /// command may act on. A multi-selection deliberately has no target;
     /// with no selection, use the currently playing track instead.
@@ -2664,6 +2764,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         equalizerWindow?.orderOut(nil)
         playlistWindows.values.forEach { $0.orderOut(nil) }
         infoWindow?.orderOut(nil)
+        tagEditorWindow?.orderOut(nil)
         visualizationWindow?.orderOut(nil)
         refreshInterfaceVisibility()
     }
@@ -2697,6 +2798,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if equalizerState.isVisible { equalizerWindow?.orderFrontRegardless() }
         if playlistState.isVisible { playlistWindows.values.forEach { $0.orderFrontRegardless() } }
         if infoState.isVisible { infoWindow?.orderFrontRegardless() }
+        if tagEditorWindow?.isVisible == true { tagEditorWindow?.orderFrontRegardless() }
         if visualizationState.isVisible { visualizationWindow?.orderFrontRegardless() }
         (visualizationWindow?.contentView as? VisualizationPanelView)?.updateRenderingState()
     }
@@ -2752,7 +2854,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleAlwaysOnTop(_ sender: Any?) {
         alwaysOnTopState.isEnabled.toggle()
-        [window, preferencesWindow, equalizerWindow, infoWindow, visualizationWindow]
+        [window, preferencesWindow, equalizerWindow, infoWindow, tagEditorWindow, visualizationWindow]
             .compactMap { $0 }
             .forEach(applyAlwaysOnTopLevel(to:))
         playlistWindows.values.forEach(applyAlwaysOnTopLevel(to:))
@@ -2917,6 +3019,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.schedulePersistentStateSave()
         }
         infoWindow = panel
+        return panel
+    }
+
+    private func makeTagEditorWindowIfNeeded() -> NSWindow {
+        if let tagEditorWindow { return tagEditorWindow }
+        let panel = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 640),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Metadata Editor"
+        panel.isReleasedWhenClosed = false
+        panel.minSize = NSSize(width: 730, height: 620)
+        applyAlwaysOnTopLevel(to: panel)
+        let content = TagEditorPanelView(
+            model: tagEditorModel,
+            onSave: { [weak self] fields in self?.saveTagEditor(fields) },
+            onCancel: { [weak self] in self?.closeTagEditor() }
+        )
+        panel.contentView = content
+        panel.initialFirstResponder = content.initialFirstResponder
+        panel.center()
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            self?.tagEditorContext = nil
+        }
+        tagEditorWindow = panel
         return panel
     }
 
@@ -4486,12 +4619,13 @@ private struct PlaylistView: View {
                 x: 112,
                 index: 3,
                 titles: [
-                    "File Info", "Reveal in Finder",
+                    "File Info", "Edit metadata", "Reveal in Finder",
                     "Sort by title", "Sort by artist/album/track number",
                     "Sort by file name", "Sort by path + file name", "Reverse",
                     "Rebuild titles on selection"
                 ],
                 shortcuts: [
+                    "Edit metadata": .shiftE,
                     "Rebuild titles on selection": .commandOptionE
                 ],
                 separatorsBefore: ["Sort by title", "Rebuild titles on selection"]
@@ -4965,7 +5099,9 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
         menu.addItem(contextItem("Crop files", action: #selector(PlaylistContextMenuTarget.cropFiles(_:)), target: target))
         menu.addItem(.separator())
         let edit = contextItem("Edit metadata", action: #selector(PlaylistContextMenuTarget.editMetadata(_:)), target: target)
-        edit.isEnabled = false
+        edit.keyEquivalent = "e"
+        edit.keyEquivalentModifierMask = [.shift]
+        edit.isEnabled = playlist.selectedIDs.count == 1 && playlist.selectedIDs.contains(entry.id)
         menu.addItem(edit)
         let viewInfo = contextItem("View file info", action: #selector(PlaylistContextMenuTarget.viewInfo(_:)), target: target)
         viewInfo.isEnabled = playlist.selectedIDs.count <= 1
@@ -5104,7 +5240,9 @@ private final class PlaylistContextMenuTarget: NSObject {
 
     @objc func removeItems(_ sender: NSMenuItem) { manager.removeSelected(from: playlist) }
     @objc func cropFiles(_ sender: NSMenuItem) { manager.cropToSelection(playlist) }
-    @objc func editMetadata(_ sender: NSMenuItem) {}
+    @objc func editMetadata(_ sender: NSMenuItem) {
+        AppDelegate.shared?.showTagEditor(for: playlist, entry: entry)
+    }
     @objc func viewInfo(_ sender: NSMenuItem) { AppDelegate.shared?.showFileInfo(for: playlist) }
     @objc func rateItems(_ sender: NSMenuItem) {}
     @objc func revealInFinder(_ sender: NSMenuItem) { AppDelegate.shared?.revealInFinder(url: entry.url) }
@@ -5148,6 +5286,7 @@ private struct PlaylistMenuShortcut {
     static let commandN = Self(keyEquivalent: "n", modifierFlags: [.command])
     static let commandO = Self(keyEquivalent: "o", modifierFlags: [.command])
     static let commandShiftS = Self(keyEquivalent: "s", modifierFlags: [.command, .shift])
+    static let shiftE = Self(keyEquivalent: "e", modifierFlags: [.shift])
     static let commandOptionE = Self(keyEquivalent: "e", modifierFlags: [.command, .option])
 }
 
@@ -5186,6 +5325,9 @@ private final class PlaylistMenuHotspotNSView: NSView {
                     item.isEnabled = false
                 } else if title == "File Info" {
                     item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
+                } else if title == "Edit metadata" {
+                    item.isEnabled = playlist.selectedIDs.count == 1
+                        && playlist.entries.contains { playlist.selectedIDs.contains($0.id) }
                 } else if title == "Reveal in Finder" {
                     item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
                 } else if title == "Rebuild titles on selection" {
@@ -5213,6 +5355,11 @@ private final class PlaylistMenuHotspotNSView: NSView {
         case "Invert Selection": AppDelegate.shared?.invertSelectionInActivePlaylist()
         case "File Info":
             if let playlist { AppDelegate.shared?.showFileInfo(for: playlist) }
+        case "Edit metadata":
+            if let playlist,
+               let entry = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) }) {
+                AppDelegate.shared?.showTagEditor(for: playlist, entry: entry)
+            }
         case "Reveal in Finder":
             if let playlist { AppDelegate.shared?.revealInFinder(for: playlist) }
         case "Rebuild titles on selection":

@@ -639,6 +639,40 @@ final class PlaylistManager: ObservableObject {
         save()
     }
 
+    /// Applies the values just written by the File Info editor to the live
+    /// playlist row. The file remains the source of truth; this in-memory
+    /// update only prevents the row and the player display from waiting for a
+    /// later metadata scan.
+    func applyEditedMetadata(_ fields: TagEditorFields, to entry: PlaylistEntry, in playlist: PlaylistModel) {
+        guard playlists.contains(where: { $0.id == playlist.id }),
+              let liveEntry = playlist.entries.first(where: { $0.id == entry.id }) else { return }
+        let artist = fields.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = fields.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch (artist.isEmpty ? nil : artist, title.isEmpty ? nil : title) {
+        case let (.some(artist), .some(title)):
+            liveEntry.artist = artist
+            liveEntry.trackTitle = title
+            liveEntry.title = "\(artist) - \(title)"
+        case let (.some(artist), nil):
+            liveEntry.artist = artist
+            liveEntry.trackTitle = nil
+            liveEntry.title = artist
+        case let (nil, .some(title)):
+            liveEntry.artist = nil
+            liveEntry.trackTitle = title
+            liveEntry.title = title
+        case (nil, nil):
+            liveEntry.artist = nil
+            liveEntry.trackTitle = nil
+            liveEntry.title = liveEntry.url.deletingPathExtension().lastPathComponent
+        }
+        liveEntry.metadataIsAvailable = true
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist)
+        save()
+    }
+
     private func startSort(
         _ records: [SortRecord],
         option: SortOption,

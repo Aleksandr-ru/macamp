@@ -18,6 +18,7 @@
 		E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000C26A0000100000001 /* EqualizerController.swift */; };
 		E1A0000D26A0000100000001 /* PlaylistManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0000E26A0000100000001 /* PlaylistManager.swift */; };
 		E1A0000F26A0000100000001 /* InfoWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001026A0000100000001 /* InfoWindow.swift */; };
+		E1A0002126A0000100000001 /* TagEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0002226A0000100000001 /* TagEditor.swift */; };
 		E1A0001726A0000100000001 /* MilkDropRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001826A0000100000001 /* MilkDropRenderer.swift */; };
 		E1A0001926A0000100000001 /* MilkDropShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001A26A0000100000001 /* MilkDropShaders.metal */; };
 		E1A0001B26A0000100000001 /* VisualizationWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001C26A0000100000001 /* VisualizationWindow.swift */; };
@@ -39,6 +40,7 @@
 		E1A0000C26A0000100000001 /* EqualizerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EqualizerController.swift; sourceTree = "<group>"; };
 		E1A0000E26A0000100000001 /* PlaylistManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistManager.swift; sourceTree = "<group>"; };
 		E1A0001026A0000100000001 /* InfoWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InfoWindow.swift; sourceTree = "<group>"; };
+		E1A0002226A0000100000001 /* TagEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TagEditor.swift; sourceTree = "<group>"; };
 		E1A0001826A0000100000001 /* MilkDropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MilkDropRenderer.swift; sourceTree = "<group>"; };
 		E1A0001A26A0000100000001 /* MilkDropShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = MilkDropShaders.metal; sourceTree = "<group>"; };
 		E1A0001C26A0000100000001 /* VisualizationWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualizationWindow.swift; sourceTree = "<group>"; };
@@ -90,6 +92,7 @@
 				E1A0000C26A0000100000001 /* EqualizerController.swift */,
 				E1A0000E26A0000100000001 /* PlaylistManager.swift */,
 				E1A0001026A0000100000001 /* InfoWindow.swift */,
+				E1A0002226A0000100000001 /* TagEditor.swift */,
 				E1A0001826A0000100000001 /* MilkDropRenderer.swift */,
 				E1A0001A26A0000100000001 /* MilkDropShaders.metal */,
 				E1A0001C26A0000100000001 /* VisualizationWindow.swift */,
@@ -203,6 +206,7 @@
 				E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */,
 				E1A0000D26A0000100000001 /* PlaylistManager.swift in Sources */,
 				E1A0000F26A0000100000001 /* InfoWindow.swift in Sources */,
+				E1A0002126A0000100000001 /* TagEditor.swift in Sources */,
 				E1A0001726A0000100000001 /* MilkDropRenderer.swift in Sources */,
 				E1A0001926A0000100000001 /* MilkDropShaders.metal in Sources */,
 				E1A0001B26A0000100000001 /* VisualizationWindow.swift in Sources */,
