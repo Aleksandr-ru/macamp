@@ -4925,7 +4925,7 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
 
         let rate = NSMenuItem(title: "Rate items", action: nil, keyEquivalent: "")
         let rateMenu = NSMenu(title: "Rate items")
-        ["None", "★", "★★", "★★★", "★★★★", "★★★★★"].forEach {
+        PlaylistRatingMenu.titles.forEach {
             rateMenu.addItem(contextItem($0, action: #selector(PlaylistContextMenuTarget.rateItems(_:)), target: target))
         }
         rate.submenu = rateMenu

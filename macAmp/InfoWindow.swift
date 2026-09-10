@@ -2,6 +2,10 @@ import AppKit
 import AVFoundation
 import Combine
 
+enum PlaylistRatingMenu {
+    static let titles = Array(["None", "★", "★★", "★★★", "★★★★", "★★★★★"].reversed())
+}
+
 /// Info metadata is loaded lazily and off the main thread.  Playlist scans do
 /// not decode artwork or long text frames merely because a row is visible.
 final class InfoWindowModel: ObservableObject {
@@ -490,6 +494,17 @@ final class InfoPanelView: NSView {
 
     private func makeCopyMenu() -> NSMenu {
         let menu = NSMenu()
+        let rate = NSMenuItem(title: "Set Rating", action: nil, keyEquivalent: "")
+        let rateMenu = NSMenu(title: "Set Rating")
+        for title in PlaylistRatingMenu.titles {
+            let item = NSMenuItem(title: title, action: #selector(rateItems(_:)), keyEquivalent: "")
+            item.target = self
+            rateMenu.addItem(item)
+        }
+        rate.submenu = rateMenu
+        menu.addItem(rate)
+        menu.addItem(.separator())
+
         for tag in InfoWindowModel.Content.CopyableTag.allCases {
             guard tag.isAvailable(in: model.content) else { continue }
             let item = NSMenuItem(title: tag.menuTitle, action: #selector(copyTag(_:)), keyEquivalent: "")
@@ -530,6 +545,8 @@ final class InfoPanelView: NSView {
     @objc private func copySummaryMenuItem(_ sender: NSMenuItem) {
         copySummary()
     }
+
+    @objc private func rateItems(_ sender: NSMenuItem) {}
 
     private var summaryText: String {
         let content = model.content
