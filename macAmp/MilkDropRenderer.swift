@@ -177,6 +177,13 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
     private var presetTo = MilkDropPresetLibrary.all[0]
     private var presetTransitionStart: Float?
     private var nextPresetTime: Float = 15
+    private var smoothedBass: Float = 0
+    private var smoothedMid: Float = 0
+    private var smoothedTreble: Float = 0
+    private var smoothedVolume: Float = 0
+    private var bassBaseline: Float = 0
+    private var beatPulse: Float = 0
+    private var hasAudioBaseline = false
 
     private let presetTransitionDuration: Float = 2.7
     private let presetCycleInterval: Float = 15
@@ -232,6 +239,7 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
         elapsedTime = 0
         if shouldRender {
             nextPresetTime = presetCycleInterval
+            hasAudioBaseline = false
             updateDrawableSize()
             needsDisplay = true
         } else {
@@ -260,6 +268,8 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
             presetTransitionStart = nil
             presetFrom = presetTo
         }
+        hasAudioBaseline = false
+        beatPulse = 0
         selectNextPreset()
     }
 
@@ -298,16 +308,20 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
         for index in frameWaveform.indices { frameWaveform[index] = latestWaveform[index] }
         sampleLock.unlock()
 
-        let bass = average(frameSpectrum, from: 0, to: 3)
-        let mid = average(frameSpectrum, from: 3, to: 8)
-        let treble = average(frameSpectrum, from: 8, to: 16)
-        let volume = max(0.03, min(1, bass * 0.55 + mid * 0.3 + treble * 0.15))
+        let rawBass = average(frameSpectrum, from: 0, to: 3)
+        let rawMid = average(frameSpectrum, from: 3, to: 8)
+        let rawTreble = average(frameSpectrum, from: 8, to: 16)
+        let waveformRMS = rootMeanSquare(frameWaveform)
+        updateAudioResponse(bass: rawBass, mid: rawMid, treble: rawTreble,
+                            waveformRMS: waveformRMS, delta: delta)
+        let bass = smoothedBass
+        let mid = smoothedMid
+        let treble = smoothedTreble
+        let volume = smoothedVolume
 
         var uniforms = MilkDropUniforms()
         uniforms.timeDelta = SIMD4(elapsedTime, delta, bass, mid)
-        uniforms.audio = SIMD4(treble, volume,
-                               fmod(elapsedTime * 0.035 + bass * 0.08, 1),
-                               1 + bass * 0.035)
+        uniforms.audio = SIMD4(treble, volume, beatPulse, waveformRMS)
         uniforms.visual = SIMD4(sin(elapsedTime * 0.16) * 0.035 + (mid - bass) * 0.02,
                                 0.963 + volume * 0.018,
                                 fmod(elapsedTime * 0.012 + treble * 0.12, 1),
@@ -400,7 +414,7 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
     }
 
     private func observeAudioState(_ visualization: PlaybackVisualizationState) {
-        visualization.$spectrumLevels.sink { [weak self] values in
+        visualization.$milkDropSpectrumLevels.sink { [weak self] values in
             self?.copySpectrum(values)
         }.store(in: &observation)
         visualization.$waveformSamples.sink { [weak self] values in
@@ -429,6 +443,48 @@ final class MilkDropMetalView: MTKView, MTKViewDelegate {
         var total: Float = 0
         for index in start..<min(end, values.count) { total += values[index] }
         return total / Float(max(1, min(end, values.count) - start))
+    }
+
+    private func rootMeanSquare(_ values: [Float]) -> Float {
+        guard !values.isEmpty else { return 0 }
+        var sum: Float = 0
+        for value in values { sum += value * value }
+        return min(1, sqrt(sum / Float(values.count)))
+    }
+
+    private func updateAudioResponse(bass: Float, mid: Float, treble: Float,
+                                     waveformRMS: Float, delta: Float) {
+        let volumeTarget = min(1, max(waveformRMS * 3.4,
+                                      bass * 0.42 + mid * 0.34 + treble * 0.24))
+        if !hasAudioBaseline {
+            smoothedBass = bass
+            smoothedMid = mid
+            smoothedTreble = treble
+            smoothedVolume = volumeTarget
+            bassBaseline = bass
+            hasAudioBaseline = true
+        }
+
+        smoothedBass = envelope(smoothedBass, target: bass,
+                                attack: 0.025, release: 0.16, delta: delta)
+        smoothedMid = envelope(smoothedMid, target: mid,
+                               attack: 0.035, release: 0.19, delta: delta)
+        smoothedTreble = envelope(smoothedTreble, target: treble,
+                                  attack: 0.02, release: 0.12, delta: delta)
+        smoothedVolume = envelope(smoothedVolume, target: volumeTarget,
+                                  attack: 0.025, release: 0.2, delta: delta)
+
+        let baselineAlpha = 1 - exp(-delta / 1.35)
+        bassBaseline += (bass - bassBaseline) * baselineAlpha
+        let transient = min(1, max(0, bass - bassBaseline) * 5.5)
+        beatPulse = max(transient, beatPulse * exp(-delta / 0.16))
+    }
+
+    private func envelope(_ current: Float, target: Float,
+                          attack: Float, release: Float, delta: Float) -> Float {
+        let duration = target > current ? attack : release
+        let alpha = 1 - exp(-delta / duration)
+        return current + (target - current) * alpha
     }
 
     private func beginPresetTransition() {

@@ -86,6 +86,10 @@ enum VisualizationAnalyzer: String, CaseIterable, Identifiable {
 /// frames do not invalidate the whole player interface.
 final class PlaybackVisualizationState: ObservableObject {
     @Published var spectrumLevels = Array(repeating: CGFloat(0), count: 16)
+    /// Unquantized FFT levels for the MilkDrop renderer. The classic analyzer
+    /// intentionally keeps its 15-row falloff, which is too coarse and slow
+    /// for beat-reactive preset equations.
+    @Published var milkDropSpectrumLevels = Array(repeating: CGFloat(0), count: 16)
     /// The peak marker is kept separately from the bar levels.  Winamp's
     /// classic renderer lets each marker fall independently of its column.
     @Published var spectrumPeaks = Array(repeating: CGFloat(0), count: 16)
@@ -620,6 +624,9 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     var currentURL: URL? { scopedURL }
+    /// Changes only when `open` starts a new source attempt. Seeking and
+    /// resuming may invoke onPlaybackReady again, but remain in this generation.
+    var currentTrackGeneration: Int { fileOpenGeneration }
 
     let equalizer = EqualizerController()
     let outputDeviceManager = AudioOutputDeviceManager()
@@ -799,6 +806,7 @@ final class PlaybackController: NSObject, ObservableObject {
             isPlaying = false
             isPaused = false
             visualization.spectrumLevels = Array(repeating: 0, count: 16)
+            visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
             visualization.spectrumPeaks = Array(repeating: 0, count: 16)
             visualization.waveformSamples = Array(repeating: 0, count: 76)
             resetSpectrumAnimation()
@@ -821,6 +829,7 @@ final class PlaybackController: NSObject, ObservableObject {
         isPlaying = false
         isPaused = false
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
         visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
         resetSpectrumAnimation()
@@ -842,6 +851,11 @@ final class PlaybackController: NSObject, ObservableObject {
         guard milkDropVisualizationEnabled != enabled else { return }
         milkDropVisualizationEnabled = enabled
         updateVisualizationDemand()
+        if let streamingPlayer {
+            installStreamingTimeObserver(on: streamingPlayer)
+        } else if isPlaying, sourceFile != nil {
+            startTimer()
+        }
     }
 
     private func updateVisualizationDemand() {
@@ -850,6 +864,7 @@ final class PlaybackController: NSObject, ObservableObject {
         updateLiveAnalysisTap()
         guard !isVisualizationEnabled else { return }
         visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
         visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
         resetSpectrumAnimation()
@@ -1060,7 +1075,14 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private var needsLiveAnalysis: Bool {
-        isInterfaceVisible && (isVisualizationEnabled || (equalizer.isEnabled && equalizer.isAdaptiveEnabled))
+        milkDropVisualizationEnabled
+            || (isInterfaceVisible
+                && (mainVisualizationEnabled || (equalizer.isEnabled && equalizer.isAdaptiveEnabled)))
+    }
+
+    private var liveAnalysisInterval: TimeInterval {
+        if milkDropVisualizationEnabled { return 1.0 / 30.0 }
+        return isInterfaceVisible ? equalizer.adaptiveConfiguration.analysisInterval : 1.0
     }
 
     /// Tapping a node invokes code on the real-time audio render thread. Do not
@@ -1342,14 +1364,19 @@ final class PlaybackController: NSObject, ObservableObject {
     private func installStreamingTimeObserver(on player: AVPlayer) {
         if let streamingTimeObserver { player.removeTimeObserver(streamingTimeObserver) }
         streamingTimeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: isInterfaceVisible ? 0.25 : 1.0, preferredTimescale: 600), queue: .main
+            forInterval: CMTime(seconds: liveAnalysisInterval, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             guard let self, self.streamingPlayer === player else { return }
             guard !self.isVisualUpdatesSuspended else { return }
-            self.position = max(0, time.seconds)
-            self.isPlaying = player.rate > 0
-            self.isPaused = !self.isPlaying
-            if self.isPlaying, self.isInterfaceVisible, self.isVisualizationEnabled {
+            let now = Date()
+            if now.timeIntervalSince(self.lastPublishedPosition) >= self.positionPublishInterval {
+                self.position = max(0, time.seconds)
+                self.lastPublishedPosition = now
+            }
+            let playerIsPlaying = player.rate > 0
+            if self.isPlaying != playerIsPlaying { self.isPlaying = playerIsPlaying }
+            if self.isPaused == playerIsPlaying { self.isPaused = !playerIsPlaying }
+            if playerIsPlaying, self.needsLiveAnalysis {
                 self.updateSpectrum(at: time.seconds, includesWaveform: self.needsWaveformSamples)
             }
         }
@@ -1478,7 +1505,7 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func startTimer() {
         timer?.invalidate()
-        let interval = isInterfaceVisible ? equalizer.adaptiveConfiguration.analysisInterval : 1.0
+        let interval = liveAnalysisInterval
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self, let file = self.sourceFile else { return }
             guard !self.isVisualUpdatesSuspended else { return }
@@ -1494,7 +1521,7 @@ final class PlaybackController: NSObject, ObservableObject {
             }
             let nodeIsPlaying = self.playerNode.isPlaying
             if self.isPlaying != nodeIsPlaying { self.isPlaying = nodeIsPlaying }
-            if nodeIsPlaying, self.isInterfaceVisible, self.isVisualizationEnabled {
+            if nodeIsPlaying, self.needsLiveAnalysis {
                 self.updateSpectrum(at: currentPosition, includesWaveform: self.needsWaveformSamples)
             }
         }
@@ -1619,9 +1646,15 @@ final class PlaybackController: NSObject, ObservableObject {
                 // the cleared analyzer state.
                 guard !self.isVisualUpdatesSuspended,
                       self.isPlaying,
-                      self.isVisualizationEnabled else { return }
-                if self.visualization.spectrumLevels != levels { self.visualization.spectrumLevels = levels }
-                if self.visualization.spectrumPeaks != peaks { self.visualization.spectrumPeaks = peaks }
+                      self.needsLiveAnalysis else { return }
+                if self.isInterfaceVisible, self.mainVisualizationEnabled {
+                    if self.visualization.spectrumLevels != levels { self.visualization.spectrumLevels = levels }
+                    if self.visualization.spectrumPeaks != peaks { self.visualization.spectrumPeaks = peaks }
+                }
+                if self.milkDropVisualizationEnabled,
+                   self.visualization.milkDropSpectrumLevels != rawLevels {
+                    self.visualization.milkDropSpectrumLevels = rawLevels
+                }
                 if includesWaveform { self.visualization.waveformSamples = waveform }
                 if needsAdaptiveAnalysis { self.updateAdaptiveEqualizer(with: decibels) }
             }

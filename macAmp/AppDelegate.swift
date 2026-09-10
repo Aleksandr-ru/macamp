@@ -659,8 +659,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // state change is inexpensive while hidden; rendering remains
             // paused until VisualizationPanelView considers the window visible.
             DispatchQueue.main.async { [weak self] in
-                (self?.visualizationWindow?.contentView as? VisualizationPanelView)?
-                    .playbackDidStartNewTrack()
+                guard let self else { return }
+                (self.visualizationWindow?.contentView as? VisualizationPanelView)?
+                    .playbackDidStartNewTrack(title: self.playback.title,
+                                              generation: self.playback.currentTrackGeneration)
             }
         }
         // Create the SwiftUI view that provides the window contents.

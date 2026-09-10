@@ -74,6 +74,8 @@ fragment half4 milkDropFeedback(
     float mid = uniforms.timeDelta.w;
     float treble = uniforms.audio.x;
     float volume = uniforms.audio.y;
+    float beat = uniforms.audio.z;
+    float waveformEnergy = uniforms.audio.w;
     float warpStrength = uniforms.preset0.x;
     float rotationSpeed = uniforms.preset0.y;
     float zoom = uniforms.preset0.z;
@@ -93,7 +95,8 @@ fragment half4 milkDropFeedback(
 
     float2 centered = input.uv - 0.5;
     float radius = length(centered);
-    float audioPulse = bass * 0.65 + mid * 0.25 + treble * 0.1;
+    float audioPulse = min(1.5, bass * 0.42 + mid * 0.2 + treble * 0.08
+                                + waveformEnergy * 0.25 + beat * 0.9);
     float angle = rotationSpeed * time + uniforms.visual.x
         + sin(time * (0.42 + pulseAmount * 0.14) + radius * (7.0 + radialAmount * 15.0))
             * (warpStrength * (0.35 + mid));
@@ -101,7 +104,8 @@ fragment half4 milkDropFeedback(
     float s = sin(angle);
     float2 warped = float2(centered.x * c - centered.y * s,
                            centered.x * s + centered.y * c);
-    warped *= zoom + sin(time * (0.31 + pulseAmount * 0.1)) * warpStrength * 0.08;
+    warped *= zoom + sin(time * (0.31 + pulseAmount * 0.1)) * warpStrength * 0.08
+        - beat * warpStrength * 0.42;
     warped += drift * time + float2(sin(time * 0.17), cos(time * 0.13))
         * (warpStrength * (0.12 + bass * 0.18));
 
@@ -118,13 +122,14 @@ fragment half4 milkDropFeedback(
     float3 secondary = hsvToRGB(float3(fract(hue + 0.22), saturation * 0.82, 1.0));
     // Keep the backdrop black, but make the narrow generated forms visible
     // even when the analyser reports a quiet passage.
-    float emission = (0.08 + volume * 0.34) * brightness;
+    float emission = (0.08 + volume * 0.34) * brightness * (1.0 + beat * 0.7);
     float3 source = float3(0.0);
 
     if (style == 0) {
         // Orbit: narrow concentric rings, driven mostly by the low end.
         float ringPhase = fract(radius * (5.5 + radialAmount * 9.0)
-                                - time * (0.16 + pulseAmount * 0.36) - bass * 0.2);
+                                - time * (0.16 + pulseAmount * 0.36)
+                                - bass * 0.2 - beat * 0.22);
         float ring = 1.0 - smoothstep(0.035, 0.09, abs(ringPhase - 0.5));
         source += primary * ring * (0.32 + audioPulse * glowAmount);
     } else if (style == 1) {
@@ -132,13 +137,13 @@ fragment half4 milkDropFeedback(
         float cloud = sin(centered.x * 18.0 + time * 0.31)
                     * sin(centered.y * 13.0 - time * 0.23)
                     + sin((centered.x + centered.y) * 10.0 + time * 0.17);
-        float nebula = smoothstep(1.15, 1.75, cloud);
+        float nebula = smoothstep(1.15 - beat * 0.18, 1.75, cloud);
         source += mix(primary, secondary, 0.55) * nebula * (0.22 + audioPulse * glowAmount);
     } else if (style == 2) {
         // Kaleidoscope: sharp mirrored diagonal shards.
         float2 mirror = abs(centered);
         float diagonal = abs(fract((mirror.x + mirror.y * 1.7) * symmetry * 4.0
-                                   - time * 0.17) - 0.5);
+                                   - time * 0.17 - beat * 0.16) - 0.5);
         float shards = 1.0 - smoothstep(0.025, 0.085, diagonal);
         source += primary * shards * (0.26 + audioPulse * glowAmount);
     } else if (style == 3) {
@@ -147,22 +152,22 @@ fragment half4 milkDropFeedback(
         float level = spectrumAt(uniforms, band);
         float centerX = (float(band) + 0.5) / 16.0;
         float column = 1.0 - smoothstep(0.015, 0.035, abs(input.uv.x - centerX));
-        float height = 0.08 + level * 0.72 * spectrumGain;
+        float height = 0.08 + level * 0.66 * spectrumGain + beat * 0.08;
         float body = column * step(input.uv.y, height);
         float cap = column * (1.0 - smoothstep(0.004, 0.018, abs(input.uv.y - height)));
         source += primary * (body * 0.28 + cap * (0.55 + treble * glowAmount));
     } else if (style == 4) {
         // Ribbons: a few wide bands whose displacement reacts to the midrange.
         float ribbonY = 0.5 + sin(input.uv.x * (7.0 + radialAmount * 12.0)
-                                   + time * (0.5 + pulseAmount * 0.4))
-            * (0.05 + mid * 0.16);
+                                   + time * (0.5 + pulseAmount * 0.4) + beat * 1.4)
+            * (0.045 + mid * 0.13 + waveformEnergy * 0.22 + beat * 0.06);
         float ribbon = 1.0 - smoothstep(0.009, 0.04 + waveformGain * 0.012,
                                          abs(input.uv.y - ribbonY));
         source += mix(primary, secondary, input.uv.x) * ribbon * (0.25 + audioPulse * glowAmount);
     } else {
         // Tunnel: a moving perspective grid of shrinking rings.
         float tunnel = fract(radius * (5.0 + radialAmount * 14.0)
-                             - time * (0.28 + pulseAmount * 0.52));
+                             - time * (0.28 + pulseAmount * 0.52) - beat * 0.28);
         float ring = 1.0 - smoothstep(0.025, 0.075, abs(tunnel - 0.5));
         float ray = 1.0 - smoothstep(0.02, 0.075,
                                      abs(abs(centered.x) - abs(centered.y) * 0.65));
@@ -178,10 +183,11 @@ fragment half4 milkDropFeedback(
         * (1.0 - smoothstep(0.005, 0.02, abs(input.uv.y - 0.92)));
     source += secondary * accent * accentLevel * spectrumGain * 0.22;
 
-    float centre = exp(-radius * 18.0) * (0.025 + bass * (0.12 + glowAmount * 0.22));
+    float centre = exp(-radius * 18.0)
+        * (0.025 + bass * (0.12 + glowAmount * 0.22) + beat * 0.32);
     source += primary * centre;
 
-    float3 color = previous * decay + source * emission;
+    float3 color = previous * max(0.86, decay - beat * 0.025) + source * emission;
     // Compress only the top end. This preserves dark space around the effect
     // while preventing long feedback trails from becoming a white rectangle.
     color = color / (1.0 + max(color - 0.72, float3(0.0)) * 1.8);

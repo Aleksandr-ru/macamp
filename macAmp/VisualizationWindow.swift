@@ -1,5 +1,79 @@
 import AppKit
 import Combine
+import QuartzCore
+
+/// Webamp asks Butterchurn to launch a short "song title" animation whenever
+/// the current track changes. A lightweight AppKit overlay provides the same
+/// behavior without adding text work to every Metal frame.
+private final class VisualizationTrackTitleView: NSView {
+    private var title = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.opacity = 0
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard !title.isEmpty else { return }
+        let fontSize = max(11, min(26, bounds.height * 0.26))
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
+        shadow.shadowBlurRadius = 4
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        let text = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.boldSystemFont(ofSize: fontSize),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.94),
+                .paragraphStyle: paragraph,
+                .shadow: shadow
+            ]
+        )
+        let textHeight = text.boundingRect(
+            with: NSSize(width: bounds.width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height
+        text.draw(in: NSRect(x: 0, y: (bounds.height - textHeight) * 0.5,
+                             width: bounds.width, height: textHeight))
+    }
+
+    func show(_ value: String) {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        title = normalized
+        needsDisplay = true
+        displayIfNeeded()
+        guard let layer else { return }
+        layer.removeAllAnimations()
+        layer.opacity = 0
+
+        let opacity = CAKeyframeAnimation(keyPath: "opacity")
+        opacity.values = [0, 1, 1, 0]
+        opacity.keyTimes = [0, 0.12, 0.62, 1]
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.82
+        scale.toValue = 1.05
+        let group = CAAnimationGroup()
+        group.animations = [opacity, scale]
+        group.duration = 3.2
+        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(group, forKey: "track-title")
+    }
+
+    func hide() {
+        layer?.removeAllAnimations()
+        layer?.opacity = 0
+    }
+}
 
 /// The visualization window has its own panel type. It follows Info's generic
 /// window geometry and skin chrome, but is deliberately independent from the
@@ -14,8 +88,11 @@ final class VisualizationPanelView: NSView {
     private let onDragChanged: () -> Void
     private let onDragEnded: () -> Void
     private let visualizationView: MilkDropMetalView
+    private let trackTitleView = VisualizationTrackTitleView(frame: .zero)
     private var observation = Set<AnyCancellable>()
     private var closePressed = false
+    private var pendingTrackTitle: String?
+    private var lastTrackGeneration: Int
 
     init(scale: InterfaceScale, focus: WindowFocusState,
          playback: PlaybackController,
@@ -29,9 +106,12 @@ final class VisualizationPanelView: NSView {
         self.onDragChanged = onDragChanged
         self.onDragEnded = onDragEnded
         self.visualizationView = MilkDropMetalView(frame: .zero, visualization: playback.visualization)
+        self.lastTrackGeneration = playback.currentTrackGeneration
         super.init(frame: .zero)
         wantsLayer = true
         addSubview(visualizationView)
+        addSubview(trackTitleView)
+        pendingTrackTitle = playback.title
         skin.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -125,6 +205,11 @@ final class VisualizationPanelView: NSView {
     override func layout() {
         super.layout()
         visualizationView.frame = contentRect
+        let titleHeight = max(40, contentRect.height * 0.58)
+        trackTitleView.frame = NSRect(x: contentRect.minX + 10 * pixelScale,
+                                      y: contentRect.midY - titleHeight * 0.5,
+                                      width: max(1, contentRect.width - 20 * pixelScale),
+                                      height: titleHeight)
     }
 
     /// Visibility is checked at the panel boundary as well as in the window
@@ -138,10 +223,20 @@ final class VisualizationPanelView: NSView {
             && playback.isPlaying
         visualizationView.setRenderingEnabled(isVisible)
         playback.setMilkDropVisualization(enabled: isVisible)
+        if isVisible, let pendingTrackTitle {
+            trackTitleView.show(pendingTrackTitle)
+            self.pendingTrackTitle = nil
+        } else if !isVisible {
+            trackTitleView.hide()
+        }
     }
 
-    func playbackDidStartNewTrack() {
+    func playbackDidStartNewTrack(title: String, generation: Int) {
+        guard generation != lastTrackGeneration else { return }
+        lastTrackGeneration = generation
         visualizationView.selectPresetForNewTrack()
+        pendingTrackTitle = title
+        updateRenderingState()
     }
 
     override func resetCursorRects() {
