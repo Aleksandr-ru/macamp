@@ -448,7 +448,7 @@ final class TagEditorModel: ObservableObject {
             result.canCopyID3v1 = result.id3v1Fields.hasID3v1CopyableValue
         }
         result.tagEnabled = hasMetadataTag(for: url, metadata: metadata)
-        result.formatInfo = formatInfoLines(for: url, asset: asset).joined(separator: "\n")
+        result.formatInfo = formatInfoLines(for: url, asset: asset, metadata: metadata).joined(separator: "\n")
         return result
     }
 
@@ -588,7 +588,23 @@ final class TagEditorModel: ObservableObject {
         let isVariableBitrate: Bool
     }
 
-    private static func formatInfoLines(for url: URL, asset: AVAsset) -> [String] {
+    private struct PopularimeterInfo {
+        let name: String
+        let value: Int
+        let counter: UInt64
+
+        var starCount: Int {
+            guard value > 0 else { return 0 }
+            return min(5, (value - 1) / 51 + 1)
+        }
+
+        var starDisplay: String {
+            String(repeating: "★", count: starCount)
+                + String(repeating: "☆", count: 5 - starCount)
+        }
+    }
+
+    private static func formatInfoLines(for url: URL, asset: AVAsset, metadata: [AVMetadataItem]) -> [String] {
         var lines: [String] = []
 
         let mpegInfo: MPEGInfo?
@@ -622,7 +638,131 @@ final class TagEditorModel: ObservableObject {
             lines.append("\(Int((bitrate / 1_000).rounded()))kbit")
         }
 
+        let ratings = popularimeterRecords(from: url, metadata: metadata)
+        if !ratings.isEmpty {
+            if !lines.isEmpty { lines.append("") }
+            for rating in ratings {
+                let name = rating.name.isEmpty ? "(unnamed)" : rating.name
+                lines.append("Rating: \(name)")
+                lines.append("- Value: \(rating.value)/255")
+                lines.append("- Stars: \(rating.starCount)/5 \(rating.starDisplay)")
+                lines.append("- Play count: \(rating.counter)")
+            }
+        }
+
         return lines
+    }
+
+    private static func popularimeterRecords(from url: URL, metadata: [AVMetadataItem]) -> [PopularimeterInfo] {
+        let records = readPopularimeterRecords(from: url)
+        if !records.isEmpty { return records }
+
+        return metadata.compactMap { item in
+            guard isPopularimeterItem(item), let data = item.dataValue else { return nil }
+            return parsePopularimeterRecord(data)
+        }
+    }
+
+    private static func readPopularimeterRecords(from url: URL) -> [PopularimeterInfo] {
+        guard url.isFileURL, let input = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? input.close() }
+
+        guard let header = try? input.read(upToCount: 10), header.count == 10,
+              header[0] == 0x49, header[1] == 0x44, header[2] == 0x33 else {
+            return []
+        }
+        let version = Int(header[3])
+        guard version == 3 || version == 4 else { return [] }
+
+        let tagSize = synchsafeValue(header[6], header[7], header[8], header[9])
+        guard tagSize <= 64 * 1024 * 1024,
+              let tagData = try? input.read(upToCount: tagSize), tagData.count == tagSize else {
+            return []
+        }
+
+        var offset = 0
+        if header[5] & 0x40 != 0 {
+            let extendedSize: Int
+            if version == 4 {
+                guard tagData.count >= 4 else { return [] }
+                extendedSize = synchsafeValue(tagData[0], tagData[1], tagData[2], tagData[3])
+            } else {
+                guard tagData.count >= 4 else { return [] }
+                extendedSize = Int(tagData[0]) << 24
+                    | Int(tagData[1]) << 16
+                    | Int(tagData[2]) << 8
+                    | Int(tagData[3])
+            }
+            offset = min(tagData.count, 4 + extendedSize)
+        }
+
+        var records: [PopularimeterInfo] = []
+        while offset + 10 <= tagData.count {
+            let idBytes = tagData.subdata(in: offset..<(offset + 4))
+            if idBytes.allSatisfy({ $0 == 0 }) { break }
+            guard idBytes.allSatisfy({
+                ($0 >= 0x41 && $0 <= 0x5A) || ($0 >= 0x30 && $0 <= 0x39)
+            }), let id = String(data: idBytes, encoding: .ascii) else {
+                break
+            }
+
+            let frameSize: Int
+            if version == 4 {
+                frameSize = synchsafeValue(
+                    tagData[offset + 4], tagData[offset + 5],
+                    tagData[offset + 6], tagData[offset + 7]
+                )
+            } else {
+                frameSize = Int(tagData[offset + 4]) << 24
+                    | Int(tagData[offset + 5]) << 16
+                    | Int(tagData[offset + 6]) << 8
+                    | Int(tagData[offset + 7])
+            }
+            guard frameSize >= 0, frameSize <= tagData.count - offset - 10 else { break }
+
+            let bodyStart = offset + 10
+            let bodyEnd = bodyStart + frameSize
+            if id == "POPM",
+               let record = parsePopularimeterRecord(tagData.subdata(in: bodyStart..<bodyEnd)) {
+                records.append(record)
+            }
+            offset = bodyEnd
+        }
+        return records
+    }
+
+    private static func isPopularimeterItem(_ item: AVMetadataItem) -> Bool {
+        let key = (item.key as? String)?.uppercased()
+        let identifier = item.identifier?.rawValue.uppercased()
+        return key == "POPM"
+            || identifier == "POPM"
+            || identifier?.hasSuffix("/POPM") == true
+    }
+
+    private static func parsePopularimeterRecord(_ data: Data) -> PopularimeterInfo? {
+        guard let separator = data.firstIndex(of: 0) else { return nil }
+        let ratingIndex = data.index(after: separator)
+        guard ratingIndex < data.endIndex else { return nil }
+
+        let nameData = data.subdata(in: data.startIndex..<separator)
+        let name = (String(data: nameData, encoding: .isoLatin1)
+            ?? String(decoding: nameData, as: UTF8.self))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = Int(data[ratingIndex])
+        let counterStart = data.index(after: ratingIndex)
+        var counter: UInt64 = 0
+        for byte in data[counterStart...] {
+            if counter > (UInt64.max - UInt64(byte)) / 256 {
+                counter = UInt64.max
+                break
+            }
+            counter = counter * 256 + UInt64(byte)
+        }
+        return PopularimeterInfo(name: name, value: value, counter: counter)
+    }
+
+    private static func synchsafeValue(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Int {
+        Int(a & 0x7F) << 21 | Int(b & 0x7F) << 14 | Int(c & 0x7F) << 7 | Int(d & 0x7F)
     }
 
     private static func readMPEGInfo(from url: URL) -> MPEGInfo? {
