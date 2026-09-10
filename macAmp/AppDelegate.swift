@@ -532,6 +532,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let tagEditorModel = TagEditorModel()
     private var infoTargetURL: URL?
     private var tagEditorContext: (playlistID: UUID, entryID: UUID)?
+    private var tagEditorStandaloneURL: URL?
     private var infoLogicalSize = NSSize(width: 250, height: 300)
     private var visualizationLogicalSize = NSSize(width: 250, height: 300)
     private var playlistWindows: [UUID: NSWindow] = [:]
@@ -813,6 +814,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Local monitoring is the only AppKit path that consistently carries the
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if handleCurrentTrackMetadataShortcut(event, modifiers: modifiers) { return true }
+
         // The metadata editor owns its keyboard navigation and editing shortcuts.
         // Text events stay with AppKit, while other key events are consumed
         // here so the main Playback menu cannot reinterpret them as player
@@ -834,7 +838,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // field editor; otherwise a one-letter transport shortcut (Z/X/C/V,
         // B/S/R) wins over the text being entered in a playlist name.
         guard !isEditingText(for: event) else { return false }
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if handleWindowShadeShortcut(event, modifiers: modifiers) { return true }
         if handleFileCloseShortcut(event, modifiers: modifiers) { return true }
         if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
@@ -945,6 +948,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard modifiers == [.option], event.keyCode == 13 else { return false }
         closeActiveWindow(event.window ?? NSApp.keyWindow)
         return true
+    }
+
+    /// Option+3 opens metadata for the file currently loaded by the player.
+    /// The physical number-row key keeps this stable across input sources.
+    private func handleCurrentTrackMetadataShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers == [.option], event.keyCode == 20,
+              let sourceWindow = event.window ?? NSApp.keyWindow,
+              isSkinnedPlayerWindow(sourceWindow) else { return false }
+        showTagEditorForCurrentPlayback()
+        return true
+    }
+
+    private func isSkinnedPlayerWindow(_ sourceWindow: NSWindow) -> Bool {
+        sourceWindow === window
+            || sourceWindow === equalizerWindow
+            || sourceWindow === playlistWindow
+            || sourceWindow === infoWindow
+            || sourceWindow === visualizationWindow
+            || playlistWindows.values.contains(where: { $0 === sourceWindow })
     }
 
     /// Window shortcuts use physical keys, not the character emitted by the
@@ -2606,37 +2631,92 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Editor row. The existing skinned Info panel deliberately remains a
     /// read-only metadata summary.
     func showTagEditor(for playlist: PlaylistModel, entry: PlaylistEntry) {
-        guard playlist.selectedIDs.count == 1,
+        guard hasExactlyOneSelectedEntry(in: playlist),
               playlist.selectedIDs.contains(entry.id),
               entry.url.isFileURL,
               !entry.url.path.isEmpty else { return }
+        openTagEditor(for: entry.url, playlist: playlist, entry: entry)
+    }
+
+    private func showTagEditorForCurrentPlayback() {
+        guard let url = playback.currentURL,
+              url.isFileURL,
+              !url.path.isEmpty else { return }
+
+        if standalonePlaybackURL == nil,
+           let playlist = playlistManager.activePlaylist,
+           let playingEntryID = playlistManager.playingEntryID,
+           let entry = playlist.entries.first(where: { $0.id == playingEntryID }),
+           entry.url == url {
+            openTagEditor(for: url, playlist: playlist, entry: entry)
+        } else {
+            openStandaloneTagEditor(for: url)
+        }
+    }
+
+    private func openTagEditor(for url: URL, playlist: PlaylistModel, entry: PlaylistEntry) {
+        guard url.isFileURL, !url.path.isEmpty else { return }
         tagEditorContext = (playlist.id, entry.id)
+        tagEditorStandaloneURL = nil
         let panel = makeTagEditorWindowIfNeeded()
-        tagEditorModel.load(entry.url)
+        tagEditorModel.load(url)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func openStandaloneTagEditor(for url: URL) {
+        guard url.isFileURL, !url.path.isEmpty else { return }
+        tagEditorContext = nil
+        tagEditorStandaloneURL = url
+        let panel = makeTagEditorWindowIfNeeded()
+        tagEditorModel.load(url)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     private func saveTagEditor(_ fields: TagEditorFields) {
-        guard let context = tagEditorContext,
-              let playlist = playlistManager.playlist(id: context.playlistID),
-              let entry = playlist.entries.first(where: { $0.id == context.entryID }) else { return }
-        let url = entry.url
+        let context = tagEditorContext
+        let standaloneURL = tagEditorStandaloneURL
+        let playlist: PlaylistModel?
+        let entry: PlaylistEntry?
+        let url: URL
+        if let context,
+           let resolvedPlaylist = playlistManager.playlist(id: context.playlistID),
+           let resolvedEntry = resolvedPlaylist.entries.first(where: { $0.id == context.entryID }) {
+            playlist = resolvedPlaylist
+            entry = resolvedEntry
+            url = resolvedEntry.url
+        } else if let standaloneURL {
+            playlist = nil
+            entry = nil
+            url = standaloneURL
+        } else {
+            return
+        }
         tagEditorModel.save(fields) { [weak self] result in
-            guard let self,
-                  self.tagEditorContext?.playlistID == context.playlistID,
-                  self.tagEditorContext?.entryID == context.entryID else { return }
+            guard let self else { return }
             switch result {
             case .success:
-                let appliedFields = self.tagEditorModel.values.tagEnabled ? fields : TagEditorFields()
-                self.playlistManager.applyEditedMetadata(appliedFields, to: entry, in: playlist)
+                if let context {
+                    guard self.tagEditorContext?.playlistID == context.playlistID,
+                          self.tagEditorContext?.entryID == context.entryID,
+                          let playlist,
+                          let entry else { return }
+                    let appliedFields = self.tagEditorModel.values.tagEnabled ? fields : TagEditorFields()
+                    self.playlistManager.applyEditedMetadata(appliedFields, to: entry, in: playlist)
+                } else {
+                    guard self.tagEditorStandaloneURL == standaloneURL else { return }
+                }
                 self.infoModel.reload(url)
-                if self.playback.currentURL == url,
+                if let context,
+                   let playlist,
+                   self.playback.currentURL == url,
                    let updatedEntry = playlist.entries.first(where: { $0.id == context.entryID }) {
                     self.playback.updateDisplayTitle(updatedEntry.title)
                 }
                 self.tagEditorWindow?.orderOut(nil)
                 self.tagEditorContext = nil
+                self.tagEditorStandaloneURL = nil
             case .failure:
                 NSSound.beep()
             }
@@ -2646,6 +2726,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func closeTagEditor() {
         tagEditorWindow?.orderOut(nil)
         tagEditorContext = nil
+        tagEditorStandaloneURL = nil
     }
 
     /// Returns the one file that the Playlist Editor's Reveal in Finder
@@ -3048,6 +3129,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             queue: .main
         ) { [weak self] _ in
             self?.tagEditorContext = nil
+            self?.tagEditorStandaloneURL = nil
         }
         tagEditorWindow = panel
         return panel
@@ -5101,7 +5183,8 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
         let edit = contextItem("Edit metadata", action: #selector(PlaylistContextMenuTarget.editMetadata(_:)), target: target)
         edit.keyEquivalent = "e"
         edit.keyEquivalentModifierMask = [.shift]
-        edit.isEnabled = playlist.selectedIDs.count == 1 && playlist.selectedIDs.contains(entry.id)
+        edit.isEnabled = hasExactlyOneSelectedEntry(in: playlist)
+            && playlist.selectedIDs.contains(entry.id)
         menu.addItem(edit)
         let viewInfo = contextItem("View file info", action: #selector(PlaylistContextMenuTarget.viewInfo(_:)), target: target)
         viewInfo.isEnabled = playlist.selectedIDs.count <= 1
@@ -5225,6 +5308,12 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
     }
 }
 
+private func hasExactlyOneSelectedEntry(in playlist: PlaylistModel) -> Bool {
+    guard playlist.selectedIDs.count == 1,
+          let selectedID = playlist.selectedIDs.first else { return false }
+    return playlist.entries.contains { $0.id == selectedID }
+}
+
 private final class PlaylistContextMenuTarget: NSObject {
     let manager: PlaylistManager
     let playlist: PlaylistModel
@@ -5320,20 +5409,27 @@ private final class PlaylistMenuHotspotNSView: NSView {
             )
             item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
-            if let playlist, let appDelegate = AppDelegate.shared {
+            if let playlist {
                 if playlist.sortingProgress != nil {
                     item.isEnabled = false
                 } else if title == "File Info" {
-                    item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
+                    if let appDelegate = AppDelegate.shared {
+                        item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
+                    }
                 } else if title == "Edit metadata" {
-                    item.isEnabled = playlist.selectedIDs.count == 1
-                        && playlist.entries.contains { playlist.selectedIDs.contains($0.id) }
+                    item.isEnabled = hasExactlyOneSelectedEntry(in: playlist)
                 } else if title == "Reveal in Finder" {
-                    item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
+                    if let appDelegate = AppDelegate.shared {
+                        item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil
+                    }
                 } else if title == "Rebuild titles on selection" {
-                    item.isEnabled = appDelegate.canRebuildTitles(for: playlist)
+                    if let appDelegate = AppDelegate.shared {
+                        item.isEnabled = appDelegate.canRebuildTitles(for: playlist)
+                    }
                 } else if let option = PlaylistManager.SortOption(menuTitle: title) {
-                    item.isEnabled = appDelegate.canSort(playlist, by: option)
+                    if let appDelegate = AppDelegate.shared {
+                        item.isEnabled = appDelegate.canSort(playlist, by: option)
+                    }
                 }
             }
             menu.addItem(item)
@@ -5357,6 +5453,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
             if let playlist { AppDelegate.shared?.showFileInfo(for: playlist) }
         case "Edit metadata":
             if let playlist,
+               hasExactlyOneSelectedEntry(in: playlist),
                let entry = playlist.entries.first(where: { playlist.selectedIDs.contains($0.id) }) {
                 AppDelegate.shared?.showTagEditor(for: playlist, entry: entry)
             }
