@@ -133,16 +133,6 @@ final class VisualizationPanelView: NSView {
             DispatchQueue.main.async { self?.updateRenderingState() }
         }.store(in: &observation)
         NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: NSApp,
-            queue: .main
-        ) { [weak self] _ in self?.updateRenderingState() }
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didResignActiveNotification,
-            object: NSApp,
-            queue: .main
-        ) { [weak self] _ in self?.updateRenderingState() }
-        NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
             object: nil,
             queue: .main
@@ -214,12 +204,13 @@ final class VisualizationPanelView: NSView {
 
     /// Visibility is checked at the panel boundary as well as in the window
     /// controller. This covers orderOut, minimization and full occlusion, and
-    /// keeps the Metal display link paused when no pixels can be seen.
+    /// keeps the Metal display link paused when no pixels can be seen. Focus
+    /// and application activation are deliberately not part of this state:
+    /// the analyzer continues working when the player is not the active app.
     func updateRenderingState() {
         let isVisible = window?.isVisible == true
             && window?.isMiniaturized == false
             && window?.occlusionState.contains(.visible) == true
-            && NSApp.isActive
             && playback.isPlaying
         visualizationView.setRenderingEnabled(isVisible)
         playback.setMilkDropVisualization(enabled: isVisible)

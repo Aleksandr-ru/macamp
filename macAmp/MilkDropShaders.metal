@@ -91,7 +91,7 @@ fragment half4 milkDropFeedback(
     float glowAmount = uniforms.preset3.y;
     float pulseAmount = uniforms.preset3.z;
     float symmetry = max(1.0, uniforms.preset4.x);
-    int style = int(clamp(floor(uniforms.preset4.y + 0.5), 0.0, 5.0));
+    int style = int(clamp(floor(uniforms.preset4.y + 0.5), 0.0, 10.0));
 
     float2 centered = input.uv - 0.5;
     float radius = length(centered);
@@ -164,7 +164,7 @@ fragment half4 milkDropFeedback(
         float ribbon = 1.0 - smoothstep(0.009, 0.04 + waveformGain * 0.012,
                                          abs(input.uv.y - ribbonY));
         source += mix(primary, secondary, input.uv.x) * ribbon * (0.25 + audioPulse * glowAmount);
-    } else {
+    } else if (style == 5) {
         // Tunnel: a moving perspective grid of shrinking rings.
         float tunnel = fract(radius * (5.0 + radialAmount * 14.0)
                              - time * (0.28 + pulseAmount * 0.52) - beat * 0.28);
@@ -172,6 +172,62 @@ fragment half4 milkDropFeedback(
         float ray = 1.0 - smoothstep(0.02, 0.075,
                                      abs(abs(centered.x) - abs(centered.y) * 0.65));
         source += primary * (ring * 0.27 + ray * 0.1) * (0.28 + audioPulse * glowAmount);
+    } else if (style == 6) {
+        // Plasma: three low-cost moving fields create a shader-like colour
+        // surface while the threshold keeps most of the backdrop black.
+        float fieldA = sin(centered.x * 11.0 + time * (0.36 + mid * 0.22))
+                     + sin(centered.y * 14.0 - time * 0.27)
+                     + sin((centered.x + centered.y) * 9.0 + time * 0.19);
+        float fieldB = sin(length(centered) * (18.0 + radialAmount * 12.0)
+                            - time * (0.55 + bass * 0.4));
+        float plasma = smoothstep(1.0 - beat * 0.3, 2.35, fieldA + fieldB * 0.5);
+        source += mix(primary, secondary, plasma) * plasma
+            * (0.18 + audioPulse * glowAmount * 0.72);
+    } else if (style == 7) {
+        // Starburst: narrow angular rays and a bass-reactive centre. atan2 is
+        // used once per pixel and avoids allocating any particle geometry.
+        float angle = atan2(centered.y, centered.x);
+        float rays = abs(sin(angle * (10.0 + symmetry * 4.0)
+                          + time * (0.42 + pulseAmount * 0.3)));
+        float rayMask = 1.0 - smoothstep(0.72, 0.98, rays);
+        float radialFade = 1.0 - smoothstep(0.12, 0.82, radius);
+        float burst = rayMask * radialFade * (0.24 + bass * 0.86 + beat * 0.55);
+        source += mix(primary, secondary, rayMask) * burst;
+    } else if (style == 8) {
+        // Liquid: overlapping signed fields form soft blobs that drift with
+        // the midrange and leave a coloured feedback trace.
+        float liquidA = sin(centered.x * 8.0 + sin(time * 0.31) * 3.0)
+                      + cos(centered.y * 10.0 - time * 0.24);
+        float liquidB = sin((centered.x - centered.y) * 12.0 + time * 0.18)
+                      + cos(length(centered) * 21.0 - time * 0.42);
+        float blobs = smoothstep(0.55 - mid * 0.35 - beat * 0.2, 1.85,
+                                 liquidA + liquidB * 0.42);
+        source += mix(secondary, primary, blobs) * blobs
+            * (0.16 + audioPulse * glowAmount * 0.68);
+    } else if (style == 9) {
+        // Spiral: polar bands are phase-shifted by radius to produce a
+        // twisting vortex. The central glow prevents the spiral from vanishing
+        // during quiet passages.
+        float angle = atan2(centered.y, centered.x);
+        float spiralPhase = angle * (3.0 + radialAmount * 5.0)
+            + radius * (24.0 + radialAmount * 18.0)
+            - time * (0.75 + pulseAmount * 0.55) - beat * 0.9;
+        float spiral = 1.0 - smoothstep(0.32, 0.92, abs(sin(spiralPhase)));
+        float spiralFade = 1.0 - smoothstep(0.08, 0.84, radius);
+        source += mix(primary, secondary, fract(radius * 2.8 + time * 0.04))
+            * spiral * spiralFade * (0.18 + audioPulse * glowAmount * 0.72);
+    } else {
+        // Grid: a sparse geometric field with audio-driven line thickness.
+        float gridX = abs(fract((input.uv.x + drift.x * time) * (7.0 + radialAmount * 5.0)) - 0.5);
+        float gridY = abs(fract((input.uv.y + drift.y * time) * (5.0 + pulseAmount * 4.0)) - 0.5);
+        float lineWidth = 0.045 + beat * 0.045 + volume * 0.025;
+        float grid = 1.0 - smoothstep(lineWidth, lineWidth + 0.035,
+                                      min(gridX, gridY));
+        float diagonal = 1.0 - smoothstep(0.018, 0.055,
+                                           abs(fract((input.uv.x + input.uv.y) * 4.0
+                                                     - time * 0.08) - 0.5));
+        source += mix(primary, secondary, diagonal) * (grid * 0.15 + diagonal * 0.07)
+            * (0.24 + audioPulse * glowAmount * 0.62);
     }
 
     // A compact spectrum accent is shared by all presets. Unlike the former

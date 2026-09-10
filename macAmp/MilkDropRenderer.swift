@@ -117,7 +117,47 @@ private enum MilkDropPresetLibrary {
                        brightness: 0.9, radialAmount: 0.48, spectrumGain: 0.6,
                        waveformGain: 0.86, decay: 0.938, glow: 0.98, pulse: 1.0,
                        waveWidth: 0.20, symmetry: 1.0, style: 5,
-                       waveTint: SIMD3(1.0, 0.66, 0.20))
+                       waveTint: SIMD3(1.0, 0.66, 0.20)),
+        // Plasma: layered colour fields, similar to the shader-driven
+        // MilkDrop2 presets, with a restrained feedback trail.
+        MilkDropPreset(warp: 0.041, rotation: 0.009, zoom: 1.003, hueSpeed: 0.019,
+                       drift: SIMD2(-0.002, 0.001), hueOffset: 0.18, saturation: 0.84,
+                       brightness: 0.86, radialAmount: 0.34, spectrumGain: 0.72,
+                       waveformGain: 0.92, decay: 0.942, glow: 0.88, pulse: 0.72,
+                       waveWidth: 0.22, symmetry: 1.0, style: 6,
+                       waveTint: SIMD3(0.98, 0.30, 0.82)),
+        // Starburst: radial rays and a bass-driven core, a common MilkDrop
+        // composition that stays inexpensive because it uses no particle list.
+        MilkDropPreset(warp: 0.020, rotation: -0.032, zoom: 1.006, hueSpeed: 0.014,
+                       drift: SIMD2(0.001, -0.001), hueOffset: 0.61, saturation: 0.92,
+                       brightness: 0.9, radialAmount: 0.52, spectrumGain: 0.78,
+                       waveformGain: 1.0, decay: 0.941, glow: 0.94, pulse: 1.0,
+                       waveWidth: 0.24, symmetry: 1.0, style: 7,
+                       waveTint: SIMD3(0.28, 0.62, 1.0)),
+        // Liquid: smooth moving blobs with midrange modulation instead of a
+        // bright full-screen fill.
+        MilkDropPreset(warp: 0.032, rotation: 0.014, zoom: 0.997, hueSpeed: 0.010,
+                       drift: SIMD2(-0.001, 0.002), hueOffset: 0.39, saturation: 0.7,
+                       brightness: 0.8, radialAmount: 0.22, spectrumGain: 0.66,
+                       waveformGain: 1.18, decay: 0.956, glow: 0.8, pulse: 0.58,
+                       waveWidth: 0.34, symmetry: 1.0, style: 8,
+                       waveTint: SIMD3(0.24, 1.0, 0.58)),
+        // Spiral: polar bands that twist around the centre without requiring
+        // a second render pass or a geometry buffer.
+        MilkDropPreset(warp: 0.026, rotation: 0.045, zoom: 1.011, hueSpeed: 0.021,
+                       drift: SIMD2(0.001, 0.001), hueOffset: 0.76, saturation: 0.9,
+                       brightness: 0.88, radialAmount: 0.46, spectrumGain: 0.7,
+                       waveformGain: 0.88, decay: 0.939, glow: 0.93, pulse: 0.86,
+                       waveWidth: 0.2, symmetry: 1.0, style: 9,
+                       waveTint: SIMD3(1.0, 0.38, 0.2)),
+        // Grid: luminous horizontal/vertical structures with a subtle
+        // feedback zoom, inspired by geometric MilkDrop2 presets.
+        MilkDropPreset(warp: 0.015, rotation: -0.018, zoom: 1.008, hueSpeed: 0.012,
+                       drift: SIMD2(-0.001, 0), hueOffset: 0.53, saturation: 0.86,
+                       brightness: 0.82, radialAmount: 0.3, spectrumGain: 0.9,
+                       waveformGain: 0.96, decay: 0.944, glow: 0.84, pulse: 0.76,
+                       waveWidth: 0.26, symmetry: 1.0, style: 10,
+                       waveTint: SIMD3(0.38, 0.82, 1.0))
     ]
 }
 
