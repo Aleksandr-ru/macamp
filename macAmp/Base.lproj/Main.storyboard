@@ -86,6 +86,13 @@
                                                 <action selector="revertDocumentToSaved:" target="Ady-hI-5gd" id="iJ3-Pv-kwq"/>
                                             </connections>
                                         </menuItem>
+                                        <menuItem isSeparatorItem="YES" id="QF1-Separator-Before-EQ"/>
+                                        <menuItem title="Import EQ Presets…" id="QF1-Import-EQ">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                        </menuItem>
+                                        <menuItem title="Export EQ Presets…" id="QF1-Export-EQ">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                        </menuItem>
                                         <menuItem isSeparatorItem="YES" id="aJh-i4-bef"/>
                                         <menuItem title="Import Skin…" id="YxQ-9g-Import">
                                             <modifierMask key="keyEquivalentModifierMask"/>

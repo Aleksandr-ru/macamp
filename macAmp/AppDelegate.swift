@@ -1622,6 +1622,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureFileItem("New Playlist", action: #selector(newPlaylist(_:)), in: fileMenu)
         configureFileItem("Open…", action: #selector(openDocument(_:)), in: fileMenu)
         configureFileItem("Import Skin…", action: #selector(importSkin(_:)), in: fileMenu)
+        configureFileItem("Import EQ Presets…", action: #selector(importEQPresets(_:)), in: fileMenu)
+        configureFileItem("Export EQ Presets…", action: #selector(exportEQPresets(_:)), in: fileMenu)
         if let recent = fileMenu.items.first(where: { $0.title == "Open Recent" })?.submenu {
             rebuildRecentMenu(recent)
         }
@@ -2107,6 +2109,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func importSkin(_ sender: Any?) {
         _ = WinampSkinStore.shared.chooseArchive()
+    }
+
+    @objc private func importEQPresets(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.allowedFileTypes = ["eqf", "q1"]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try playback.equalizer.importUserPresets(from: url)
+        } catch {
+            showEQPresetFileError(error, operation: "import")
+        }
+    }
+
+    @objc private func exportEQPresets(_ sender: Any?) {
+        guard !playback.equalizer.userPresets.isEmpty else {
+            showEQPresetFileError(EqualizerPresetFileError.noPresets, operation: "export")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedFileTypes = ["eqf"]
+        panel.canCreateDirectories = false
+        panel.nameFieldStringValue = "macAmp EQ Presets.eqf"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if FileManager.default.fileExists(atPath: url.path) {
+            let alert = NSAlert()
+            alert.messageText = "Replace existing EQ preset file?"
+            alert.informativeText = "The selected file will be overwritten."
+            alert.addButton(withTitle: "Replace")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        do {
+            try playback.equalizer.exportUserPresets(to: url)
+        } catch {
+            showEQPresetFileError(error, operation: "export")
+        }
+    }
+
+    private func showEQPresetFileError(_ error: Error, operation: String) {
+        let alert = NSAlert()
+        alert.messageText = "Unable to " + operation + " EQ presets"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {

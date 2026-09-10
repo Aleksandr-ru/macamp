@@ -1,3 +1,4 @@
+import Foundation
 import AVFoundation
 import Combine
 
@@ -61,6 +62,24 @@ struct EqualizerPersistentState: Codable {
     let selectedPresetName: String
 }
 
+enum EqualizerPresetFileError: LocalizedError {
+    case invalidHeader
+    case invalidRecordLength
+    case invalidPresetName
+    case invalidPresetValues
+    case noPresets
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidHeader: return "The file is not a Winamp EQ library file."
+        case .invalidRecordLength: return "The Winamp EQ library contains an incomplete preset record."
+        case .invalidPresetName: return "The Winamp EQ library contains a preset with an invalid name."
+        case .invalidPresetValues: return "The Winamp EQ library contains invalid equalizer values."
+        case .noPresets: return "The Winamp EQ library does not contain any presets."
+        }
+    }
+}
+
 /// UI-independent EQ state. Values are expressed in dB and are applied by PlaybackController.
 final class EqualizerController: ObservableObject {
     static let frequencies: [Float] = [60, 170, 310, 600, 1_000, 3_000, 6_000, 12_000, 14_000, 16_000]
@@ -112,6 +131,9 @@ final class EqualizerController: ObservableObject {
     private let customPresetsKey = "macAmp.equalizer.customPresets"
     private let adaptiveEnabledDefaultsKey = "macAmp.equalizer.adaptiveEnabled"
     private let adaptiveCorrectionRangeDefaultsKey = "macAmp.equalizer.adaptiveCorrectionRange"
+    private static let winampEQFSignature: [UInt8] = Array("Winamp EQ library file v1.1".utf8) + [0x1A, 0x21, 0x2D, 0x2D]
+    private static let winampEQFNameFieldLength = 257
+    private static let winampEQFRecordLength = winampEQFNameFieldLength + 11
 
     static let factoryPresets: [EqualizerPreset] = [
         preset("Classical", [31,31,31,31,31,31,44,44,44,48]),
@@ -213,6 +235,25 @@ final class EqualizerController: ObservableObject {
         userPresets.removeAll { $0.name == name }
         if selectedPresetName == name { selectedPresetName = "Flat" }
         persistCustomPresets()
+    }
+
+    @discardableResult
+    func importUserPresets(from url: URL) throws -> Int {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let imported = try Self.presets(fromWinampEQF: data)
+        var merged = userPresets
+        for preset in imported {
+            merged.removeAll { $0.name.caseInsensitiveCompare(preset.name) == .orderedSame }
+            merged.append(preset)
+        }
+        userPresets = merged
+        persistCustomPresets()
+        return imported.count
+    }
+
+    func exportUserPresets(to url: URL) throws {
+        guard !userPresets.isEmpty else { throw EqualizerPresetFileError.noPresets }
+        try Self.winampEQFData(for: userPresets).write(to: url, options: .atomic)
     }
 
     func persistentState() -> EqualizerPersistentState {
@@ -390,6 +431,85 @@ final class EqualizerController: ObservableObject {
 
     private func persistCustomPresets() {
         if let data = try? JSONEncoder().encode(userPresets) { UserDefaults.standard.set(data, forKey: customPresetsKey) }
+    }
+
+    private static func presets(fromWinampEQF data: Data) throws -> [EqualizerPreset] {
+        let signature = Data(winampEQFSignature)
+        guard data.count >= signature.count, Data(data.prefix(signature.count)) == signature else {
+            throw EqualizerPresetFileError.invalidHeader
+        }
+        let payloadLength = data.count - signature.count
+        guard payloadLength % winampEQFRecordLength == 0 else {
+            throw EqualizerPresetFileError.invalidRecordLength
+        }
+        guard payloadLength > 0 else { throw EqualizerPresetFileError.noPresets }
+
+        var presets: [EqualizerPreset] = []
+        presets.reserveCapacity(payloadLength / winampEQFRecordLength)
+        var offset = signature.count
+        while offset < data.count {
+            let recordEnd = offset + winampEQFRecordLength
+            guard recordEnd <= data.count else { throw EqualizerPresetFileError.invalidRecordLength }
+
+            let nameField = data[offset..<(offset + winampEQFNameFieldLength)]
+            guard let terminator = nameField.firstIndex(of: 0) else {
+                throw EqualizerPresetFileError.invalidPresetName
+            }
+            let nameData = Data(nameField[..<terminator])
+            guard let name = String(data: nameData, encoding: .utf8)
+                    ?? String(data: nameData, encoding: .windowsCP1252),
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw EqualizerPresetFileError.invalidPresetName
+            }
+
+            let valuesStart = offset + winampEQFNameFieldLength
+            let values = Array(data[valuesStart..<recordEnd])
+            guard values.count == 11, values.allSatisfy({ $0 <= 63 }) else {
+                throw EqualizerPresetFileError.invalidPresetValues
+            }
+            let bands = values.prefix(10).map(dbValue(fromWinamp:))
+            let preamp = dbValue(fromWinamp: values[10])
+            presets.append(EqualizerPreset(name: name, preamp: preamp, bands: bands))
+            offset = recordEnd
+        }
+        return presets
+    }
+
+    private static func winampEQFData(for presets: [EqualizerPreset]) throws -> Data {
+        var data = Data(winampEQFSignature)
+        for preset in presets {
+            guard preset.bands.count == 10 else { throw EqualizerPresetFileError.invalidPresetValues }
+            guard !preset.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw EqualizerPresetFileError.invalidPresetName
+            }
+            data.append(contentsOf: try winampNameField(for: preset.name))
+            let values = try (preset.bands + [preset.preamp]).map(winampValue(fromDB:))
+            data.append(contentsOf: values)
+        }
+        return data
+    }
+
+    private static func winampNameField(for name: String) throws -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(min(256, name.utf8.count))
+        for character in name {
+            let characterBytes = Array(String(character).utf8)
+            guard bytes.count + characterBytes.count <= 256 else { break }
+            bytes.append(contentsOf: characterBytes)
+        }
+        guard !bytes.isEmpty else { throw EqualizerPresetFileError.invalidPresetName }
+        bytes.append(contentsOf: repeatElement(UInt8(0), count: winampEQFNameFieldLength - bytes.count))
+        return bytes
+    }
+
+    private static func winampValue(fromDB value: Double) throws -> UInt8 {
+        guard value.isFinite else { throw EqualizerPresetFileError.invalidPresetValues }
+        let rawValue = Int((31 - value * 31 / 20).rounded())
+        return UInt8(min(63, max(0, rawValue)))
+    }
+
+    private static func dbValue(fromWinamp value: UInt8) -> Double {
+        min(20, max(-20, Double(31 - Int(value)) * 20 / 31))
     }
 
     private static func preset(_ name: String, _ winampValues: [Int]) -> EqualizerPreset {
