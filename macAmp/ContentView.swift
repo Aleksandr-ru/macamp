@@ -1142,24 +1142,17 @@ private final class VisualizationNSView: NSView {
     func bind(to visualization: PlaybackVisualizationState) {
         guard self.visualization !== visualization else { return }
         self.visualization = visualization
-        levels = visualization.spectrumLevels
-        peaks = visualization.spectrumPeaks
+        levels = visualization.spectrumFrame.levels
+        peaks = visualization.spectrumFrame.peaks
         showsPeaks = visualization.showsPeaks
         samples = visualization.waveformSamples
         cancellables.removeAll()
-        visualization.$spectrumLevels
+        visualization.$spectrumFrame
             .removeDuplicates()
-            .sink { [weak self] values in
+            .sink { [weak self] frame in
                 guard let self else { return }
-                self.levels = values
-                if self.mode == .spectrum { self.needsDisplay = true }
-            }
-            .store(in: &cancellables)
-        visualization.$spectrumPeaks
-            .removeDuplicates()
-            .sink { [weak self] values in
-                guard let self else { return }
-                self.peaks = values
+                self.levels = frame.levels
+                self.peaks = frame.peaks
                 if self.mode == .spectrum { self.needsDisplay = true }
             }
             .store(in: &cancellables)

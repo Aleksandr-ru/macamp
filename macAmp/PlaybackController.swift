@@ -84,15 +84,25 @@ enum VisualizationAnalyzer: String, CaseIterable, Identifiable {
 
 /// High-frequency state is kept separate from transport state so spectrum
 /// frames do not invalidate the whole player interface.
+struct SpectrumFrame: Equatable {
+    var levels: [CGFloat]
+    var peaks: [CGFloat]
+
+    static let empty = SpectrumFrame(
+        levels: Array(repeating: 0, count: 16),
+        peaks: Array(repeating: 0, count: 16)
+    )
+}
+
 final class PlaybackVisualizationState: ObservableObject {
-    @Published var spectrumLevels = Array(repeating: CGFloat(0), count: 16)
+    /// Bars and peak markers belong to the same visual frame. Publishing them
+    /// together prevents two observer passes and two display invalidations for
+    /// one FFT result.
+    @Published var spectrumFrame = SpectrumFrame.empty
     /// Unquantized FFT levels for the MilkDrop renderer. The classic analyzer
     /// intentionally keeps its 15-row falloff, which is too coarse and slow
     /// for beat-reactive preset equations.
     @Published var milkDropSpectrumLevels = Array(repeating: CGFloat(0), count: 16)
-    /// The peak marker is kept separately from the bar levels.  Winamp's
-    /// classic renderer lets each marker fall independently of its column.
-    @Published var spectrumPeaks = Array(repeating: CGFloat(0), count: 16)
     @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
 
     private static let showsPeaksPreferenceKey = "macAmp.visualization.showsPeaks"
@@ -666,6 +676,11 @@ final class PlaybackController: NSObject, ObservableObject {
     private var analysisSnapshot = Array(repeating: Float(0), count: 1_024)
     private var liveAnalysisSampleCount = 0
     private var liveAnalysisSampleRate = 0.0
+    /// Protected by `analysisSamplesLock`. A new playback segment requests one
+    /// immediate analyzer frame from the first fresh PCM buffer instead of
+    /// waiting as long as a complete 6 Hz timer interval.
+    private var requestsSpectrumOnNextBuffer = false
+    private var liveAnalysisGeneration: UInt64 = 0
     private var timer: Timer?
     private var scopedURL: URL?
     /// The playlist is the authority for the user-facing track name. Keep it
@@ -683,8 +698,11 @@ final class PlaybackController: NSObject, ObservableObject {
     private var visualBarHeightsQ4 = Array(repeating: 0, count: 16)
     private var visualPeakPositionsQ8 = Array(repeating: 0, count: 16)
     private var visualPeakVelocities = Array(repeating: Float(0), count: 16)
+    private var lastClassicSpectrumUpdate: TimeInterval?
+    private var lastAnalyzedSampleGeneration: UInt64 = 0
     private let visualBarFalloffQ4 = 12
     private let visualPeakFalloff: Float = 1.1
+    private let classicSpectrumInterval: TimeInterval = 1.0 / 6.0
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
     private var isStreamingAnalysisTapInstalled = false
@@ -805,9 +823,8 @@ final class PlaybackController: NSObject, ObservableObject {
             pendingSeekPosition = nil
             isPlaying = false
             isPaused = false
-            visualization.spectrumLevels = Array(repeating: 0, count: 16)
+            visualization.spectrumFrame = .empty
             visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
-            visualization.spectrumPeaks = Array(repeating: 0, count: 16)
             visualization.waveformSamples = Array(repeating: 0, count: 76)
             resetSpectrumAnimation()
             return
@@ -828,9 +845,8 @@ final class PlaybackController: NSObject, ObservableObject {
         pendingSeekPosition = nil
         isPlaying = false
         isPaused = false
-        visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.spectrumFrame = .empty
         visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
-        visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
         resetSpectrumAnimation()
     }
@@ -863,9 +879,8 @@ final class PlaybackController: NSObject, ObservableObject {
         needsWaveformSamples = mainNeedsWaveformSamples || milkDropVisualizationEnabled
         updateLiveAnalysisTap()
         guard !isVisualizationEnabled else { return }
-        visualization.spectrumLevels = Array(repeating: 0, count: 16)
+        visualization.spectrumFrame = .empty
         visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
-        visualization.spectrumPeaks = Array(repeating: 0, count: 16)
         visualization.waveformSamples = Array(repeating: 0, count: 76)
         resetSpectrumAnimation()
     }
@@ -879,6 +894,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.visualBarHeightsQ4 = Array(repeating: 0, count: 16)
             self.visualPeakPositionsQ8 = Array(repeating: 0, count: 16)
             self.visualPeakVelocities = Array(repeating: 0, count: 16)
+            self.lastClassicSpectrumUpdate = nil
         }
     }
 
@@ -1125,9 +1141,30 @@ final class PlaybackController: NSObject, ObservableObject {
             }
             self.liveAnalysisSampleCount = count
             self.liveAnalysisSampleRate = buffer.format.sampleRate
+            self.liveAnalysisGeneration &+= 1
+            let shouldRequestSpectrum = self.requestsSpectrumOnNextBuffer
+                && count >= self.visualFFTSize
+            if shouldRequestSpectrum { self.requestsSpectrumOnNextBuffer = false }
             self.analysisSamplesLock.unlock()
+            if shouldRequestSpectrum {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isPlaying, self.needsLiveAnalysis,
+                          !self.isVisualUpdatesSuspended else { return }
+                    self.updateSpectrum(
+                        includesWaveform: self.needsWaveformSamples,
+                        allowsAdaptiveAnalysis: false
+                    )
+                }
+            }
         }
         isLiveAnalysisTapInstalled = true
+    }
+
+    private func requestSpectrumFromNextPCMBuffer() {
+        guard needsLiveAnalysis else { return }
+        analysisSamplesLock.lock()
+        requestsSpectrumOnNextBuffer = true
+        analysisSamplesLock.unlock()
     }
 
     /// AVPlayer is used for network volumes so opening them cannot block the
@@ -1352,6 +1389,7 @@ final class PlaybackController: NSObject, ObservableObject {
                         self.title = self.preferredDisplayTitle
                         self.loadStreamingBitrate(for: url, generation: generation)
                         self.installStreamingTimeObserver(on: player)
+                        self.requestSpectrumFromNextPCMBuffer()
                         player.play()
                         self.isPlaying = true; self.isPaused = false
                         self.onPlaybackReady?(url)
@@ -1377,7 +1415,7 @@ final class PlaybackController: NSObject, ObservableObject {
             if self.isPlaying != playerIsPlaying { self.isPlaying = playerIsPlaying }
             if self.isPaused == playerIsPlaying { self.isPaused = !playerIsPlaying }
             if playerIsPlaying, self.needsLiveAnalysis {
-                self.updateSpectrum(at: time.seconds, includesWaveform: self.needsWaveformSamples)
+                self.updateSpectrum(includesWaveform: self.needsWaveformSamples)
             }
         }
     }
@@ -1437,7 +1475,21 @@ final class PlaybackController: NSObject, ObservableObject {
         // valid frequency scale; 44.1 kHz is the conservative fallback when
         // a track does not expose its processing format to the tap.
         liveAnalysisSampleRate = 44_100
+        liveAnalysisGeneration &+= 1
+        let shouldRequestSpectrum = requestsSpectrumOnNextBuffer
+            && sampleCount >= visualFFTSize
+        if shouldRequestSpectrum { requestsSpectrumOnNextBuffer = false }
         analysisSamplesLock.unlock()
+        if shouldRequestSpectrum {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isPlaying, self.needsLiveAnalysis,
+                      !self.isVisualUpdatesSuspended else { return }
+                self.updateSpectrum(
+                    includesWaveform: self.needsWaveformSamples,
+                    allowsAdaptiveAnalysis: false
+                )
+            }
+        }
     }
 
     /// Network shares mounted by Finder normally live at /Volumes/<share>.
@@ -1484,6 +1536,7 @@ final class PlaybackController: NSObject, ObservableObject {
             reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
             return
         }
+        requestSpectrumFromNextPCMBuffer()
         playerNode.play()
         isPlaying = true
         isPaused = false
@@ -1522,7 +1575,7 @@ final class PlaybackController: NSObject, ObservableObject {
             let nodeIsPlaying = self.playerNode.isPlaying
             if self.isPlaying != nodeIsPlaying { self.isPlaying = nodeIsPlaying }
             if nodeIsPlaying, self.needsLiveAnalysis {
-                self.updateSpectrum(at: currentPosition, includesWaveform: self.needsWaveformSamples)
+                self.updateSpectrum(includesWaveform: self.needsWaveformSamples)
             }
         }
     }
@@ -1597,11 +1650,14 @@ final class PlaybackController: NSObject, ObservableObject {
         }
     }
 
-    private func updateSpectrum(at _: TimeInterval, includesWaveform: Bool) {
+    private func updateSpectrum(includesWaveform: Bool, allowsAdaptiveAnalysis: Bool = true) {
         guard !isSpectrumAnalysisScheduled else { return }
         isSpectrumAnalysisScheduled = true
         let now = Date()
-        let needsAdaptiveAnalysis = equalizer.isEnabled && equalizer.isAdaptiveEnabled && now.timeIntervalSince(lastAdaptiveAnalysis) >= adaptiveAnalysisInterval
+        let needsAdaptiveAnalysis = allowsAdaptiveAnalysis
+            && equalizer.isEnabled
+            && equalizer.isAdaptiveEnabled
+            && now.timeIntervalSince(lastAdaptiveAnalysis) >= adaptiveAnalysisInterval
         if needsAdaptiveAnalysis { lastAdaptiveAnalysis = now }
         let analysisSize = needsAdaptiveAnalysis ? fftSize : visualFFTSize
         spectrumQueue.async { [weak self] in
@@ -1610,6 +1666,7 @@ final class PlaybackController: NSObject, ObservableObject {
             self.analysisSamplesLock.lock()
             let available = self.liveAnalysisSampleCount
             let sampleRate = self.liveAnalysisSampleRate
+            let sampleGeneration = self.liveAnalysisGeneration
             if available > 0 {
                 self.analysisSnapshot.withUnsafeMutableBufferPointer { destination in
                     self.liveAnalysisSamples.withUnsafeBufferPointer { source in
@@ -1619,6 +1676,8 @@ final class PlaybackController: NSObject, ObservableObject {
             }
             self.analysisSamplesLock.unlock()
             guard sampleRate > 0, available >= analysisSize else { return }
+            guard sampleGeneration != self.lastAnalyzedSampleGeneration else { return }
+            self.lastAnalyzedSampleGeneration = sampleGeneration
             let samples = self.analysisSnapshot.prefix(available)
             let latestSamples = samples.suffix(self.visualFFTSize)
             let decibels = needsAdaptiveAnalysis
@@ -1628,7 +1687,10 @@ final class PlaybackController: NSObject, ObservableObject {
             // publishing so imperceptible floating-point changes do not cause
             // another complete SwiftUI update.
             let rawLevels = self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
-            let dynamics = self.classicSpectrumDynamics(for: rawLevels)
+            let dynamics = self.classicSpectrumDynamics(
+                for: rawLevels,
+                timestamp: ProcessInfo.processInfo.systemUptime
+            )
             let levels = dynamics.bars
             let peaks = dynamics.peaks
             let waveform: [CGFloat] = includesWaveform
@@ -1648,8 +1710,10 @@ final class PlaybackController: NSObject, ObservableObject {
                       self.isPlaying,
                       self.needsLiveAnalysis else { return }
                 if self.isInterfaceVisible, self.mainVisualizationEnabled {
-                    if self.visualization.spectrumLevels != levels { self.visualization.spectrumLevels = levels }
-                    if self.visualization.spectrumPeaks != peaks { self.visualization.spectrumPeaks = peaks }
+                    let frame = SpectrumFrame(levels: levels, peaks: peaks)
+                    if self.visualization.spectrumFrame != frame {
+                        self.visualization.spectrumFrame = frame
+                    }
                 }
                 if self.milkDropVisualizationEnabled,
                    self.visualization.milkDropSpectrumLevels != rawLevels {
@@ -1698,10 +1762,17 @@ final class PlaybackController: NSObject, ObservableObject {
     /// Reproduces the classic Winamp analyzer's two independent falloff
     /// stages.  `barHeight` is the smoothed column (`bx` in draw_sa.cpp),
     /// while `peakHeight` is the falling marker (`t_bx`/`t_vx`).
-    private func classicSpectrumDynamics(for rawLevels: [CGFloat])
+    private func classicSpectrumDynamics(for rawLevels: [CGFloat], timestamp: TimeInterval)
         -> (bars: [CGFloat], peaks: [CGFloat]) {
         var bars = Array(repeating: CGFloat(0), count: 16)
         var peaks = Array(repeating: CGFloat(0), count: 16)
+        let elapsed = lastClassicSpectrumUpdate.map { timestamp - $0 } ?? classicSpectrumInterval
+        lastClassicSpectrumUpdate = timestamp
+        // Keep Winamp's original per-frame dynamics, but scale them to elapsed
+        // time. This prevents MilkDrop's shared 30 Hz analysis cadence from
+        // making the classic bars and peaks fall five times faster.
+        let frameScale = Float(min(3, max(0.25, elapsed / classicSpectrumInterval)))
+        let barFalloff = max(1, Int((Float(visualBarFalloffQ4) * frameScale).rounded()))
 
         for index in 0..<16 {
             let raw = rawLevels.indices.contains(index) ? rawLevels[index] : 0
@@ -1709,7 +1780,7 @@ final class PlaybackController: NSObject, ObservableObject {
             let valueQ4 = value << 4
 
             if valueQ4 < visualBarHeightsQ4[index] {
-                visualBarHeightsQ4[index] = max(0, visualBarHeightsQ4[index] - visualBarFalloffQ4)
+                visualBarHeightsQ4[index] = max(0, visualBarHeightsQ4[index] - barFalloff)
             } else {
                 visualBarHeightsQ4[index] = valueQ4
             }
@@ -1723,8 +1794,8 @@ final class PlaybackController: NSObject, ObservableObject {
             let displayedPeak = min(15, max(0, visualPeakPositionsQ8[index] / 256))
             peaks[index] = CGFloat(displayedPeak) / 15
 
-            visualPeakPositionsQ8[index] -= Int(visualPeakVelocities[index])
-            visualPeakVelocities[index] *= visualPeakFalloff
+            visualPeakPositionsQ8[index] -= Int((visualPeakVelocities[index] * frameScale).rounded())
+            visualPeakVelocities[index] *= pow(visualPeakFalloff, frameScale)
             if visualPeakPositionsQ8[index] < 0 { visualPeakPositionsQ8[index] = 0 }
         }
 
