@@ -5,7 +5,8 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var playback: PlaybackController
-    @ObservedObject private var visualization: PlaybackVisualizationState
+    private let visualization: PlaybackVisualizationState
+    @ObservedObject private var visualizationPreferences: VisualizationPreferences
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var windowFocus: WindowFocusState
@@ -41,7 +42,8 @@ struct ContentView: View {
         settingsWindowState: SettingsWindowState
     ) {
         self.playback = playback
-        self._visualization = ObservedObject(wrappedValue: playback.visualization)
+        self.visualization = playback.visualization
+        self._visualizationPreferences = ObservedObject(wrappedValue: playback.visualizationPreferences)
         self.interfaceScale = interfaceScale
         self.timeDisplayPreference = timeDisplayPreference
         self.windowFocus = windowFocus
@@ -52,7 +54,7 @@ struct ContentView: View {
         self.visualizationState = visualizationState
         self.alwaysOnTopState = alwaysOnTopState
         self.settingsWindowState = settingsWindowState
-        self._visualizationMode = State(initialValue: playback.visualization.analyzer.visualizationMode)
+        self._visualizationMode = State(initialValue: playback.visualizationPreferences.analyzer.visualizationMode)
     }
 
     var body: some View {
@@ -69,12 +71,12 @@ struct ContentView: View {
                height: (windowShade.isEnabled ? 14 : 116) * CGFloat(interfaceScale.factor),
                alignment: .topLeading)
         .onAppear {
-            visualizationMode = visualization.analyzer.visualizationMode
+            visualizationMode = visualizationPreferences.analyzer.visualizationMode
             updateVisualizationDemand()
         }
         .onChange(of: visualizationMode) { _ in updateVisualizationDemand() }
-        .onChange(of: visualization.analyzer) { _ in
-            visualizationMode = visualization.analyzer.visualizationMode
+        .onChange(of: visualizationPreferences.analyzer) { _ in
+            visualizationMode = visualizationPreferences.analyzer.visualizationMode
         }
     }
 
@@ -120,7 +122,7 @@ struct ContentView: View {
 
     private func advanceVisualization() {
         visualizationMode.advance()
-        visualization.analyzer = visualizationMode.analyzer
+        visualizationPreferences.analyzer = visualizationMode.analyzer
     }
 
     private var skinTitleBar: some View {
@@ -544,6 +546,7 @@ extension ContentView {
     private func visualizationView(isWindowShade: Bool) -> some View {
         VisualizationDisplay(
             visualization: visualization,
+            showsPeaks: visualizationPreferences.showsPeaks,
             palette: skin.visualizationPalette,
             mode: visualizationMode,
             isWindowShade: isWindowShade
@@ -1071,6 +1074,7 @@ private struct TickerDisplay: View {
 /// invalidate controls, title text, or the static skin around it.
 private struct VisualizationDisplay: View {
     let visualization: PlaybackVisualizationState
+    let showsPeaks: Bool
     let palette: [NSColor]
     let mode: VisualizationMode
     let isWindowShade: Bool
@@ -1078,6 +1082,7 @@ private struct VisualizationDisplay: View {
     var body: some View {
         VisualizationSurface(
             visualization: visualization,
+            showsPeaks: showsPeaks,
             palette: palette,
             mode: mode,
             isWindowShade: isWindowShade
@@ -1090,19 +1095,20 @@ private struct VisualizationDisplay: View {
 /// enter SwiftUI's diff/layout pipeline at all.
 private struct VisualizationSurface: NSViewRepresentable {
     let visualization: PlaybackVisualizationState
+    let showsPeaks: Bool
     let palette: [NSColor]
     let mode: VisualizationMode
     let isWindowShade: Bool
 
     func makeNSView(context: Context) -> VisualizationNSView {
         let view = VisualizationNSView()
-        view.configure(palette: palette, mode: mode, isWindowShade: isWindowShade)
+        view.configure(palette: palette, mode: mode, showsPeaks: showsPeaks, isWindowShade: isWindowShade)
         view.bind(to: visualization)
         return view
     }
 
     func updateNSView(_ nsView: VisualizationNSView, context: Context) {
-        nsView.configure(palette: palette, mode: mode, isWindowShade: isWindowShade)
+        nsView.configure(palette: palette, mode: mode, showsPeaks: showsPeaks, isWindowShade: isWindowShade)
         nsView.bind(to: visualization)
     }
 }
@@ -1132,9 +1138,10 @@ private final class VisualizationNSView: NSView {
         super.init(coder: coder)
     }
 
-    func configure(palette: [NSColor], mode: VisualizationMode, isWindowShade: Bool) {
+    func configure(palette: [NSColor], mode: VisualizationMode, showsPeaks: Bool, isWindowShade: Bool) {
         self.palette = palette.isEmpty ? [.black, .darkGray, .green] : palette
         self.mode = mode
+        self.showsPeaks = showsPeaks
         self.isWindowShade = isWindowShade
         needsDisplay = true
     }
@@ -1144,7 +1151,6 @@ private final class VisualizationNSView: NSView {
         self.visualization = visualization
         levels = visualization.spectrumFrame.levels
         peaks = visualization.spectrumFrame.peaks
-        showsPeaks = visualization.showsPeaks
         samples = visualization.waveformSamples
         cancellables.removeAll()
         visualization.$spectrumFrame
@@ -1153,14 +1159,6 @@ private final class VisualizationNSView: NSView {
                 guard let self else { return }
                 self.levels = frame.levels
                 self.peaks = frame.peaks
-                if self.mode == .spectrum { self.needsDisplay = true }
-            }
-            .store(in: &cancellables)
-        visualization.$showsPeaks
-            .removeDuplicates()
-            .sink { [weak self] value in
-                guard let self else { return }
-                self.showsPeaks = value
                 if self.mode == .spectrum { self.needsDisplay = true }
             }
             .store(in: &cancellables)

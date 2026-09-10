@@ -1322,8 +1322,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func observePersistentState() {
+        playback.equalizer.onPersistenceChange = { [weak self] in
+            self?.schedulePersistentStateSave()
+        }
         let observableStates: [ObservableObjectPublisher] = [
-            playback.equalizer.objectWillChange,
             windowShade.objectWillChange, equalizerState.objectWillChange,
             equalizerShade.objectWillChange, playlistState.objectWillChange,
             playlistShade.objectWillChange, playlistLayout.objectWillChange,
@@ -2723,7 +2725,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             timeDisplayPreference: timeDisplayPreference,
             trackNotifications: trackNotifications,
             equalizer: playback.equalizer,
-            visualization: playback.visualization,
+            visualization: playback.visualizationPreferences,
             skin: WinampSkinStore.shared,
             statusBarPreferences: statusBarPreferences,
             outputDevices: playback.outputDeviceManager
@@ -3874,7 +3876,7 @@ private struct SettingsView: View {
     @ObservedObject var timeDisplayPreference: TimeDisplayPreference
     @ObservedObject var trackNotifications: TrackNotificationController
     @ObservedObject var equalizer: EqualizerController
-    @ObservedObject var visualization: PlaybackVisualizationState
+    @ObservedObject var visualization: VisualizationPreferences
     @ObservedObject var skin: WinampSkinStore
     @ObservedObject var statusBarPreferences: StatusBarPreferences
     @ObservedObject var outputDevices: AudioOutputDeviceManager

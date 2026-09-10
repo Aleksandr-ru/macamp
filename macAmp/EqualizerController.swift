@@ -85,9 +85,15 @@ final class EqualizerController: ObservableObject {
     static let frequencies: [Float] = [60, 170, 310, 600, 1_000, 3_000, 6_000, 12_000, 14_000, 16_000]
     private static let range = -20.0...20.0
 
-    @Published var isEnabled = true { didSet { onChange?() } }
+    @Published var isEnabled = true {
+        didSet {
+            if oldValue != isEnabled { onPersistenceChange?() }
+            onChange?()
+        }
+    }
     @Published var isAdaptiveEnabled = false {
         didSet {
+            guard oldValue != isAdaptiveEnabled else { return }
             UserDefaults.standard.set(isAdaptiveEnabled, forKey: adaptiveEnabledDefaultsKey)
             if isAdaptiveEnabled {
                 adaptiveReturnTimer?.invalidate()
@@ -95,11 +101,13 @@ final class EqualizerController: ObservableObject {
             } else if oldValue {
                 beginAdaptiveReturn()
             }
+            onPersistenceChange?()
             onChange?()
         }
     }
     @Published var adaptiveCorrectionRange: AdaptiveEQCorrectionRange = .default {
         didSet {
+            if oldValue != adaptiveCorrectionRange { onPersistenceChange?() }
             adaptiveConfiguration.maximumCorrection = adaptiveCorrectionRange.maximumCorrection
             let maximum = adaptiveConfiguration.maximumCorrection
             adaptiveBands = adaptiveBands.map { min(maximum, max(-maximum, $0)) }
@@ -117,6 +125,9 @@ final class EqualizerController: ObservableObject {
 
     /// Called on the main thread after every state mutation; the audio engine owns DSP objects.
     var onChange: (() -> Void)?
+    /// Called only for user-owned settings. Adaptive frames must not schedule a
+    /// persistent-state write while the audio stream is playing.
+    var onPersistenceChange: (() -> Void)?
     var adaptiveConfiguration = AdaptiveEQConfiguration()
     private var basePreamp = 0.0
     private var baseBands = Array(repeating: 0.0, count: 10)
@@ -185,6 +196,7 @@ final class EqualizerController: ObservableObject {
         if isAdaptiveEnabled { userBandOffsets[index] = value - baseBands[index] - adaptiveBands[index] }
         else { baseBands[index] = value }
         refreshFinalValues()
+        onPersistenceChange?()
     }
 
     func setPreamp(_ db: Double) {
@@ -192,6 +204,7 @@ final class EqualizerController: ObservableObject {
         if isAdaptiveEnabled { userPreampOffset = value - basePreamp - adaptivePreamp }
         else { basePreamp = value }
         refreshFinalValues()
+        onPersistenceChange?()
     }
 
     func setAllBands(_ db: Double) { for index in bands.indices { setBand(index, db: db) } }
@@ -206,6 +219,7 @@ final class EqualizerController: ObservableObject {
         // band shape, but release the headroom correction without a click.
         beginPresetPreampReturn()
         refreshFinalValues()
+        onPersistenceChange?()
     }
 
     /// Reset always returns every visible control to its physical centre (0 dB),
@@ -219,6 +233,7 @@ final class EqualizerController: ObservableObject {
         adaptiveBands = Array(repeating: 0, count: 10)
         selectedPresetName = "Flat"
         refreshFinalValues()
+        onPersistenceChange?()
     }
 
     func saveCurrentPreset(named name: String) {
@@ -229,12 +244,14 @@ final class EqualizerController: ObservableObject {
         userPresets.append(preset)
         selectedPresetName = trimmed
         persistCustomPresets()
+        onPersistenceChange?()
     }
 
     func deleteUserPreset(named name: String) {
         userPresets.removeAll { $0.name == name }
         if selectedPresetName == name { selectedPresetName = "Flat" }
         persistCustomPresets()
+        onPersistenceChange?()
     }
 
     @discardableResult
@@ -248,6 +265,7 @@ final class EqualizerController: ObservableObject {
         }
         userPresets = merged
         persistCustomPresets()
+        onPersistenceChange?()
         return imported.count
     }
 
@@ -328,7 +346,7 @@ final class EqualizerController: ObservableObject {
         adaptivePreamp += (protectedPreamp - adaptivePreamp) * smoothingFactor(duration: preampDuration, interval: configuration.analysisInterval)
         // The preset remains the adaptive base, but the final curve is no longer
         // identical to it and therefore must not be marked as selected in the UI.
-        if didApplyAdaptiveCorrection { selectedPresetName = "" }
+        if didApplyAdaptiveCorrection, !selectedPresetName.isEmpty { selectedPresetName = "" }
         refreshFinalValues()
     }
 
@@ -339,8 +357,17 @@ final class EqualizerController: ObservableObject {
 
     private func refreshFinalValues() {
         let includeAdaptive = isAdaptiveEnabled || adaptiveReturnTimer != nil
-        preamp = clamp(basePreamp + userPreampOffset + (includeAdaptive ? adaptivePreamp : 0))
-        bands = bands.indices.map { clamp(baseBands[$0] + userBandOffsets[$0] + (includeAdaptive ? adaptiveBands[$0] : 0)) }
+        let nextPreamp = clamp(basePreamp + userPreampOffset + (includeAdaptive ? adaptivePreamp : 0))
+        let nextBands = bands.indices.map {
+            clamp(baseBands[$0] + userBandOffsets[$0] + (includeAdaptive ? adaptiveBands[$0] : 0))
+        }
+        let preampChanged = abs(preamp - nextPreamp) >= 0.001
+        let bandsChanged = bands.count != nextBands.count || zip(bands, nextBands).contains {
+            abs($0 - $1) >= 0.001
+        }
+        guard preampChanged || bandsChanged else { return }
+        if preampChanged { preamp = nextPreamp }
+        if bandsChanged { bands = nextBands }
         onChange?()
     }
 

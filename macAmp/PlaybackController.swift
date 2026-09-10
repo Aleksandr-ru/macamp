@@ -4,7 +4,6 @@ import Combine
 import Accelerate
 import CoreAudio
 import AudioToolbox
-import os
 
 /// A title-bar drag has a much stricter latency budget than normal playback.
 /// Timers use this main-thread gate to defer cosmetic updates until mouse-up.
@@ -94,17 +93,10 @@ struct SpectrumFrame: Equatable {
     )
 }
 
-final class PlaybackVisualizationState: ObservableObject {
-    /// Bars and peak markers belong to the same visual frame. Publishing them
-    /// together prevents two observer passes and two display invalidations for
-    /// one FFT result.
-    @Published var spectrumFrame = SpectrumFrame.empty
-    /// Unquantized FFT levels for the MilkDrop renderer. The classic analyzer
-    /// intentionally keeps its 15-row falloff, which is too coarse and slow
-    /// for beat-reactive preset equations.
-    @Published var milkDropSpectrumLevels = Array(repeating: CGFloat(0), count: 16)
-    @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
-
+/// Low-frequency visualization choices are kept apart from the live audio
+/// frame stream. Views that only need the mode or peak preference must not
+/// subscribe to every analyzer frame.
+final class VisualizationPreferences: ObservableObject {
     private static let showsPeaksPreferenceKey = "macAmp.visualization.showsPeaks"
     private static let analyzerPreferenceKey = "macAmp.visualization.analyzer"
 
@@ -130,6 +122,21 @@ final class PlaybackVisualizationState: ObservableObject {
             ? true
             : defaults.bool(forKey: Self.showsPeaksPreferenceKey)
     }
+}
+
+/// High-frequency analyzer frames are isolated from low-frequency preferences
+/// so changing a bar does not invalidate the complete player interface.
+final class PlaybackVisualizationState: ObservableObject {
+    /// Bars and peak markers belong to the same visual frame. Publishing them
+    /// together prevents two observer passes and two display invalidations for
+    /// one FFT result.
+    @Published var spectrumFrame = SpectrumFrame.empty
+    /// Unquantized FFT levels for the MilkDrop renderer. The classic analyzer
+    /// intentionally keeps its 15-row falloff, which is too coarse and slow
+    /// for beat-reactive preset equations.
+    @Published var milkDropSpectrumLevels = Array(repeating: CGFloat(0), count: 16)
+    @Published var waveformSamples = Array(repeating: CGFloat(0), count: 76)
+
 }
 
 /// High-frequency clock updates are isolated from transport and settings.
@@ -217,10 +224,6 @@ final class AudioOutputDeviceManager: ObservableObject {
     var onSelectedDeviceUnavailable: ((AudioDeviceID?) -> Void)?
 
     private static let preferredDeviceUIDKey = "macAmp.audio.preferredOutputDeviceUID"
-    private static let deviceLogger = Logger(
-        subsystem: "ru.aleksandr.macAmp",
-        category: "AudioOutputDevices"
-    )
     private let defaults: UserDefaults
     private let listenerQueue = DispatchQueue(label: "ru.aleksandr.macAmp.audio.devices", qos: .utility)
     private let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
@@ -265,9 +268,6 @@ final class AudioOutputDeviceManager: ObservableObject {
 
         devices = refreshedDevices
         defaultDeviceID = defaultID
-        Self.deviceLogger.notice(
-            "refreshed output devices count=\(refreshedDevices.count, privacy: .public) defaultID=\(defaultID ?? AudioDeviceID(kAudioObjectUnknown), privacy: .public)"
-        )
 
         if !hasResolvedInitialSelection {
             let initialDevice = preferredDeviceUID.flatMap { uid in
@@ -363,18 +363,9 @@ final class AudioOutputDeviceManager: ObservableObject {
                   outputChannelCount(deviceID) > 0,
                   let uid = stringProperty(deviceID, selector: kAudioDevicePropertyDeviceUID),
                   let rawName = stringProperty(deviceID, selector: kAudioObjectPropertyName),
-                  let rawTransport = transportTypeID(deviceID),
                   let presentation = outputPresentation(deviceID),
                   !uid.isEmpty else { return nil }
             let isServiceDevice = isSystemRouteProxy(name: rawName, uid: uid)
-            logDevice(
-                id: deviceID,
-                uid: uid,
-                rawName: rawName,
-                rawTransport: rawTransport,
-                presentation: presentation,
-                isIncluded: !isServiceDevice
-            )
             guard !isServiceDevice else { return nil }
             return AudioOutputDevice(
                 id: deviceID,
@@ -388,25 +379,6 @@ final class AudioOutputDeviceManager: ObservableObject {
             if $0.isDefault != $1.isDefault { return $0.isDefault }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-    }
-
-    private static func logDevice(
-        id: AudioDeviceID,
-        uid: String,
-        rawName: String,
-        rawTransport: UInt32,
-        presentation: (name: String, type: String),
-        isIncluded: Bool
-    ) {
-        let activeSubdeviceIDs = activeSubdeviceIDs(id)
-        let mainSubdeviceUID = stringProperty(id, selector: kAudioAggregateDevicePropertyMainSubDevice) ?? ""
-        let fullSubdeviceUIDs = stringArrayProperty(
-            id,
-            selector: kAudioAggregateDevicePropertyFullSubDeviceList
-        )
-        deviceLogger.notice(
-            "device id=\(id, privacy: .public) uid=\(uid, privacy: .public) rawName=\(rawName, privacy: .public) rawTransport=\(rawTransport, privacy: .public) presentationName=\(presentation.name, privacy: .public) presentationType=\(presentation.type, privacy: .public) included=\(isIncluded, privacy: .public) activeSubdevices=\(String(describing: activeSubdeviceIDs), privacy: .public) mainSubdeviceUID=\(mainSubdeviceUID, privacy: .public) fullSubdeviceUIDs=\(String(describing: fullSubdeviceUIDs), privacy: .public)"
-        )
     }
 
     private static func isAlive(_ deviceID: AudioDeviceID) -> Bool {
@@ -614,6 +586,7 @@ final class PlaybackController: NSObject, ObservableObject {
         set { clock.pendingSeekPosition = newValue }
     }
     let visualization = PlaybackVisualizationState()
+    let visualizationPreferences = VisualizationPreferences()
     @Published var volume: Double = 0.8 { didSet { playerNode.volume = Float(volume) } }
     @Published var balance: Double = 0 { didSet { playerNode.pan = Float(min(1, max(-1, balance))) } }
     @Published var shuffleMode: ShuffleMode = .off {
@@ -1098,7 +1071,13 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private var liveAnalysisInterval: TimeInterval {
         if milkDropVisualizationEnabled { return 1.0 / 30.0 }
-        return isInterfaceVisible ? equalizer.adaptiveConfiguration.analysisInterval : 1.0
+        if isInterfaceVisible, mainVisualizationEnabled {
+            return equalizer.adaptiveConfiguration.analysisInterval
+        }
+        if isInterfaceVisible, equalizer.isEnabled, equalizer.isAdaptiveEnabled {
+            return adaptiveAnalysisInterval
+        }
+        return 1.0
     }
 
     /// Tapping a node invokes code on the real-time audio render thread. Do not
@@ -1652,12 +1631,15 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func updateSpectrum(includesWaveform: Bool, allowsAdaptiveAnalysis: Bool = true) {
         guard !isSpectrumAnalysisScheduled else { return }
-        isSpectrumAnalysisScheduled = true
         let now = Date()
+        let needsClassicVisualization = isInterfaceVisible && mainVisualizationEnabled
         let needsAdaptiveAnalysis = allowsAdaptiveAnalysis
             && equalizer.isEnabled
             && equalizer.isAdaptiveEnabled
             && now.timeIntervalSince(lastAdaptiveAnalysis) >= adaptiveAnalysisInterval
+        let needsVisualAnalysis = needsClassicVisualization || milkDropVisualizationEnabled
+        guard needsVisualAnalysis || needsAdaptiveAnalysis else { return }
+        isSpectrumAnalysisScheduled = true
         if needsAdaptiveAnalysis { lastAdaptiveAnalysis = now }
         let analysisSize = needsAdaptiveAnalysis ? fftSize : visualFFTSize
         spectrumQueue.async { [weak self] in
@@ -1683,17 +1665,18 @@ final class PlaybackController: NSObject, ObservableObject {
             let decibels = needsAdaptiveAnalysis
                 ? self.bandDecibels(samples: samples, sampleRate: sampleRate)
                 : []
-            // The skin contains fifteen physical LED rows.  Quantize before
-            // publishing so imperceptible floating-point changes do not cause
-            // another complete SwiftUI update.
-            let rawLevels = self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
-            let dynamics = self.classicSpectrumDynamics(
-                for: rawLevels,
-                timestamp: ProcessInfo.processInfo.systemUptime
-            )
-            let levels = dynamics.bars
-            let peaks = dynamics.peaks
-            let waveform: [CGFloat] = includesWaveform
+            // Do not calculate display-only FFT data for Adaptive EQ when both
+            // visual surfaces are hidden. Adaptive EQ needs only `decibels`.
+            let rawLevels = needsVisualAnalysis
+                ? self.visualLevels(samples: latestSamples, sampleRate: sampleRate)
+                : []
+            let dynamics = needsClassicVisualization
+                ? self.classicSpectrumDynamics(
+                    for: rawLevels,
+                    timestamp: ProcessInfo.processInfo.systemUptime
+                )
+                : nil
+            let waveform: [CGFloat] = includesWaveform && needsVisualAnalysis
                 ? (0..<76).map { column in
                     let offset = min(self.visualFFTSize - 1, column * (self.visualFFTSize - 1) / 75)
                     // ArraySlice keeps the source collection's indices, so use
@@ -1709,8 +1692,8 @@ final class PlaybackController: NSObject, ObservableObject {
                 guard !self.isVisualUpdatesSuspended,
                       self.isPlaying,
                       self.needsLiveAnalysis else { return }
-                if self.isInterfaceVisible, self.mainVisualizationEnabled {
-                    let frame = SpectrumFrame(levels: levels, peaks: peaks)
+                if needsClassicVisualization, let dynamics {
+                    let frame = SpectrumFrame(levels: dynamics.bars, peaks: dynamics.peaks)
                     if self.visualization.spectrumFrame != frame {
                         self.visualization.spectrumFrame = frame
                     }
