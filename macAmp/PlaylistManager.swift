@@ -61,10 +61,6 @@ final class PlaylistModel: ObservableObject, Identifiable {
     @Published var isVisible = true
     @Published var isWindowShaded = false
     @Published var windowFrame: CGRect?
-    /// A lightweight invalidation token for visible rows.  Metadata may be
-    /// read while the status must remain "Loading", so scannerState cannot be
-    /// used to refresh the row text in that phase.
-    @Published var metadataRevision = 0
     /// Changes only when rows are inserted or removed. The playlist editor
     /// uses it to discard LazyVStack's cached row hosts after an index shift;
     /// selection and metadata updates do not touch it.
@@ -635,7 +631,6 @@ final class PlaylistManager: ObservableObject {
         }
         metadataProgress[playlist.id] = (0, pendingCount)
         playlist.scannerState = .readingMetadata(processed: 0, total: pendingCount)
-        playlist.metadataRevision &+= 1
         playlist.isDirty = true
         markEntriesDirty(in: playlist)
         metadataPriorityRevision &+= 1
@@ -1059,7 +1054,6 @@ final class PlaylistManager: ObservableObject {
               let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
         guard !entry.hasPlaybackError else { return }
         entry.hasPlaybackError = true
-        playlist.metadataRevision &+= 1
     }
 
     func clearPlaybackErrorForActiveEntry(url: URL) {
@@ -1068,7 +1062,6 @@ final class PlaylistManager: ObservableObject {
               let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
         guard entry.hasPlaybackError else { return }
         entry.hasPlaybackError = false
-        playlist.metadataRevision &+= 1
     }
 
     func focus(_ playlist: PlaylistModel) { focusedPlaylistID = playlist.id; save() }
@@ -1159,10 +1152,6 @@ final class PlaylistManager: ObservableObject {
         playlist.scrollPosition = position
         playlist.visibleEntryCount = count
         metadataPriorityRevision &+= 1
-        // Rows that finished while off-screen were intentionally coalesced.
-        // Publish once as the viewport changes so the newly visible range is
-        // rendered immediately with all metadata already available there.
-        playlist.metadataRevision &+= 1
         if metadataReprioritizationSuppressedForPlaylistIDs.remove(playlist.id) != nil {
             // This range change is the delayed ScrollView reveal issued by
             // play(_:in:). The worker will use the new viewport after its
@@ -1617,9 +1606,10 @@ final class PlaylistManager: ObservableObject {
             let previous = metadataProgress[owner.id] ?? (0, owner.entries.count)
             let progress = (previous.processed + 1, max(previous.total, owner.entries.count))
             metadataProgress[owner.id] = progress
-            // A visible row must update as soon as its metadata arrives. Keep
-            // background rows batched, however, so a large off-screen scan
-            // does not invalidate the playlist editor for every file.
+            // Each visible row observes its own PlaylistEntry, so applying this
+            // result refreshes only that row. The scanner status still follows
+            // visible completions without invalidating the list during folder
+            // insertion, where Loading remains the higher-priority state.
             let visibleStart = min(max(0, owner.scrollPosition), owner.entries.count)
             let visibleEnd = min(owner.entries.count, visibleStart + owner.visibleEntryCount)
             let completedEntryIsVisible = owner.entries[visibleStart..<visibleEnd]
@@ -1631,7 +1621,6 @@ final class PlaylistManager: ObservableObject {
                shouldPublishUpdate {
                 owner.scannerState = .readingMetadata(processed: progress.0, total: progress.1)
             }
-            if shouldPublishUpdate { owner.metadataRevision &+= 1 }
         }
         DispatchQueue.main.async(execute: applyResult)
         let priorityChanged = DispatchQueue.main.sync {

@@ -4474,9 +4474,6 @@ private struct PlaylistView: View {
     private var playlistEntries: some View {
         let colors = skin.playlistColors()
         let entryHeight = playlistEntryHeight
-        // Read the token so completed metadata becomes visible without having
-        // to replace the higher-priority Loading/Adding status text.
-        _ = playlist.metadataRevision
         return ScrollViewReader { proxy in
             ScrollView {
                 playlistRows(entryHeight: entryHeight)
@@ -4600,17 +4597,14 @@ private struct PlaylistView: View {
         let rowLabel = entry.hasPlaybackError ? "!" : String(index + 1)
         return ZStack {
             let isPlayingEntry = entry.id == manager.playingEntryID && manager.activePlaylistID == playlist.id
-            HStack(spacing: 3) {
-                Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
-                Spacer(minLength: 2)
-                Text(entry.duration.map(formattedTime) ?? "--:--")
-            }
-            .font(Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))))
-            .foregroundColor(playlistColor(isPlayingEntry ? colors.currentText : colors.normalText))
-            .padding(.horizontal, 2)
-            .frame(maxWidth: .infinity, minHeight: entryHeight, alignment: .leading)
-            .background(playlistColor(isSelected ? colors.selectedBackground : colors.background))
-            .contentShape(Rectangle())
+            PlaylistEntryContent(
+                entry: entry,
+                rowLabel: rowLabel,
+                entryHeight: entryHeight,
+                font: Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))),
+                foregroundColor: playlistColor(isPlayingEntry ? colors.currentText : colors.normalText),
+                backgroundColor: playlistColor(isSelected ? colors.selectedBackground : colors.background)
+            )
 
             PlaylistRowInteractionArea(
                 manager: manager,
@@ -4715,6 +4709,37 @@ private struct PlaylistView: View {
         )
             .frame(width: 22, height: 18)
             .position(x: x, y: layout.height - 21)
+    }
+}
+
+/// Observes only the entry represented by this row. Metadata completion can
+/// therefore reveal title and duration one file at a time without rebuilding
+/// the complete LazyVStack or waiting for another playlist-level mutation.
+private struct PlaylistEntryContent: View {
+    @ObservedObject var entry: PlaylistEntry
+    let rowLabel: String
+    let entryHeight: CGFloat
+    let font: Font
+    let foregroundColor: Color
+    let backgroundColor: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
+            Spacer(minLength: 2)
+            Text(entry.duration.map(Self.formattedTime) ?? "--:--")
+        }
+        .font(font)
+        .foregroundColor(foregroundColor)
+        .padding(.horizontal, 2)
+        .frame(maxWidth: .infinity, minHeight: entryHeight, alignment: .leading)
+        .background(backgroundColor)
+        .contentShape(Rectangle())
+    }
+
+    private static func formattedTime(_ seconds: TimeInterval) -> String {
+        let value = max(0, Int(seconds.rounded(.down)))
+        return String(format: "%02d:%02d", min(99, value / 60), value % 60)
     }
 }
 
