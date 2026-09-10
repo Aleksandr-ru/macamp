@@ -2022,7 +2022,9 @@ final class WinampSkinStore: ObservableObject {
 
     /// Winamp prefers the skin's extended number sheet when it is present;
     /// classic skins commonly ship only `NUMS_EX.BMP`. Its first ten cells
-    /// are the fixed 9×13 pixel glyphs for digits 0 through 9.
+    /// are nominally 9×13 pixel glyphs for digits 0 through 9. Older skins
+    /// sometimes crop the unused bottom row; Winamp still blits the nominal
+    /// cell size and the missing part remains transparent.
     func timeDigit(_ digit: Int) -> NSImage? {
         timeGlyph(at: digit)
     }
@@ -2040,12 +2042,20 @@ final class WinampSkinStore: ObservableObject {
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
-        let cropRect = isExtended
-            ? CGRect(x: 99, y: 0, width: 9, height: 13)
-            : CGRect(x: 20, y: 6, width: 5, height: 1)
-        guard cropRect.maxX <= CGFloat(source.width), cropRect.maxY <= CGFloat(source.height),
-              let cropped = source.cropping(to: cropRect) else { return nil }
-        let image = NSImage(cgImage: cropped, size: NSSize(width: cropRect.width, height: cropRect.height))
+        let image: NSImage?
+        if isExtended {
+            image = paddedTimeGlyph(
+                from: source,
+                sourceRect: CGRect(x: 99, y: 0, width: 9, height: 13),
+                targetSize: NSSize(width: 9, height: 13)
+            )
+        } else {
+            let cropRect = CGRect(x: 20, y: 6, width: 5, height: 1)
+            guard cropRect.maxX <= CGFloat(source.width), cropRect.maxY <= CGFloat(source.height),
+                  let cropped = source.cropping(to: cropRect) else { return nil }
+            image = NSImage(cgImage: cropped, size: NSSize(width: cropRect.width, height: cropRect.height))
+        }
+        guard let image else { return nil }
         timeDigitCache[cacheKey] = image
         return image
     }
@@ -2055,14 +2065,64 @@ final class WinampSkinStore: ObservableObject {
         if let cached = timeDigitCache[index] { return cached }
         guard let sheet = bitmap(named: "NUMS_EX.BMP") ?? bitmap(named: "NUMBERS.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              source.width >= 99, source.height >= 13,
-              let cropped = source.cropping(to: CGRect(x: index * 9, y: 0, width: 9, height: 13)) else {
+              let image = paddedTimeGlyph(
+                from: source,
+                sourceRect: CGRect(x: index * 9, y: 0, width: 9, height: 13),
+                targetSize: NSSize(width: 9, height: 13)
+              ) else {
             return nil
         }
-
-        let image = NSImage(cgImage: cropped, size: NSSize(width: 9, height: 13))
         timeDigitCache[index] = image
         return image
+    }
+
+    /// Returns a fixed-size bitmap cell while accepting skins that cropped
+    /// unused rows from the bottom of the source sheet. This mirrors Winamp's
+    /// BitBlt behavior: only the available source pixels are copied and the
+    /// remainder of the nominal cell stays transparent.
+    private func paddedTimeGlyph(
+        from source: CGImage,
+        sourceRect: CGRect,
+        targetSize: NSSize
+    ) -> NSImage? {
+        let sourceX = Int(sourceRect.origin.x)
+        let sourceY = Int(sourceRect.origin.y)
+        let sourceWidth = Int(sourceRect.width)
+        let targetWidth = Int(targetSize.width)
+        let targetHeight = Int(targetSize.height)
+        guard sourceX >= 0, sourceY >= 0,
+              sourceWidth > 0, targetWidth == sourceWidth, targetHeight > 0,
+              sourceX + sourceWidth <= source.width,
+              sourceY < source.height else { return nil }
+
+        let availableHeight = min(Int(sourceRect.height), source.height - sourceY)
+        guard availableHeight > 0 else { return nil }
+        guard let cropped = source.cropping(to: CGRect(x: sourceX,
+                                                        y: sourceY,
+                                                        width: sourceWidth,
+                                                        height: availableHeight)) else {
+            return nil
+        }
+        guard let context = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: targetWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                | CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
+        context.clear(CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .none
+        context.draw(cropped, in: CGRect(x: 0,
+                                         y: targetHeight - availableHeight,
+                                         width: targetWidth,
+                                         height: availableHeight))
+        guard let padded = context.makeImage() else { return nil }
+        return NSImage(cgImage: padded, size: targetSize)
     }
 
     /// Classic `posbar.bmp`: a 248×10 track followed by normal and pressed 29×10 thumbs.
