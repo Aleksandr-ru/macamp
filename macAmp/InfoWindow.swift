@@ -4,6 +4,11 @@ import Combine
 
 enum PlaylistRatingMenu {
     static let titles = Array(["None", "★", "★★", "★★★", "★★★★", "★★★★★"].reversed())
+
+    static func shortcut(for title: String) -> (key: String, modifiers: NSEvent.ModifierFlags)? {
+        guard let index = titles.firstIndex(of: title) else { return nil }
+        return (String(5 - index), [.control])
+    }
 }
 
 /// Info metadata is loaded lazily and off the main thread.  Playlist scans do
@@ -494,6 +499,10 @@ final class InfoPanelView: NSView {
         for title in PlaylistRatingMenu.titles {
             let item = NSMenuItem(title: title, action: #selector(rateItems(_:)), keyEquivalent: "")
             item.target = self
+            if let shortcut = PlaylistRatingMenu.shortcut(for: title) {
+                item.keyEquivalent = shortcut.key
+                item.keyEquivalentModifierMask = shortcut.modifiers
+            }
             rateMenu.addItem(item)
         }
         rate.submenu = rateMenu

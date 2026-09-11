@@ -869,6 +869,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // field editor; otherwise a one-letter transport shortcut (Z/X/C/V,
         // B/S/R) wins over the text being entered in a playlist name.
         guard !isEditingText(for: event) else { return false }
+        if handleRatingShortcut(event, modifiers: modifiers) { return true }
         if handleWindowShadeShortcut(event, modifiers: modifiers) { return true }
         if handleFileCloseShortcut(event, modifiers: modifiers) { return true }
         if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
@@ -992,6 +993,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               isSkinnedPlayerWindow(sourceWindow) else { return false }
         showTagEditorForCurrentPlayback()
         return true
+    }
+
+    /// Control+0…5 is routed by the focused skinned window. Settings, the tag
+    /// editor and other native panels deliberately do not participate.
+    private func handleRatingShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard modifiers.intersection([.command, .option, .control, .shift]) == [.control],
+              let sourceWindow = event.window ?? NSApp.keyWindow,
+              sourceWindow.isKeyWindow,
+              isSkinnedPlayerWindow(sourceWindow),
+              let stars = ratingShortcutValue(for: event.keyCode) else { return false }
+
+        if sourceWindow === infoWindow {
+            guard let url = infoModel.content.url else { return true }
+            setManualRating(stars: stars, for: url)
+            return true
+        }
+
+        if let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+           let playlist = playlistManager.playlist(id: playlistID) {
+            let targetIDs: Set<UUID>
+            let selectedIDs = Set(playlist.entries.filter { playlist.selectedIDs.contains($0.id) }.map(\.id))
+            if !selectedIDs.isEmpty {
+                targetIDs = selectedIDs
+            } else if let playingID = playlistManager.playingEntryID,
+                      playlist.entries.contains(where: { $0.id == playingID }) {
+                targetIDs = [playingID]
+            } else if let currentURL = playback.currentURL,
+                      let currentID = playlist.entries.first(where: { $0.url == currentURL })?.id {
+                targetIDs = [currentID]
+            } else {
+                return true
+            }
+            setManualRating(stars: stars, for: playlist, entryIDs: targetIDs)
+            return true
+        }
+
+        guard let url = currentRatingTargetURL() else { return true }
+        setManualRating(stars: stars, for: url)
+        return true
+    }
+
+    private func ratingShortcutValue(for keyCode: UInt16) -> Int? {
+        switch keyCode {
+        case 29, 82: return 0
+        case 18, 83: return 1
+        case 19, 84: return 2
+        case 20, 85: return 3
+        case 21, 86: return 4
+        case 23, 87: return 5
+        default: return nil
+        }
+    }
+
+    private func currentRatingTargetURL() -> URL? {
+        if let currentURL = playback.currentURL { return currentURL }
+        guard let active = playlistManager.activePlaylist,
+              let playingID = playlistManager.playingEntryID else { return nil }
+        return active.entries.first(where: { $0.id == playingID })?.url
     }
 
     private func isSkinnedPlayerWindow(_ sourceWindow: NSWindow) -> Bool {
@@ -2538,8 +2600,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func setManualRating(stars: Int, for playlist: PlaylistModel) {
+        setManualRating(stars: stars, for: playlist, entryIDs: playlist.selectedIDs)
+    }
+
+    func setManualRating(stars: Int, for playlist: PlaylistModel, entryIDs: Set<UUID>) {
         let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
-        for entry in playlist.entries where playlist.selectedIDs.contains(entry.id) {
+        for entry in playlist.entries where entryIDs.contains(entry.id) {
             do { try TrackRatingStore.write(TrackRating(rating: value, counter: TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: false)?.counter ?? 0), to: entry.url); updateRating(value, for: entry.url) }
             catch { presentRatingWriteError(error) }
         }
@@ -5368,7 +5434,12 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
         let rate = NSMenuItem(title: "Rate items", action: nil, keyEquivalent: "")
         let rateMenu = NSMenu(title: "Rate items")
         PlaylistRatingMenu.titles.forEach {
-            rateMenu.addItem(contextItem($0, action: #selector(PlaylistContextMenuTarget.rateItems(_:)), target: target))
+            let item = contextItem($0, action: #selector(PlaylistContextMenuTarget.rateItems(_:)), target: target)
+            if let shortcut = PlaylistRatingMenu.shortcut(for: $0) {
+                item.keyEquivalent = shortcut.key
+                item.keyEquivalentModifierMask = shortcut.modifiers
+            }
+            rateMenu.addItem(item)
         }
         rate.submenu = rateMenu
         menu.addItem(rate)
