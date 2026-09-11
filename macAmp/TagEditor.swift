@@ -17,6 +17,62 @@ private func logTagEditorFailure(_ operation: String, url: URL?, error: Error) {
     )
 }
 
+struct TrackRating: Equatable {
+    var rating: UInt8
+    var counter: UInt32
+    static func stars(for rating: UInt8) -> Int { rating == 0 ? 0 : min(5, (Int(rating) - 1) / 51 + 1) }
+}
+
+/// Small ID3-only rating service. Reading is bounded to the tag (never audio)
+/// and all writing goes through the editor's overlap-safe in-place writer.
+enum TrackRatingStore {
+    static let identifier = "macAmp"
+    private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "automatic-rating")
+
+    static func readOrInitialize(url: URL, allowWrite: Bool) -> TrackRating? {
+        guard let records = readRecords(url: url) else { return nil }
+        if let ours = records.first(where: { $0.identifier == identifier }) { return ours.value }
+        guard allowWrite, FileManager.default.isWritableFile(atPath: url.path) else { return nil }
+        let others = records.filter { $0.identifier != identifier }.map { Int($0.value.rating) }
+        let initial = others.isEmpty ? 128 : UInt8(min(255, max(1, Int((Double(others.reduce(0, +)) / Double(others.count)).rounded()))))
+        let result = TrackRating(rating: initial, counter: 0)
+        do { try AudioTagWriter.updatePopularimeter(rating: result.rating, counter: result.counter, identifier: identifier, to: url); return result }
+        catch { logger.error("Rating initialization failed; path=\(url.path, privacy: .public); error=\(error.localizedDescription, privacy: .public)"); return nil }
+    }
+
+    static func write(_ value: TrackRating, to url: URL) throws {
+        try AudioTagWriter.updatePopularimeter(rating: value.rating, counter: value.counter, identifier: identifier, to: url)
+    }
+
+    private static func readRecords(url: URL) -> [(identifier: String, value: TrackRating)]? {
+        guard url.isFileURL, url.pathExtension.lowercased() == "mp3", let data = try? Data(contentsOf: url, options: [.mappedIfSafe]), data.count >= 10,
+              data.prefix(3).elementsEqual([0x49, 0x44, 0x33]), data[3] == 3 || data[3] == 4 else { return nil }
+        let version = data[3]
+        let tagSize = sync(data[6], data[7], data[8], data[9])
+        guard tagSize <= 64 * 1024 * 1024, 10 + tagSize <= data.count else { return nil }
+        var offset = 10; let end = 10 + tagSize; var output: [(String, TrackRating)] = []
+        while offset + 10 <= end {
+            let id = String(bytes: data[offset..<(offset + 4)], encoding: .ascii) ?? ""
+            if id.isEmpty || id.utf8.allSatisfy({ $0 == 0 }) { break }
+            let size = version == 4 ? sync(data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]) : Int(data[offset + 4]) << 24 | Int(data[offset + 5]) << 16 | Int(data[offset + 6]) << 8 | Int(data[offset + 7])
+            guard size >= 0, offset + 10 + size <= end else { return nil }
+            if id == "POPM" {
+                let body = data[(offset + 10)..<(offset + 10 + size)]
+                if let zero = body.firstIndex(of: 0), zero + 1 < body.endIndex {
+                    let name = String(data: body[..<zero], encoding: .isoLatin1) ?? ""
+                    let rating = body[body.index(after: zero)]
+                    var counter: UInt64 = 0
+                    for byte in body[body.index(zero, offsetBy: 2)...] { counter = min(UInt64(UInt32.max), counter * 256 + UInt64(byte)) }
+                    output.append((name, TrackRating(rating: rating, counter: UInt32(counter))))
+                }
+            }
+            offset += 10 + size
+        }
+        return output
+    }
+    private static func sync(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Int { Int(a & 127) << 21 | Int(b & 127) << 14 | Int(c & 127) << 7 | Int(d & 127) }
+}
+
 struct TagEditorFields: Equatable {
     var trackNumber = ""
     var discNumber = ""
@@ -975,6 +1031,39 @@ private enum AudioTagWriter {
         default:
             throw TagEditorError.unsupportedFormat(url.pathExtension)
         }
+    }
+
+    /// Updates only macAmp's POPM frame. This deliberately refuses a file
+    /// without an existing ID3v2 tag: automatic rating must never create tags
+    /// for previously untagged audio.
+    static func updatePopularimeter(rating: UInt8, counter: UInt32, identifier: String, to url: URL) throws {
+        guard isSafeRegularFile(url), url.pathExtension.lowercased() == "mp3" else {
+            throw TagEditorError.unsupportedFormat(url.pathExtension)
+        }
+        guard FileManager.default.isWritableFile(atPath: url.path) else {
+            throw TagEditorError.fileWriteFailed("The audio file is not writable.")
+        }
+        let input = try FileHandle(forReadingFrom: url)
+        defer { try? input.close() }
+        let length = try input.seekToEnd(); input.seek(toFileOffset: 0)
+        let header = try readID3Header(from: input, fileLength: length)
+        guard header.audioStart > 0 else { throw TagEditorError.metadataReadFailed }
+        var frames = try preservedID3Frames(from: header.tagData, version: header.version)
+        frames.removeAll { frame in
+            guard frame.count >= 10, String(bytes: frame.prefix(4), encoding: .ascii) == "POPM" else { return false }
+            let body = frame.dropFirst(10)
+            guard let zero = body.firstIndex(of: 0) else { return false }
+            return String(data: body[..<zero], encoding: .isoLatin1) == identifier
+        }
+        var body = Data(identifier.data(using: .isoLatin1) ?? Data(identifier.utf8))
+        body.append(0); body.append(rating)
+        body.append(contentsOf: [UInt8((counter >> 24) & 0xFF), UInt8((counter >> 16) & 0xFF), UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)])
+        frames.append(frameData(id: "POPM", body: body, version: header.version))
+        let payload = frames.reduce(into: Data()) { $0.append($1) }
+        let audioEnd = oldAudioEnd(fileLength: length, audioStart: header.audioStart, input: input)
+        let tag = makeID3TagData(payload, version: header.version, paddedTo: header.audioStart)
+        try input.close()
+        try rewriteID3InPlace(to: url, oldTagSize: header.audioStart, contentEnd: audioEnd, fileLength: length, newTag: tag, preserveTrailingID3v1: true)
     }
 
     private static func isSafeRegularFile(_ url: URL) -> Bool {

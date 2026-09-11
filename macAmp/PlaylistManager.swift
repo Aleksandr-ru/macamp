@@ -19,17 +19,21 @@ final class PlaylistEntry: ObservableObject, Identifiable {
     @Published var trackTitle: String?
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
+    /// Numeric POPM value, not the five-star presentation value. Zero means no
+    /// usable macAmp POPM record is available for this file.
+    @Published var rating: UInt8 = 0
     /// Runtime-only result of an unsuccessful read/playback attempt.  This is
     /// deliberately absent from StoredEntry: a fresh launch retries files.
     @Published var hasPlaybackError = false
 
     init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil,
-         artist: String? = nil, trackTitle: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false) {
+         artist: String? = nil, trackTitle: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false,
+         rating: UInt8 = 0) {
         self.id = id; self.url = url; self.title = title ?? url.deletingPathExtension().lastPathComponent
         self.artist = artist
         self.trackTitle = trackTitle
         self.bookmarkData = bookmarkData
-        self.duration = duration; self.metadataIsAvailable = metadataIsAvailable
+        self.duration = duration; self.metadataIsAvailable = metadataIsAvailable; self.rating = rating
     }
 }
 
@@ -72,11 +76,14 @@ final class PlaylistModel: ObservableObject, Identifiable {
     @Published var scannerState: ScannerState = .idle
     @Published var sortingProgress: SortingProgress?
     @Published var isDirty = false
+    @Published var automaticRatingEnabled: Bool
     var fileURL: URL?
     private var cachedTotalDuration: TimeInterval
 
-    init(id: UUID = UUID(), name: String = "New Playlist", entries: [PlaylistEntry] = [], fileURL: URL? = nil) {
+    init(id: UUID = UUID(), name: String = "New Playlist", entries: [PlaylistEntry] = [], fileURL: URL? = nil,
+         automaticRatingEnabled: Bool = RatingPreferences.shared.enableForAllPlaylists) {
         self.id = id; self.name = name; self.entries = entries; self.fileURL = fileURL
+        self.automaticRatingEnabled = automaticRatingEnabled
         cachedTotalDuration = entries.compactMap(\.duration).reduce(0, +)
     }
     var totalDuration: TimeInterval { cachedTotalDuration }
@@ -299,6 +306,12 @@ final class PlaylistManager: ObservableObject {
     }
 
     var activePlaylist: PlaylistModel? { playlists.first { $0.id == activePlaylistID } ?? playlists.first }
+    func setAutomaticRating(_ enabled: Bool, for playlist: PlaylistModel) {
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
+        playlist.automaticRatingEnabled = enabled
+        mainSnapshotNeedsRewrite = true
+        save()
+    }
     var editingPlaylist: PlaylistModel? { playlists.first { $0.id == focusedPlaylistID } ?? activePlaylist }
     func playlist(id: UUID) -> PlaylistModel? { playlists.first { $0.id == id } }
     func isOpenPlaylist(at url: URL) -> Bool {
@@ -1572,7 +1585,7 @@ final class PlaylistManager: ObservableObject {
             return
         }
 
-        let result: (duration: TimeInterval?, artist: String?, title: String?, available: Bool) = autoreleasepool {
+        let result: (duration: TimeInterval?, artist: String?, title: String?, rating: UInt8, available: Bool) = autoreleasepool {
             let asset = AVURLAsset(url: work.entry.url)
             metadataAssetLock.lock()
             loadingMetadataAssets[work.entry.id] = asset
@@ -1589,15 +1602,16 @@ final class PlaylistManager: ObservableObject {
                     didLoad = true
                     break
                 }
-                if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, nil, false) }
+                if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, nil, 0, false) }
             }
-            guard didLoad else { return (nil, nil, nil, false) }
+            guard didLoad else { return (nil, nil, nil, 0, false) }
             var error: NSError?
-            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, false) }
+            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, 0, false) }
             let duration = asset.duration.seconds
             let artist = asset.commonMetadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
             let title = asset.commonMetadata.first(where: { $0.commonKey?.rawValue == "title" })?.stringValue
-            return (duration.isFinite && duration > 0 ? duration : nil, artist, title, true)
+            let rating = TrackRatingStore.readOrInitialize(url: work.entry.url, allowWrite: true)?.rating ?? 0
+            return (duration.isFinite && duration > 0 ? duration : nil, artist, title, rating, true)
         }
         let applyResult = DispatchWorkItem { [self] in
             metadataAssetLock.lock()
@@ -1612,6 +1626,7 @@ final class PlaylistManager: ObservableObject {
             guard !wasCancelled, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, !work.entry.metadataIsAvailable else { return }
             let previousDuration = work.entry.duration
             work.entry.duration = result.duration
+            work.entry.rating = result.rating
             owner.replaceTotalDuration(previousDuration, with: result.duration)
             let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
             let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1711,12 +1726,13 @@ final class PlaylistManager: ObservableObject {
         var selection: [UUID]?
         var scrollPosition: Int?
         var lastPlayedEntryID: UUID?
+        var automaticRatingEnabled: Bool?
     }
 
     private struct StoredEntry: Codable {
         var id: UUID; var url: URL; var bookmark: Data?; var title: String
         var artist: String?; var trackTitle: String?
-        var duration: TimeInterval?; var metadata: Bool
+        var duration: TimeInterval?; var metadata: Bool; var rating: UInt8?
     }
 
     private func markEntriesDirty(in playlist: PlaylistModel) {
@@ -1795,7 +1811,8 @@ final class PlaylistManager: ObservableObject {
                     unshadedHeight: playlist.unshadedWindowHeight.map(Double.init),
                     selection: Array(playlist.selectedIDs),
                     scrollPosition: playlist.scrollPosition,
-                    lastPlayedEntryID: playlist.lastPlayedEntryID
+                    lastPlayedEntryID: playlist.lastPlayedEntryID,
+                    automaticRatingEnabled: playlist.automaticRatingEnabled
                 )
             }
             let snapshot = Snapshot(
@@ -1861,10 +1878,12 @@ final class PlaylistManager: ObservableObject {
                     artist: storedEntry.artist,
                     trackTitle: storedEntry.trackTitle,
                     duration: storedEntry.duration,
-                    metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata
+                    metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata,
+                    rating: storedEntry.rating ?? 0
                 )
             }
-            let model = PlaylistModel(id: playlist.id, name: playlist.name, entries: entries, fileURL: playlist.fileURL)
+            let model = PlaylistModel(id: playlist.id, name: playlist.name, entries: entries, fileURL: playlist.fileURL,
+                                      automaticRatingEnabled: playlist.automaticRatingEnabled ?? RatingPreferences.shared.enableForAllPlaylists)
             model.isVisible = playlist.visible
             model.isWindowShaded = playlist.shaded
             model.windowFrame = playlist.frame
@@ -1900,7 +1919,7 @@ final class PlaylistManager: ObservableObject {
             artist: entry.artist,
             trackTitle: entry.trackTitle,
             duration: entry.duration,
-            metadata: entry.metadataIsAvailable
+            metadata: entry.metadataIsAvailable, rating: entry.rating
         )
     }
 

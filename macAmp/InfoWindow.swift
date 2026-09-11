@@ -96,6 +96,22 @@ final class InfoWindowModel: ObservableObject {
     /// window never keeps showing the old values.
     func reload(_ url: URL?) { show(url, metadataDelay: 0, force: true) }
 
+    /// Applies a rating that was just persisted by the caller. The value is
+    /// already authoritative in memory, so refreshing the complete metadata
+    /// document here would add needless disk I/O and could briefly regress the
+    /// display while AVFoundation returns a stale metadata snapshot.
+    func applyKnownRating(_ value: UInt8, for url: URL) {
+        guard let currentURL = content.url,
+              currentURL.standardizedFileURL.resolvingSymlinksInPath()
+                == url.standardizedFileURL.resolvingSymlinksInPath() else { return }
+        // Invalidate an in-flight AVFoundation read so an older snapshot cannot
+        // overwrite the value that was just written successfully.
+        generation = UUID()
+        var updated = content
+        updated.rating = TrackRating.stars(for: value)
+        content = updated
+    }
+
     /// Metadata/APIC extraction often performs another long sequential read of
     /// a network file. Let the audio renderer establish its buffer first.
     func showForPlayback(_ url: URL?) { show(url, metadataDelay: 2) }
@@ -194,14 +210,16 @@ final class InfoWindowModel: ObservableObject {
             ?? metadata.first(where: { $0.commonKey == .commonKeyArtwork })?.dataValue {
             result.artwork = NSImage(data: artworkData)
         }
-        if let popularity = id3("POPM") {
+        if let ownRating = TrackRatingStore.readOrInitialize(url: url, allowWrite: false) {
+            result.rating = TrackRating.stars(for: ownRating.rating)
+        } else if let popularity = id3("POPM") {
             let byte: Int?
             if let data = popularity.dataValue, let separator = data.firstIndex(of: 0), separator + 1 < data.endIndex {
                 byte = Int(data[data.index(after: separator)])
             } else {
                 byte = popularity.numberValue?.intValue
             }
-            if let byte { result.rating = min(5, max(0, Int((Double(byte) * 5 / 255).rounded()))) }
+            if let byte { result.rating = TrackRating.stars(for: UInt8(min(255, max(0, byte)))) }
         }
 
         var technical: [String] = []
@@ -523,7 +541,10 @@ final class InfoPanelView: NSView {
         copySummary()
     }
 
-    @objc private func rateItems(_ sender: NSMenuItem) {}
+    @objc private func rateItems(_ sender: NSMenuItem) {
+        let stars = PlaylistRatingMenu.titles.firstIndex(of: sender.title).map { 5 - $0 } ?? 0
+        if let url = model.content.url { AppDelegate.shared?.setManualRating(stars: stars, for: url) }
+    }
 
     private var summaryText: String {
         let content = model.content

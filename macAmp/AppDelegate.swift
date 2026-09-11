@@ -12,6 +12,7 @@ import Combine
 import UniformTypeIdentifiers
 import MediaPlayer
 import QuartzCore
+import os
 
 /// AppKit has no built-in equivalents of the classic move and diagonal resize
 /// cursors on all supported macOS versions. Render those shapes consistently
@@ -319,6 +320,32 @@ final class SettingsWindowState: ObservableObject {
     @Published var isVisible = false
 }
 
+enum RatingAdaptationPeriod: Int, CaseIterable, Identifiable {
+    case fast = 10, medium = 30, slow = 100, verySlow = 250
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .fast: return "Fast adaptation — 10 plays"
+        case .medium: return "Medium adaptation — 30 plays"
+        case .slow: return "Slow adaptation — 100 plays"
+        case .verySlow: return "Very slow adaptation — 250 plays"
+        }
+    }
+}
+
+final class RatingPreferences: ObservableObject {
+    static let shared = RatingPreferences()
+    private enum Key { static let showStars = "macAmp.rating.showStars"; static let enableAll = "macAmp.rating.enableAll"; static let period = "macAmp.rating.adaptationPeriod" }
+    @Published var showsStars: Bool { didSet { UserDefaults.standard.set(showsStars, forKey: Key.showStars) } }
+    @Published var enableForAllPlaylists: Bool { didSet { UserDefaults.standard.set(enableForAllPlaylists, forKey: Key.enableAll) } }
+    @Published var adaptationPeriod: RatingAdaptationPeriod { didSet { UserDefaults.standard.set(adaptationPeriod.rawValue, forKey: Key.period) } }
+    private init() {
+        showsStars = UserDefaults.standard.bool(forKey: Key.showStars)
+        enableForAllPlaylists = UserDefaults.standard.bool(forKey: Key.enableAll)
+        adaptationPeriod = RatingAdaptationPeriod(rawValue: UserDefaults.standard.object(forKey: Key.period) as? Int ?? 30) ?? .medium
+    }
+}
+
 final class EqualizerFocusState: ObservableObject { @Published var isKey = false }
 final class EqualizerShadeState: ObservableObject { @Published var isEnabled = false }
 final class PlaylistFocusState: ObservableObject { @Published var isKey = false }
@@ -511,6 +538,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let playlistShade = PlaylistShadeState()
     private let playlistLayout = PlaylistLayout()
     private let playback = PlaybackController()
+    private struct PlaybackRatingEvent { let playlistID: UUID; let entryID: UUID; var invalidated = false }
+    private var playbackRatingEvent: PlaybackRatingEvent?
     private let trackNotifications = TrackNotificationController()
     private let statusBarPreferences = StatusBarPreferences()
     private var statusItem: NSStatusItem?
@@ -623,6 +652,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         restorePersistentState()
         playback.onTrackFinished = { [weak self] in
             guard let self else { return }
+            self.evaluateAutomaticRating(completed: true)
             if self.standalonePlaybackURL != nil {
                 self.standalonePlaybackURL = nil
                 self.stopPlayback()
@@ -2008,6 +2038,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func pausePlayback() { resetInfoTarget(); playback.pause() }
     func stopPlayback() {
+        invalidateAutomaticRatingEvent()
         standalonePlaybackURL = nil
         resetInfoTarget()
         pendingTrackNotification = nil
@@ -2390,6 +2421,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let playlist = playlistManager.activePlaylist else { return }
         switch index {
         case 0:
+            invalidateAutomaticRatingEvent()
             if playback.shuffleMode != .off {
                 if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: -1) {
                     playPlaylistEntry(next.entry, in: next.playlist)
@@ -2402,6 +2434,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case 2: pausePlayback()
         case 3: stopPlayback()
         case 4:
+            evaluateAutomaticRating(completed: false)
             if playback.shuffleMode != .off {
                 if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: 1) {
                     playPlaylistEntry(next.entry, in: next.playlist)
@@ -2419,6 +2452,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Error-marked rows are retried only through a direct double-click in
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
+        if !automatic { evaluateAutomaticRating(completed: false) }
         standalonePlaybackURL = nil
         // Transport commands must not disturb a list the user is already
         // reading. Centre only when the newly playing row is outside its
@@ -2427,6 +2461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry, automatic: automatic)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
     }
@@ -2442,10 +2477,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A direct row activation is the sole retry route for a failed item.
         // Keep its marker until PlaybackController confirms it opened.
         standalonePlaybackURL = nil
+        evaluateAutomaticRating(completed: false)
         let shouldReveal = revealIfNotVisible && !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry, automatic: false)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
     }
@@ -2471,7 +2508,78 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func seekPlayback(to position: TimeInterval) {
         resetInfoTarget()
+        invalidateAutomaticRatingEvent()
         playback.seek(to: position)
+    }
+
+    func toggleAutomaticRating(for playlist: PlaylistModel) {
+        playlistManager.setAutomaticRating(!playlist.automaticRatingEnabled, for: playlist)
+    }
+
+    private func invalidateAutomaticRatingEvent() { playbackRatingEvent?.invalidated = true }
+
+    private func evaluateAutomaticRating(completed: Bool) {
+        guard let event = playbackRatingEvent, !event.invalidated,
+              let playlist = playlistManager.playlist(id: event.playlistID), playlist.automaticRatingEnabled,
+              let entry = playlist.entries.first(where: { $0.id == event.entryID }),
+              let old = TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: true), old.rating > 0 else { return }
+        let fraction = completed ? 1.0 : min(1, max(0, playback.duration > 0 ? playback.position / playback.duration : 0))
+        let factor = fraction < 0.5 ? 1 - 2 * fraction : 2 * fraction - 1
+        let delta = max(1, Int((Double(RatingPreferences.shared.adaptationPeriod.rawValue) * factor / (Double(old.counter) + 1)).rounded()))
+        let signed = fraction < 0.5 ? -delta : delta
+        let next = TrackRating(rating: UInt8(min(255, max(1, Int(old.rating) + signed))), counter: old.counter == UInt32.max ? old.counter : old.counter + 1)
+        do {
+            try TrackRatingStore.write(next, to: entry.url)
+            updateRating(next.rating, for: entry.url)
+        } catch {
+            Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "automatic-rating").error("Automatic rating write failed; path=\(entry.url.path, privacy: .public); error=\(error.localizedDescription, privacy: .public)")
+        }
+        playbackRatingEvent = nil
+    }
+
+    func setManualRating(stars: Int, for playlist: PlaylistModel) {
+        let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
+        for entry in playlist.entries where playlist.selectedIDs.contains(entry.id) {
+            do { try TrackRatingStore.write(TrackRating(rating: value, counter: TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: false)?.counter ?? 0), to: entry.url); updateRating(value, for: entry.url) }
+            catch { presentRatingWriteError(error) }
+        }
+    }
+
+    func setManualRating(stars: Int, for url: URL) {
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard let playlist = playlistManager.playlists.first(where: {
+            $0.entries.contains { $0.url.standardizedFileURL.resolvingSymlinksInPath() == canonical }
+        }) else {
+            let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
+            do {
+                let counter = TrackRatingStore.readOrInitialize(url: url, allowWrite: false)?.counter ?? 0
+                try TrackRatingStore.write(TrackRating(rating: value, counter: counter), to: url)
+                infoModel.applyKnownRating(value, for: url)
+            } catch { presentRatingWriteError(error) }
+            return
+        }
+        let previous = playlist.selectedIDs
+        playlist.selectedIDs = Set(playlist.entries.filter { $0.url.standardizedFileURL.resolvingSymlinksInPath() == canonical }.map(\.id))
+        setManualRating(stars: stars, for: playlist)
+        playlist.selectedIDs = previous
+    }
+
+    private func updateRating(_ rating: UInt8, for url: URL) {
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        for list in playlistManager.playlists {
+            for item in list.entries where item.url.standardizedFileURL.resolvingSymlinksInPath() == canonical {
+                item.rating = rating
+            }
+        }
+        if let infoURL = infoModel.content.url,
+           infoURL.standardizedFileURL.resolvingSymlinksInPath() == canonical {
+            infoModel.applyKnownRating(rating, for: infoURL)
+        }
+    }
+
+    private func presentRatingWriteError(_ error: Error) {
+        Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "automatic-rating").error("Manual rating write failed: \(error.localizedDescription, privacy: .public)")
+        let alert = NSAlert(); alert.messageText = "Could not save rating"; alert.informativeText = error.localizedDescription; alert.runModal()
     }
 
     /// Main Play never opens a file picker.  A playlist is the playback
@@ -4133,6 +4241,7 @@ private struct SettingsView: View {
     @ObservedObject var skin: WinampSkinStore
     @ObservedObject var statusBarPreferences: StatusBarPreferences
     @ObservedObject var outputDevices: AudioOutputDeviceManager
+    @ObservedObject private var ratingPreferences = RatingPreferences.shared
     @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
     @State private var selectedTab: Tab = .general
 
@@ -4176,6 +4285,18 @@ private struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     SettingsSlider(title: "Scale", value: $interfaceScale.percent, range: 100...300, step: 10, valueText: "\(Int(interfaceScale.percent))%")
                     SettingsSlider(title: "Playlist font", value: $playlistFontScale.percent, range: 100...200, step: 10, valueText: "\(Int(playlistFontScale.percent))%")
+                }
+            }
+
+            SettingsGroup(title: "Rating") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Show rating stars in playlist", isOn: $ratingPreferences.showsStars)
+                    Toggle("Enable automatic rating for all playlists", isOn: $ratingPreferences.enableForAllPlaylists)
+                    Picker("Rating adaptation period", selection: $ratingPreferences.adaptationPeriod) {
+                        ForEach(RatingAdaptationPeriod.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
                 }
             }
 
@@ -4589,6 +4710,7 @@ private struct SkinInformationView: View {
 /// PlaylistModel and its independent window context.
 private struct PlaylistView: View {
     @ObservedObject private var skin = WinampSkinStore.shared
+    @ObservedObject private var ratingPreferences = RatingPreferences.shared
     @ObservedObject var interfaceScale: InterfaceScale
     @ObservedObject var fontScale: PlaylistFontScale
     @ObservedObject var focus: PlaylistFocusState
@@ -4739,6 +4861,7 @@ private struct PlaylistView: View {
                 x: 112,
                 index: 3,
                 titles: [
+                    "Automatic rating",
                     "File Info", "Edit metadata", "Reveal in Finder",
                     "Sort by title", "Sort by artist/album/track number",
                     "Sort by file name", "Sort by path + file name", "Reverse",
@@ -4748,7 +4871,7 @@ private struct PlaylistView: View {
                     "Edit metadata": .shiftE,
                     "Rebuild titles on selection": .commandOptionE
                 ],
-                separatorsBefore: ["Sort by title", "Rebuild titles on selection"]
+                separatorsBefore: ["File Info", "Sort by title", "Rebuild titles on selection"]
             )
             playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
                 "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
@@ -4906,7 +5029,9 @@ private struct PlaylistView: View {
                 entryHeight: entryHeight,
                 font: Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))),
                 foregroundColor: playlistColor(isPlayingEntry ? colors.currentText : colors.normalText),
-                backgroundColor: playlistColor(isSelected ? colors.selectedBackground : colors.background)
+                backgroundColor: playlistColor(isSelected ? colors.selectedBackground : colors.background),
+                showsRating: ratingPreferences.showsStars,
+                ratingFont: Font(skin.resolvedFont(ofSize: CGFloat(12 * fontScale.factor)))
             )
 
             PlaylistRowInteractionArea(
@@ -4936,7 +5061,9 @@ private struct PlaylistView: View {
     /// Leave the original 13-pixel row untouched at 100%; larger text gains
     /// matching line height so the glyphs never overlap or get clipped.
     private var playlistEntryHeight: CGFloat {
-        let fontHeight = skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)).boundingRectForFont.height
+        let rowFontHeight = skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)).boundingRectForFont.height
+        let ratingFontHeight = skin.resolvedFont(ofSize: CGFloat(12 * fontScale.factor)).boundingRectForFont.height
+        let fontHeight = max(rowFontHeight, ratingFontHeight)
         return max(13, ceil(fontHeight + 3))
     }
 
@@ -5025,11 +5152,20 @@ private struct PlaylistEntryContent: View {
     let font: Font
     let foregroundColor: Color
     let backgroundColor: Color
+    let showsRating: Bool
+    let ratingFont: Font
 
     var body: some View {
-        HStack(spacing: 3) {
+        HStack(alignment: .center, spacing: 3) {
             Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
             Spacer(minLength: 2)
+            if showsRating, entry.rating > 0 {
+                Text(String(repeating: "★", count: TrackRating.stars(for: entry.rating)))
+                    .font(ratingFont)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(minHeight: entryHeight, alignment: .center)
+                    .offset(y: -1)
+            }
             Text(entry.duration.map(Self.formattedTime) ?? "--:--")
         }
         .font(font)
@@ -5371,7 +5507,10 @@ private final class PlaylistContextMenuTarget: NSObject {
         AppDelegate.shared?.showTagEditor(for: playlist, entry: entry)
     }
     @objc func viewInfo(_ sender: NSMenuItem) { AppDelegate.shared?.showFileInfo(for: playlist) }
-    @objc func rateItems(_ sender: NSMenuItem) {}
+    @objc func rateItems(_ sender: NSMenuItem) {
+        let stars = PlaylistRatingMenu.titles.firstIndex(of: sender.title).map { 5 - $0 } ?? 0
+        AppDelegate.shared?.setManualRating(stars: stars, for: playlist)
+    }
     @objc func revealInFinder(_ sender: NSMenuItem) { AppDelegate.shared?.revealInFinder(url: entry.url) }
 }
 
@@ -5447,6 +5586,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
             )
             item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
+            if title == "Automatic rating" { item.state = playlist?.automaticRatingEnabled == true ? .on : .off }
             if let playlist {
                 if playlist.sortingProgress != nil {
                     item.isEnabled = false
@@ -5479,6 +5619,8 @@ private final class PlaylistMenuHotspotNSView: NSView {
     @objc private func selectMenuItem(_ sender: NSMenuItem) {
         switch sender.title {
         case "Add Files…": AppDelegate.shared?.addFilesToActivePlaylist()
+        case "Automatic rating":
+            if let playlist { AppDelegate.shared?.toggleAutomaticRating(for: playlist) }
         case "Add Folder…": AppDelegate.shared?.addFolderToActivePlaylist()
         case "Remove Selected": AppDelegate.shared?.removeSelectedFromActivePlaylist()
         case "Remove with Error": AppDelegate.shared?.removePlaybackErrorEntriesFromActivePlaylist()
