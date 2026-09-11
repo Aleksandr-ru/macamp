@@ -2752,6 +2752,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func selectAllInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectAll(in: playlist) } }
     func selectNoneInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.selectNone(in: playlist) } }
     func invertSelectionInActivePlaylist() { if let playlist = playlistManager.editingPlaylist { playlistManager.invertSelection(in: playlist) } }
+    func selectPlaylistEntriesByRating(_ stars: Int, in playlist: PlaylistModel) {
+        playlistManager.selectByRating(stars, in: playlist)
+    }
 
     func canSort(_ playlist: PlaylistModel, by option: PlaylistManager.SortOption) -> Bool {
         playlistManager.canSort(option, in: playlist)
@@ -4920,7 +4923,7 @@ private struct PlaylistView: View {
                 "Remove Selected": .delete,
                 "Remove with Error": .optionDelete
             ])
-            playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select None", "Invert Selection"], shortcuts: [
+            playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select by rating", "Select None", "Invert Selection"], shortcuts: [
                 "Select All": .commandA
             ])
             playlistMenuHotspot(
@@ -5649,6 +5652,25 @@ private final class PlaylistMenuHotspotNSView: NSView {
         let menu = NSMenu()
         for title in titles {
             if separatorsBefore.contains(title) { menu.addItem(.separator()) }
+            if title == "Select by rating" {
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                let submenu = NSMenu(title: title)
+                for ratingTitle in PlaylistRatingMenu.titles {
+                    let ratingItem = NSMenuItem(title: ratingTitle,
+                                                action: #selector(selectRatingMenuItem(_:)),
+                                                keyEquivalent: "")
+                    ratingItem.target = self
+                    if let index = PlaylistRatingMenu.titles.firstIndex(of: ratingTitle) {
+                        ratingItem.representedObject = NSNumber(value: 5 - index)
+                    }
+                    submenu.addItem(ratingItem)
+                }
+                item.submenu = submenu
+                item.target = self
+                if playlist?.sortingProgress != nil { item.isEnabled = false }
+                menu.addItem(item)
+                continue
+            }
             let shortcut = shortcuts[title]
             let item = NSMenuItem(
                 title: title,
@@ -5685,6 +5707,12 @@ private final class PlaylistMenuHotspotNSView: NSView {
         }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
         isPressed = false
+    }
+
+    @objc private func selectRatingMenuItem(_ sender: NSMenuItem) {
+        guard let playlist,
+              let value = sender.representedObject as? NSNumber else { return }
+        AppDelegate.shared?.selectPlaylistEntriesByRating(value.intValue, in: playlist)
     }
 
     @objc private func selectMenuItem(_ sender: NSMenuItem) {

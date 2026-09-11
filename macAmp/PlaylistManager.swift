@@ -1281,6 +1281,15 @@ final class PlaylistManager: ObservableObject {
     func selectNone(in playlist: PlaylistModel) { playlist.selectedIDs.removeAll(); save() }
     func invertSelection(in playlist: PlaylistModel) { playlist.selectedIDs = Set(playlist.entries.map(\.id)).subtracting(playlist.selectedIDs); save() }
 
+    func selectByRating(_ stars: Int, in playlist: PlaylistModel) {
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
+        playlist.selectedIDs = Set(playlist.entries.filter {
+            TrackRating.stars(for: $0.rating) == max(0, min(5, stars))
+        }.map(\.id))
+        playlist.selectionAnchorID = nil
+        save()
+    }
+
     /// Dragging a selected row carries the complete selection in playlist order.
     /// Starting a drag from an unselected row keeps the native list behaviour
     /// useful by carrying that row alone.
