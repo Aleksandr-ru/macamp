@@ -482,6 +482,21 @@ final class InfoPanelView: NSView {
             } else {
                 y += imageHeight + spacing
             }
+        } else if usesTwoColumnLayout {
+            // Keep the left column visually occupied when a local file or a
+            // stream has no artwork. The placeholder uses the same size cap
+            // as real artwork so the two-column layout remains balanced.
+            let minimumWindowArtworkWidth = max(1, CGFloat(skin.genericMinimumWindowWidth(title: "Info") - 35) * pixelScale)
+            let placeholderSize = min(columnWidth, minimumWindowArtworkWidth)
+            let placeholder = InfoArtworkPlaceholderView()
+            placeholder.frame = NSRect(
+                x: leftColumnX + (columnWidth - placeholderSize) * 0.5,
+                y: y,
+                width: placeholderSize,
+                height: placeholderSize
+            )
+            documentView.addSubview(placeholder)
+            leftArtworkHeight = placeholderSize
         }
 
         // Showing a stored rating is independent from whether this file can
@@ -731,6 +746,28 @@ private final class InfoArtworkView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.current?.imageInterpolation = .high
         image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1)
+    }
+}
+
+private final class InfoArtworkPlaceholderView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let coverColor = NSColor(calibratedRed: 0.055, green: 0.065, blue: 0.075, alpha: 1)
+        let noteColor = NSColor(calibratedRed: 0.22, green: 0.24, blue: 0.26, alpha: 1)
+        coverColor.setFill()
+        NSBezierPath(rect: bounds).fill()
+
+        let side = min(bounds.width, bounds.height)
+        let noteFont = NSFont.systemFont(ofSize: max(12, floor(side * 0.44)), weight: .regular)
+        let note = "♫" as NSString
+        let noteSize = note.size(withAttributes: [.font: noteFont])
+        let noteOrigin = NSPoint(
+            x: bounds.midX - noteSize.width * 0.5,
+            y: bounds.midY - noteSize.height * 0.5 - noteSize.height * 0.04
+        )
+        note.draw(at: noteOrigin, withAttributes: [
+            .font: noteFont,
+            .foregroundColor: noteColor
+        ])
     }
 }
 
