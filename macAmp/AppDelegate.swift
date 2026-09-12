@@ -673,6 +673,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         playback.onStreamMetadata = { [weak self] url, title in
             self?.playlistManager.updateStreamMetadata(title, for: url)
+            self?.infoModel.updateStreamMetadata(title, for: url)
         }
         playback.onPlaybackReady = { [weak self] url in
             guard let self else { return }
@@ -1011,7 +1012,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let stars = ratingShortcutValue(for: event.keyCode) else { return false }
 
         if sourceWindow === infoWindow {
-            guard let url = infoModel.content.url else { return true }
+            guard let url = infoModel.content.url, infoModel.content.canSetRating else { return true }
             setManualRating(stars: stars, for: url)
             return true
         }
@@ -2568,7 +2569,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func observePlayingEntryTitle(_ entry: PlaylistEntry) {
         playingEntryTitleCancellable = entry.$title
             .removeDuplicates()
-            .sink { [weak self] title in self?.playback.updateDisplayTitle(title) }
+            .sink { [weak self] title in
+                self?.playback.updateDisplayTitle(title)
+                if !entry.url.isFileURL {
+                    self?.infoModel.updateStreamMetadata(title, for: entry.url)
+                }
+            }
     }
 
     func seekPlayback(to position: TimeInterval) {
@@ -2578,6 +2584,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func toggleAutomaticRating(for playlist: PlaylistModel) {
+        guard canUseAutomaticRating(for: playlist) else { return }
         playlistManager.setAutomaticRating(!playlist.automaticRatingEnabled, for: playlist)
     }
 
@@ -2608,13 +2615,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func setManualRating(stars: Int, for playlist: PlaylistModel, entryIDs: Set<UUID>) {
         let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
-        for entry in playlist.entries where entryIDs.contains(entry.id) {
+        for entry in playlist.entries where entryIDs.contains(entry.id)
+            && entry.url.isFileURL && !entry.url.path.isEmpty {
             do { try TrackRatingStore.write(TrackRating(rating: value, counter: TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: false)?.counter ?? 0), to: entry.url); updateRating(value, for: entry.url) }
             catch { presentRatingWriteError(error) }
         }
     }
 
     func setManualRating(stars: Int, for url: URL) {
+        guard url.isFileURL, !url.path.isEmpty else { return }
         let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
         guard let playlist = playlistManager.playlists.first(where: {
             $0.entries.contains { $0.url.standardizedFileURL.resolvingSymlinksInPath() == canonical }
@@ -2808,6 +2817,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playlistManager.canRebuildTitles(in: playlist)
     }
 
+    func canUseAutomaticRating(for playlist: PlaylistModel) -> Bool {
+        playlist.entries.contains { entry in
+            entry.url.isFileURL
+                && !entry.url.path.isEmpty
+                && entry.url.pathExtension.lowercased() == "mp3"
+        }
+    }
+
     func rebuildTitles(for playlist: PlaylistModel) {
         playlistManager.rebuildTitlesForSelection(in: playlist)
     }
@@ -2987,13 +3004,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func revealInFinderTarget(for playlist: PlaylistModel) -> URL? {
         let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
         guard selectedEntries.count <= 1 else { return nil }
-        if let selected = selectedEntries.first { return selected.url }
+        if let selected = selectedEntries.first {
+            return selected.url.isFileURL && !selected.url.path.isEmpty ? selected.url : nil
+        }
 
-        if let currentURL = playback.currentURL { return currentURL }
+        if let currentURL = playback.currentURL,
+           currentURL.isFileURL, !currentURL.path.isEmpty { return currentURL }
         if let activePlaylist = playlistManager.activePlaylist,
            let playingEntryID = playlistManager.playingEntryID,
            let playingEntry = activePlaylist.entries.first(where: { $0.id == playingEntryID }) {
-            return playingEntry.url
+            return playingEntry.url.isFileURL && !playingEntry.url.path.isEmpty ? playingEntry.url : nil
         }
         return nil
     }
@@ -5468,6 +5488,8 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
         edit.keyEquivalentModifierMask = [.shift]
         edit.isEnabled = hasExactlyOneSelectedEntry(in: playlist)
             && playlist.selectedIDs.contains(entry.id)
+            && entry.url.isFileURL
+            && !entry.url.path.isEmpty
         menu.addItem(edit)
         let viewInfo = contextItem("View file info", action: #selector(PlaylistContextMenuTarget.viewInfo(_:)), target: target)
         viewInfo.isEnabled = playlist.selectedIDs.count <= 1
@@ -5485,6 +5507,9 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
             rateMenu.addItem(item)
         }
         rate.submenu = rateMenu
+        let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        rate.isEnabled = !selectedEntries.isEmpty
+            && selectedEntries.allSatisfy { $0.url.isFileURL && !$0.url.path.isEmpty }
         menu.addItem(rate)
         menu.addItem(.separator())
         let reveal = contextItem("Reveal in Finder", action: #selector(PlaylistContextMenuTarget.revealInFinder(_:)), target: target)
@@ -5719,16 +5744,25 @@ private final class PlaylistMenuHotspotNSView: NSView {
             )
             item.keyEquivalentModifierMask = shortcut?.modifierFlags ?? []
             item.target = self
-            if title == "Automatic rating" { item.state = playlist?.automaticRatingEnabled == true ? .on : .off }
+            if title == "Automatic rating" {
+                item.state = playlist?.automaticRatingEnabled == true ? .on : .off
+            }
             if let playlist {
                 if playlist.sortingProgress != nil {
                     item.isEnabled = false
+                } else if title == "Automatic rating" {
+                    if let appDelegate = AppDelegate.shared {
+                        item.isEnabled = appDelegate.canUseAutomaticRating(for: playlist)
+                    }
                 } else if title == "File Info" {
                     if let appDelegate = AppDelegate.shared {
                         item.isEnabled = appDelegate.fileInfoTarget(for: playlist) != nil
                     }
                 } else if title == "Edit metadata" {
+                    let selectedEntry = playlist.entries.first { playlist.selectedIDs.contains($0.id) }
                     item.isEnabled = hasExactlyOneSelectedEntry(in: playlist)
+                        && selectedEntry?.url.isFileURL == true
+                        && selectedEntry?.url.path.isEmpty == false
                 } else if title == "Reveal in Finder" {
                     if let appDelegate = AppDelegate.shared {
                         item.isEnabled = appDelegate.revealInFinderTarget(for: playlist) != nil

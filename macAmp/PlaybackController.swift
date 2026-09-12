@@ -557,7 +557,7 @@ final class AudioOutputDeviceManager: ObservableObject {
     }
 }
 
-final class PlaybackController: NSObject, ObservableObject {
+final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadataOutputPushDelegate {
     var onTrackFinished: (() -> Void)?
     /// These callbacks identify the source rather than relying on a global UI
     /// flag, so PlaylistManager can update only the entry being attempted.
@@ -634,6 +634,7 @@ final class PlaybackController: NSObject, ObservableObject {
     /// visualizer (or AUTO EQ) actually needs it.
     private var streamingAudioTrack: AVAssetTrack?
     private var streamingStatusObservation: NSKeyValueObservation?
+    private var streamingMetadataOutput: AVPlayerItemMetadataOutput?
     private var streamingHasReportedReady = false
     private var streamingEndObserver: Any?
     private var streamingTimeObserver: Any?
@@ -1341,6 +1342,9 @@ final class PlaybackController: NSObject, ObservableObject {
                 $0 > 0 ? Int(($0 / 1_000).rounded()) : nil
             }
             let item = AVPlayerItem(asset: asset)
+            let metadataOutput = AVPlayerItemMetadataOutput(identifiers: nil)
+            metadataOutput.setDelegate(self, queue: .main)
+            item.add(metadataOutput)
             DispatchQueue.main.async {
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else {
@@ -1352,6 +1356,7 @@ final class PlaybackController: NSObject, ObservableObject {
                 player.audioOutputDeviceUniqueID = self.outputDeviceManager.selectedDeviceUID
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
+                self.streamingMetadataOutput = metadataOutput
                 self.bitrateKbps = bitrateKbps
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
@@ -1431,6 +1436,7 @@ final class PlaybackController: NSObject, ObservableObject {
         streamingStatusObservation?.invalidate(); streamingStatusObservation = nil
         streamingPlayer?.pause(); streamingPlayer = nil
         streamingAudioTrack = nil
+        streamingMetadataOutput = nil
         isStreamingAnalysisTapInstalled = false
         streamingOpenGeneration = nil
         streamingHasReportedReady = false
@@ -1460,6 +1466,34 @@ final class PlaybackController: NSObject, ObservableObject {
         let mix = AVMutableAudioMix()
         mix.inputParameters = [parameters]
         return mix
+    }
+
+    func metadataOutput(
+        _ output: AVPlayerItemMetadataOutput,
+        didOutputTimedMetadataGroups groups: [AVTimedMetadataGroup],
+        from track: AVPlayerItemTrack?
+    ) {
+        guard output === streamingMetadataOutput,
+              let url = scopedURL,
+              let title = streamMetadataTitle(from: groups) else { return }
+        onStreamMetadata?(url, title)
+    }
+
+    private func streamMetadataTitle(from groups: [AVTimedMetadataGroup]) -> String? {
+        let items = groups.flatMap(\.items)
+        for item in items {
+            guard let value = item.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { continue }
+            let key = (item.key as? String)?.lowercased() ?? ""
+            let identifier = item.identifier?.rawValue.lowercased() ?? ""
+            let isTitle = item.commonKey == .commonKeyTitle
+                || key.contains("streamtitle")
+                || identifier.contains("streamtitle")
+                || key == "title"
+                || identifier.hasSuffix("/title")
+            if isTitle { return value }
+        }
+        return nil
     }
 
     /// Called on AVPlayer's real-time audio thread. It only retains the newest

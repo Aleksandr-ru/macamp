@@ -846,7 +846,9 @@ final class PlaylistManager: ObservableObject {
               !playlist.selectedIDs.isEmpty,
               playlist.sortingProgress == nil,
               !isLoadingEntries(playlist) else { return false }
-        return playlist.entries.contains { playlist.selectedIDs.contains($0.id) }
+        let selectedEntries = playlist.entries.filter { playlist.selectedIDs.contains($0.id) }
+        return !selectedEntries.isEmpty
+            && selectedEntries.allSatisfy { $0.url.isFileURL && !$0.url.path.isEmpty }
     }
 
     /// Invalidates the selected rows and sends them through the same serial

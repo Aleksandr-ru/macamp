@@ -46,15 +46,20 @@ final class InfoWindowModel: ObservableObject {
                 case .genre: return content.fieldValue(label: "Genre:")
                 case .lyrics: return content.lyrics
                 case .comment: return content.comment
-                case .url: return content.webURL
+                case .url:
+                    if content.url?.isFileURL == false { return content.url?.absoluteString }
+                    return content.webURL
                 case .copyright: return content.copyright
                 case .filename:
+                    guard content.url?.isFileURL == true else { return nil }
                     guard let value = content.url?.lastPathComponent, !value.isEmpty else { return nil }
                     return value
                 case .folder:
+                    guard content.url?.isFileURL == true else { return nil }
                     guard let value = content.url?.deletingLastPathComponent().path, !value.isEmpty else { return nil }
                     return value
                 case .fullPath:
+                    guard content.url?.isFileURL == true else { return nil }
                     guard let value = content.url?.path, !value.isEmpty else { return nil }
                     return value
                 }
@@ -70,6 +75,8 @@ final class InfoWindowModel: ObservableObject {
         var url: URL?
         var artwork: NSImage?
         var rating = 0
+        var canSetRating = false
+        var streamMetadataTitle: String?
         var fields: [(label: String, value: String)] = []
         var lyrics: String?
         var comment: String?
@@ -83,6 +90,23 @@ final class InfoWindowModel: ObservableObject {
         private func fieldValue(label: String) -> String? {
             fields.first(where: { $0.label == label })?.value
         }
+
+        mutating func applyStreamMetadata(_ rawTitle: String) {
+            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return }
+            streamMetadataTitle = title
+            fields.removeAll { $0.label == "Artist:" || $0.label == "Title:" }
+            let parts = title.components(separatedBy: " - ")
+            if parts.count >= 2 {
+                let artist = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                let trackTitle = parts.dropFirst().joined(separator: " - ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !artist.isEmpty { fields.insert(("Artist:", artist), at: 0) }
+                if !trackTitle.isEmpty { fields.insert(("Title:", trackTitle), at: artist.isEmpty ? 0 : 1) }
+            } else {
+                fields.insert(("Title:", title), at: 0)
+            }
+        }
     }
 
     @Published private(set) var content = Content()
@@ -92,6 +116,7 @@ final class InfoWindowModel: ObservableObject {
     /// the same local file. Once APIC was decoded, never replace it with an
     /// incomplete later metadata result for that URL.
     private var artworkCache: [URL: NSImage] = [:]
+    private var streamMetadataByURL: [URL: String] = [:]
     private let queue = DispatchQueue(label: "ru.aleksandr.macAmp.info", qos: .utility)
 
     func show(_ url: URL?) { show(url, metadataDelay: 0) }
@@ -112,6 +137,7 @@ final class InfoWindowModel: ObservableObject {
         // Invalidate an in-flight AVFoundation read so an older snapshot cannot
         // overwrite the value that was just written successfully.
         generation = UUID()
+        guard content.canSetRating else { return }
         var updated = content
         updated.rating = TrackRating.stars(for: value)
         content = updated
@@ -125,7 +151,11 @@ final class InfoWindowModel: ObservableObject {
         guard force || content.url != url else { return }
         let token = UUID()
         generation = token
-        content = Content(url: url, artwork: url.flatMap { artworkCache[$0] })
+        var initial = Content(url: url, artwork: url.flatMap { artworkCache[$0] })
+        if let url, let streamMetadata = streamMetadataByURL[url] {
+            initial.applyStreamMetadata(streamMetadata)
+        }
+        content = initial
         guard let url else { return }
 
         let load = { [weak self] in self?.loadContent(for: url, token: token) }
@@ -151,9 +181,22 @@ final class InfoWindowModel: ObservableObject {
                 } else {
                     resolved.artwork = self.artworkCache[url]
                 }
+                if let streamMetadata = self.streamMetadataByURL[url] {
+                    resolved.applyStreamMetadata(streamMetadata)
+                }
                 self.content = resolved
             }
         }
+    }
+
+    func updateStreamMetadata(_ rawTitle: String, for url: URL) {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        streamMetadataByURL[url] = title
+        guard content.url == url else { return }
+        var updated = content
+        updated.applyStreamMetadata(title)
+        content = updated
     }
 
     private static func loadContent(for url: URL) -> Content {
@@ -226,6 +269,7 @@ final class InfoWindowModel: ObservableObject {
             }
             if let byte { result.rating = TrackRating.stars(for: UInt8(min(255, max(0, byte)))) }
         }
+        result.canSetRating = TagEditorModel.canSetRating(for: url, metadata: metadata)
 
         var technical: [String] = []
         let duration = asset.duration.seconds
@@ -431,13 +475,15 @@ final class InfoPanelView: NSView {
             }
         }
 
-        let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 16 * pixelScale), color: skin.playlistColors().normalText)
-        rating.menu = copyMenu
-        rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
-                              width: usesTwoColumnLayout ? columnWidth : width,
-                              height: max(18 * pixelScale, rating.intrinsicContentSize.height))
-        documentView.addSubview(rating)
-        y += rating.frame.height + spacing
+        if model.content.canSetRating {
+            let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 16 * pixelScale), color: skin.playlistColors().normalText)
+            rating.menu = copyMenu
+            rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
+                                  width: usesTwoColumnLayout ? columnWidth : width,
+                                  height: max(18 * pixelScale, rating.intrinsicContentSize.height))
+            documentView.addSubview(rating)
+            y += rating.frame.height + spacing
+        }
 
         let gap = 8 * pixelScale
         let tableColumnWidth = max(1, (columnWidth - gap) * 0.5)
@@ -462,23 +508,29 @@ final class InfoPanelView: NSView {
         if let copyright = model.content.copyright { addLabel(copyright, alignment: .center, x: detailX, width: columnWidth) }
         if let fileURL = model.content.url,
            let filename = fileURL.lastPathComponent.nilIfEmpty {
-            let filenameView = InfoWrappedTextView(
-                text: filename,
-                font: skin.resolvedFont(ofSize: 8 * textScale),
-                color: skin.playlistColors().normalText,
-                alignment: .center,
-                onClick: fileURL.isFileURL ? {
-                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
-                } : nil
-            )
-            filenameView.menu = copyMenu
-            let filenameHeight = filenameView.requiredHeight(for: columnWidth)
-            filenameView.frame = NSRect(x: detailX, y: y, width: columnWidth, height: filenameHeight)
-            documentView.addSubview(filenameView)
-            y += filenameHeight + spacing
+            if fileURL.isFileURL {
+                let filenameView = InfoWrappedTextView(
+                    text: filename,
+                    font: skin.resolvedFont(ofSize: 8 * textScale),
+                    color: skin.playlistColors().normalText,
+                    alignment: .center,
+                    onClick: {
+                        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                    }
+                )
+                filenameView.menu = copyMenu
+                let filenameHeight = filenameView.requiredHeight(for: columnWidth)
+                filenameView.frame = NSRect(x: detailX, y: y, width: columnWidth, height: filenameHeight)
+                documentView.addSubview(filenameView)
+                y += filenameHeight + spacing
+            }
         }
         if !model.content.technicalInfo.isEmpty {
             addLabel(model.content.technicalInfo.joined(separator: "   "), alignment: .center, x: detailX, width: columnWidth)
+        }
+        if model.content.url?.isFileURL == false,
+           let sourceURL = model.content.url?.absoluteString.nilIfEmpty {
+            addLabel("Source URL: \(sourceURL)", alignment: .center, x: detailX, width: columnWidth, detectsLinks: true)
         }
 
         let height = max(scrollView.contentSize.height, y - spacing + inset, leftArtworkHeight + inset * 2)
@@ -494,20 +546,22 @@ final class InfoPanelView: NSView {
 
     private func makeCopyMenu() -> NSMenu {
         let menu = NSMenu()
-        let rate = NSMenuItem(title: "Set Rating", action: nil, keyEquivalent: "")
-        let rateMenu = NSMenu(title: "Set Rating")
-        for title in PlaylistRatingMenu.titles {
-            let item = NSMenuItem(title: title, action: #selector(rateItems(_:)), keyEquivalent: "")
-            item.target = self
-            if let shortcut = PlaylistRatingMenu.shortcut(for: title) {
-                item.keyEquivalent = shortcut.key
-                item.keyEquivalentModifierMask = shortcut.modifiers
+        if model.content.canSetRating {
+            let rate = NSMenuItem(title: "Set Rating", action: nil, keyEquivalent: "")
+            let rateMenu = NSMenu(title: "Set Rating")
+            for title in PlaylistRatingMenu.titles {
+                let item = NSMenuItem(title: title, action: #selector(rateItems(_:)), keyEquivalent: "")
+                item.target = self
+                if let shortcut = PlaylistRatingMenu.shortcut(for: title) {
+                    item.keyEquivalent = shortcut.key
+                    item.keyEquivalentModifierMask = shortcut.modifiers
+                }
+                rateMenu.addItem(item)
             }
-            rateMenu.addItem(item)
+            rate.submenu = rateMenu
+            menu.addItem(rate)
+            menu.addItem(.separator())
         }
-        rate.submenu = rateMenu
-        menu.addItem(rate)
-        menu.addItem(.separator())
 
         for tag in InfoWindowModel.Content.CopyableTag.allCases {
             guard tag.isAvailable(in: model.content) else { continue }
@@ -566,10 +620,16 @@ final class InfoPanelView: NSView {
             guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
             lines.append("\(label): \(value)")
         }
-        append("URL", content.webURL)
+        if content.url?.isFileURL == false {
+            append("URL", content.url?.absoluteString)
+        } else {
+            append("URL", content.webURL)
+        }
         append("Copyright", content.copyright)
-        append("Filename", content.url?.lastPathComponent)
-        append("Folder", content.url?.deletingLastPathComponent().path)
+        if content.url?.isFileURL != false {
+            append("Filename", content.url?.lastPathComponent)
+            append("Folder", content.url?.deletingLastPathComponent().path)
+        }
         append("Bitrate", content.bitrate)
         append("Duration", content.duration)
         append("Size", content.fileSize)

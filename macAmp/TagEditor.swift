@@ -638,12 +638,27 @@ final class TagEditorModel: ObservableObject {
         return result
     }
 
-    private static func hasMetadataTag(for url: URL, metadata: [AVMetadataItem]) -> Bool {
+    static func hasMetadataTag(for url: URL, metadata: [AVMetadataItem]) -> Bool {
         switch url.pathExtension.lowercased() {
         case "mp3", "aac": return hasEditableID3Metadata(in: metadata)
         case "m4a", "mp4": return metadata.contains(where: isM4AUserMetadata)
         default: return true
         }
+    }
+
+    /// Rating persistence is currently POPM/ID3-only.  Keep this capability
+    /// separate from general metadata editing: a file may have readable tags
+    /// while still not supporting the rating command.
+    static func canSetRating(for url: URL, metadata: [AVMetadataItem]) -> Bool {
+        guard url.isFileURL,
+              url.pathExtension.lowercased() == "mp3",
+              !url.path.isEmpty,
+              FileManager.default.isWritableFile(atPath: url.path),
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isDirectory != true,
+              values.isSymbolicLink != true else { return false }
+        return hasMetadataTag(for: url, metadata: metadata)
     }
 
     private static func hasEditableID3Metadata(in metadata: [AVMetadataItem]) -> Bool {
