@@ -563,9 +563,12 @@ final class PlaybackController: NSObject, ObservableObject {
     /// flag, so PlaylistManager can update only the entry being attempted.
     var onPlaybackError: ((URL) -> Void)?
     var onPlaybackReady: ((URL) -> Void)?
+    var onStreamMetadata: ((URL, String) -> Void)?
     @Published private(set) var title = "MACAMP — READY"
     @Published private(set) var isPlaying = false
     @Published private(set) var isPaused = false
+    @Published private(set) var sourceStatus = ""
+    @Published private(set) var streamBufferPercent: Int?
     let clock = PlaybackClockState()
     var position: Double {
         get { clock.position }
@@ -587,7 +590,12 @@ final class PlaybackController: NSObject, ObservableObject {
     }
     let visualization = PlaybackVisualizationState()
     let visualizationPreferences = VisualizationPreferences()
-    @Published var volume: Double = 0.8 { didSet { playerNode.volume = Float(volume) } }
+    @Published var volume: Double = 0.8 {
+        didSet {
+            playerNode.volume = Float(volume)
+            streamingPlayer?.volume = Float(volume)
+        }
+    }
     @Published var balance: Double = 0 { didSet { playerNode.pan = Float(min(1, max(-1, balance))) } }
     @Published var shuffleMode: ShuffleMode = .off {
         didSet {
@@ -626,6 +634,7 @@ final class PlaybackController: NSObject, ObservableObject {
     /// visualizer (or AUTO EQ) actually needs it.
     private var streamingAudioTrack: AVAssetTrack?
     private var streamingStatusObservation: NSKeyValueObservation?
+    private var streamingHasReportedReady = false
     private var streamingEndObserver: Any?
     private var streamingTimeObserver: Any?
     private var streamingOpenGeneration: Int?
@@ -756,6 +765,7 @@ final class PlaybackController: NSObject, ObservableObject {
         if let streamingPlayer {
             if streamingTimeObserver == nil { installStreamingTimeObserver(on: streamingPlayer) }
             streamingPlayer.play(); isPlaying = true; isPaused = false
+            sourceStatus = ""
             return
         }
         guard sourceFile != nil else {
@@ -772,6 +782,7 @@ final class PlaybackController: NSObject, ObservableObject {
         if let streamingPlayer {
             streamingPlayer.pause()
             isPlaying = false; isPaused = true
+            sourceStatus = ""
             return
         }
         scheduledStartFrame += currentPlayedFrames()
@@ -1206,10 +1217,12 @@ final class PlaybackController: NSObject, ObservableObject {
         scopedURL = nil; hasSecurityScope = false
         isPlaying = false; isPaused = false
         hasPlaybackError = false
+        sourceStatus = isHTTPURL(url) ? "CONNECTING" : ""
+        streamBufferPercent = nil
         title = "OPENING…"
         duration = 0
         bitrateKbps = nil
-        if streamingPreferredVolumeRoots.contains(streamingVolumeRoot(for: url)) {
+        if isHTTPURL(url) || streamingPreferredVolumeRoots.contains(streamingVolumeRoot(for: url)) {
             startStreamingFallback(for: url, generation: generation)
             return
         }
@@ -1316,6 +1329,7 @@ final class PlaybackController: NSObject, ObservableObject {
         // data. Reserve this generation first, then construct it away from the
         // event loop so a second network click cannot freeze all windows.
         streamingOpenGeneration = generation
+        streamingHasReportedReady = false
         fileOpenQueue.async { [weak self] in
             let obtainedSecurityScope = url.startAccessingSecurityScopedResource()
             let asset = AVURLAsset(url: url)
@@ -1334,6 +1348,7 @@ final class PlaybackController: NSObject, ObservableObject {
                     return
                 }
                 let player = AVPlayer(playerItem: item)
+                player.volume = Float(self.volume)
                 player.audioOutputDeviceUniqueID = self.outputDeviceManager.selectedDeviceUID
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
@@ -1366,12 +1381,16 @@ final class PlaybackController: NSObject, ObservableObject {
                         self.duration = item.duration.seconds.isFinite ? max(0, item.duration.seconds) : 0
                         self.position = 0
                         self.title = self.preferredDisplayTitle
+                        self.sourceStatus = ""
                         self.loadStreamingBitrate(for: url, generation: generation)
                         self.installStreamingTimeObserver(on: player)
                         self.requestSpectrumFromNextPCMBuffer()
                         player.play()
                         self.isPlaying = true; self.isPaused = false
-                        self.onPlaybackReady?(url)
+                        if !self.streamingHasReportedReady {
+                            self.streamingHasReportedReady = true
+                            self.onPlaybackReady?(url)
+                        }
                     }
                 }
             }
@@ -1399,6 +1418,11 @@ final class PlaybackController: NSObject, ObservableObject {
         }
     }
 
+    private func isHTTPURL(_ url: URL?) -> Bool {
+        guard let scheme = url?.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
     private func stopStreamingPlayback() {
         if let streamingEndObserver { NotificationCenter.default.removeObserver(streamingEndObserver) }
         streamingEndObserver = nil
@@ -1409,6 +1433,9 @@ final class PlaybackController: NSObject, ObservableObject {
         streamingAudioTrack = nil
         isStreamingAnalysisTapInstalled = false
         streamingOpenGeneration = nil
+        streamingHasReportedReady = false
+        sourceStatus = ""
+        streamBufferPercent = nil
     }
 
     private func streamingAudioMix(for track: AVAssetTrack) -> AVAudioMix? {

@@ -107,6 +107,230 @@ enum PlaylistDragTransfer {
     static let typeIdentifier = "ru.aleksandr.macAmp.playlist-entry"
 }
 
+private enum PlaylistURLImportError: LocalizedError {
+    case emptyURL
+    case invalidURL
+    case unsupportedScheme
+    case requestFailed(String)
+    case responseTooLarge
+    case invalidPlaylist
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyURL:
+            return "Enter a URL."
+        case .invalidURL:
+            return "The URL is not valid."
+        case .unsupportedScheme:
+            return "Only HTTP and HTTPS URLs are supported."
+        case .requestFailed(let message):
+            return message
+        case .responseTooLarge:
+            return "The remote playlist is too large."
+        case .invalidPlaylist:
+            return "The URL does not contain a readable playlist."
+        }
+    }
+}
+
+private struct ImportedPlaylistItem {
+    let url: URL
+    let title: String?
+    let duration: TimeInterval?
+}
+
+private enum RemoteURLProbeResult {
+    case stream(URL)
+    case playlist(data: Data, baseURL: URL)
+}
+
+/// Performs just enough of a request to distinguish a radio/audio source from
+/// a remote M3U/PLS. Audio sources are cancelled as soon as their response or
+/// first binary payload is identified; playlist bodies are retained only up to
+/// a bounded size and are parsed off the main queue.
+private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
+    private enum Mode { case undecided, stream, playlist }
+
+    private static let maximumPlaylistBytes = 8 * 1024 * 1024
+    private static let maximumProbeBytes = 8 * 1024
+
+    private let url: URL
+    private let completion: (Result<RemoteURLProbeResult, Error>) -> Void
+    private lazy var session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }()
+    private var task: URLSessionDataTask?
+    private var mode: Mode = .undecided
+    private var responseURL: URL
+    private var contentType = ""
+    private var body = Data()
+    private var isFinished = false
+
+    init(url: URL, completion: @escaping (Result<RemoteURLProbeResult, Error>) -> Void) {
+        self.url = url
+        self.responseURL = url
+        self.completion = completion
+        super.init()
+    }
+
+    func start() {
+        var request = URLRequest(url: url)
+        request.setValue("MacAmp/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("audio/mpegurl, audio/x-scpls, text/plain, */*", forHTTPHeaderField: "Accept")
+        task = session.dataTask(with: request)
+        task?.resume()
+    }
+
+    func cancel() {
+        guard !isFinished else { return }
+        isFinished = true
+        task?.cancel()
+        session.invalidateAndCancel()
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard !isFinished else {
+            completionHandler(.cancel)
+            return
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            finish(.failure(PlaylistURLImportError.requestFailed("The URL did not return an HTTP response.")))
+            completionHandler(.cancel)
+            return
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            finish(.failure(PlaylistURLImportError.requestFailed("The server returned HTTP \(httpResponse.statusCode).")))
+            completionHandler(.cancel)
+            return
+        }
+
+        responseURL = response.url ?? url
+        contentType = (httpResponse.mimeType ?? "").lowercased()
+        let playlistExtension = ["m3u", "m3u8", "pls"].contains(responseURL.pathExtension.lowercased())
+            || ["m3u", "m3u8", "pls"].contains(url.pathExtension.lowercased())
+        let playlistMIME = contentType.contains("mpegurl")
+            || contentType.contains("scpls")
+            || contentType.contains("playlist")
+            || contentType == "audio/x-scpls"
+
+        if playlistExtension || playlistMIME {
+            mode = .playlist
+        } else if contentType.hasPrefix("audio/") {
+            finish(.success(.stream(responseURL)))
+            completionHandler(.cancel)
+            return
+        } else if contentType == "application/octet-stream" {
+            finish(.success(.stream(responseURL)))
+            completionHandler(.cancel)
+            return
+        }
+
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !isFinished else { return }
+        body.append(data)
+        guard body.count <= Self.maximumPlaylistBytes else {
+            if mode == .undecided {
+                finish(.success(.stream(responseURL)))
+            } else {
+                finish(.failure(PlaylistURLImportError.responseTooLarge))
+            }
+            dataTask.cancel()
+            return
+        }
+
+        guard mode == .undecided else { return }
+        let probe = body.prefix(Self.maximumProbeBytes)
+        if Self.looksLikePlaylist(Data(probe)) {
+            mode = .playlist
+        } else if !Self.isText(Data(probe)) && probe.count >= 1_024 {
+            // MP3/AAC/Ogg payloads normally fail UTF-8 decoding immediately.
+            // Do not wait for a radio stream to end before putting it in the
+            // playlist.
+            finish(.success(.stream(responseURL)))
+            dataTask.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !isFinished else { return }
+        if let error {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled { return }
+            finish(.failure(PlaylistURLImportError.requestFailed(error.localizedDescription)))
+            return
+        }
+
+        // Some playlist generators answer with a plain-text redirect to the
+        // actual station URL instead of returning an M3U body. Treat a single
+        // HTTP(S) line as the stream it points to; otherwise the line would be
+        // parsed as a playlist entry and a trailing slash would become its
+        // visible title.
+        if let streamURL = Self.singleRemoteURL(in: body, relativeTo: responseURL) {
+            finish(.success(.stream(streamURL)))
+        } else if mode == .playlist || Self.looksLikePlaylist(body) || contentType.hasPrefix("text/") {
+            finish(.success(.playlist(data: body, baseURL: responseURL)))
+        } else {
+            finish(.success(.stream(responseURL)))
+        }
+    }
+
+    private func finish(_ result: Result<RemoteURLProbeResult, Error>) {
+        guard !isFinished else { return }
+        isFinished = true
+        session.invalidateAndCancel()
+        completion(result)
+    }
+
+    private static func isText(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return true }
+        return String(data: data, encoding: .utf8) != nil
+            || String(data: data, encoding: .windowsCP1252) != nil
+    }
+
+    private static func looksLikePlaylist(_ data: Data) -> Bool {
+        guard let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .windowsCP1252) else { return false }
+        var upper = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if upper.hasPrefix("\u{FEFF}") { upper = String(upper.dropFirst()) }
+        return upper.hasPrefix("#EXTM3U")
+            || upper.hasPrefix("#EXTINF:")
+            || upper.hasPrefix("[PLAYLIST]")
+            || upper.contains("\nFILE1=")
+            || upper.hasPrefix("FILE1=")
+    }
+
+    private static func singleRemoteURL(in data: Data, relativeTo baseURL: URL) -> URL? {
+        guard let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .windowsCP1252) else { return nil }
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.count == 1, !lines[0].hasPrefix("#"),
+              let candidate = URL(string: lines[0], relativeTo: baseURL)?.absoluteURL,
+              let scheme = candidate.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              candidate.host != nil else { return nil }
+        return candidate
+    }
+}
+
 /// Single authority for opening, saving and scanning playlists.  Its queues are
 /// serial by design: network folders cannot create an unbounded number of jobs.
 final class PlaylistManager: ObservableObject {
@@ -252,6 +476,9 @@ final class PlaylistManager: ObservableObject {
     }
 
     private var pendingPlaylistLoads: [UUID: PendingPlaylistLoad] = [:]
+    /// URL probes are kept alive until their response is classified. The key
+    /// is transient and is removed on the main queue with the playlist update.
+    private var urlImportProbes: [UUID: RemoteURLProbe] = [:]
     // The Loading counter is an exact row counter: advance it one entry at a
     // time, rather than reporting parser blocks such as 128 records.
     private let visibleLoadingBatchSize = 1
@@ -1077,6 +1304,223 @@ final class PlaylistManager: ObservableObject {
         playlist.entries.reversed().first(where: { !$0.hasPlaybackError })
     }
 
+    /// Adds a remote source without changing the current playlist. The first
+    /// response bytes decide whether the URL is an audio/radio source or a
+    /// remote M3U/PLS; only the latter is read to completion.
+    func addURL(
+        _ rawValue: String,
+        to playlist: PlaylistModel,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
+        let trimmedValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedValue.isEmpty else {
+            completion(.failure(PlaylistURLImportError.emptyURL))
+            return
+        }
+        if let scheme = URL(string: trimmedValue)?.scheme?.lowercased(),
+           !["http", "https"].contains(scheme) {
+            completion(.failure(PlaylistURLImportError.unsupportedScheme))
+            return
+        }
+        guard let url = Self.normalizedRemoteURL(from: trimmedValue) else {
+            completion(.failure(PlaylistURLImportError.invalidURL))
+            return
+        }
+
+        playlist.scannerState = .adding(playlist.entries.count)
+        let token = UUID()
+        let probe = RemoteURLProbe(url: url) { [weak self, weak playlist] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    self.finishURLImport(
+                        token: token,
+                        playlist: playlist,
+                        result: .failure(error),
+                        completion: completion
+                    )
+                }
+            case .success(.stream(let streamURL)):
+                DispatchQueue.main.async {
+                    self.finishURLImport(
+                        token: token,
+                        playlist: playlist,
+                        result: .success([ImportedPlaylistItem(url: streamURL, title: nil, duration: nil)]),
+                        completion: completion
+                    )
+                }
+            case .success(.playlist(let data, let baseURL)):
+                self.folderQueue.async { [weak self, weak playlist] in
+                    guard let self else { return }
+                    let result: Result<[ImportedPlaylistItem], Error>
+                    if let items = Self.parseRemotePlaylist(data: data, baseURL: baseURL), !items.isEmpty {
+                        result = .success(items)
+                    } else {
+                        result = .failure(PlaylistURLImportError.invalidPlaylist)
+                    }
+                    DispatchQueue.main.async {
+                        self.finishURLImport(token: token, playlist: playlist, result: result, completion: completion)
+                    }
+                }
+            }
+        }
+        urlImportProbes[token] = probe
+        probe.start()
+    }
+
+    private func finishURLImport(
+        token: UUID,
+        playlist: PlaylistModel?,
+        result: Result<[ImportedPlaylistItem], Error>,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        urlImportProbes.removeValue(forKey: token)
+        guard let playlist,
+              playlists.contains(where: { $0.id == playlist.id }) else { return }
+
+        switch result {
+        case .failure(let error):
+            finishEntryLoading(playlist)
+            completion(.failure(error))
+        case .success(let items):
+            guard !items.isEmpty else {
+                finishEntryLoading(playlist)
+                completion(.failure(PlaylistURLImportError.invalidPlaylist))
+                return
+            }
+            let entries = items.map { item in
+                PlaylistEntry(
+                    url: item.url,
+                    title: item.title ?? Self.displayTitle(for: item.url),
+                    duration: item.duration,
+                    // A remote stream must not enter the ordinary local-file
+                    // metadata scanner. Its title arrives from ICY metadata
+                    // once playback starts.
+                    metadataIsAvailable: true
+                )
+            }
+            playlist.entries.append(contentsOf: entries)
+            playlist.structureRevision &+= 1
+            playlist.appendToTotalDuration(entries)
+            playlist.isDirty = true
+            markEntriesDirty(in: playlist)
+            finishEntryLoading(playlist)
+            save()
+            completion(.success(entries.count))
+        }
+    }
+
+    private static func normalizedRemoteURL(from rawValue: String) -> URL? {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if !value.contains("://") { value = "http://" + value }
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else { return nil }
+        return url
+    }
+
+    private static func displayTitle(for url: URL) -> String {
+        let pathTitle = url.deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pathTitle.isEmpty, pathTitle != "/", pathTitle != "." {
+            return pathTitle
+        }
+        if let host = url.host, !host.isEmpty {
+            return host
+        }
+        return url.absoluteString
+    }
+
+    private static func parseRemotePlaylist(data: Data, baseURL: URL) -> [ImportedPlaylistItem]? {
+        guard let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .utf16)
+                ?? String(data: data, encoding: .windowsCP1252) else { return nil }
+
+        let lines = text.components(separatedBy: .newlines)
+        let upper = text.uppercased()
+        if upper.contains("[PLAYLIST]") || lines.contains(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("FILE1=")
+        }) {
+            let items = parsePLS(lines, baseURL: baseURL)
+            if !items.isEmpty { return items }
+        }
+        return parseM3U(lines, baseURL: baseURL)
+    }
+
+    private static func removingBOM(from value: String) -> String {
+        value.hasPrefix("\u{FEFF}") ? String(value.dropFirst()) : value
+    }
+
+    private static func parseM3U(_ lines: [String], baseURL: URL) -> [ImportedPlaylistItem] {
+        var items: [ImportedPlaylistItem] = []
+        items.reserveCapacity(min(lines.count, 256))
+        var pendingTitle: String?
+        var pendingDuration: TimeInterval?
+
+        for rawLine in lines {
+            let line = removingBOM(from: rawLine.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard !line.isEmpty else { continue }
+            let upper = line.uppercased()
+            if upper.hasPrefix("#EXTINF:") {
+                let payload = String(line.dropFirst(8))
+                let parts = payload.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+                pendingDuration = parts.first.flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+                    .flatMap { $0 >= 0 ? $0 : nil }
+                if parts.count > 1 {
+                    let title = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    pendingTitle = title.isEmpty ? nil : title
+                } else {
+                    pendingTitle = nil
+                }
+                continue
+            }
+            guard !line.hasPrefix("#"), let url = remotePlaylistURL(line, relativeTo: baseURL) else { continue }
+            items.append(ImportedPlaylistItem(url: url, title: pendingTitle, duration: pendingDuration))
+            pendingTitle = nil
+            pendingDuration = nil
+        }
+        return items
+    }
+
+    private static func parsePLS(_ lines: [String], baseURL: URL) -> [ImportedPlaylistItem] {
+        var files: [Int: String] = [:]
+        var titles: [Int: String] = [:]
+        var lengths: [Int: TimeInterval] = [:]
+
+        for rawLine in lines {
+            let line = removingBOM(from: rawLine.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard let separator = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<separator]).lowercased()
+            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if key.hasPrefix("file"), let index = Int(key.dropFirst(4)), !value.isEmpty {
+                files[index] = value
+            } else if key.hasPrefix("title"), let index = Int(key.dropFirst(5)), !value.isEmpty {
+                titles[index] = value
+            } else if key.hasPrefix("length"), let index = Int(key.dropFirst(6)),
+                      let length = TimeInterval(value), length >= 0 {
+                lengths[index] = length
+            }
+        }
+
+        return files.keys.sorted().compactMap { index in
+            guard let value = files[index],
+                  let url = remotePlaylistURL(value, relativeTo: baseURL) else { return nil }
+            return ImportedPlaylistItem(url: url, title: titles[index], duration: lengths[index])
+        }
+    }
+
+    private static func remotePlaylistURL(_ value: String, relativeTo baseURL: URL) -> URL? {
+        guard let url = URL(string: value, relativeTo: baseURL)?.absoluteURL,
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else { return nil }
+        return url
+    }
+
     func entryToPlay(in playlist: PlaylistModel, step: Int, shuffle: Bool) -> PlaylistEntry? {
         guard !playlist.entries.isEmpty else { return nil }
         if shuffle { return shuffledEntry(for: .currentPlaylist, step: step)?.entry }
@@ -1109,6 +1553,32 @@ final class PlaylistManager: ObservableObject {
               let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
         guard entry.hasPlaybackError else { return }
         entry.hasPlaybackError = false
+    }
+
+    /// ICY metadata belongs to the currently playing remote entry. It changes
+    /// the visible title but never creates or removes a playlist row.
+    func updateStreamMetadata(_ rawTitle: String, for url: URL) {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty,
+              let playlist = activePlaylist,
+              let id = playingEntryID,
+              let entry = playlist.entries.first(where: { $0.id == id && $0.url == url }) else { return }
+
+        entry.title = title
+        entry.metadataIsAvailable = true
+        let parts = title.components(separatedBy: " - ")
+        if parts.count >= 2 {
+            let artist = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let trackTitle = parts.dropFirst().joined(separator: " - ").trimmingCharacters(in: .whitespacesAndNewlines)
+            entry.artist = artist.isEmpty ? nil : artist
+            entry.trackTitle = trackTitle.isEmpty ? nil : trackTitle
+        } else {
+            entry.artist = nil
+            entry.trackTitle = title
+        }
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist)
+        save()
     }
 
     func focus(_ playlist: PlaylistModel) { focusedPlaylistID = playlist.id; save() }

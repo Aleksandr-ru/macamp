@@ -1003,6 +1003,9 @@ private struct TickerDisplay: View {
             if magnitude == 0 { return "BALANCE: CENTER" }
             return "BALANCE: \(playback.balance < 0 ? "L" : "R") \(magnitude)%"
         }
+        if !playback.sourceStatus.isEmpty {
+            return playback.sourceStatus.uppercased()
+        }
         return playback.title.uppercased()
     }
 

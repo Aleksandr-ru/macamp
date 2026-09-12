@@ -671,6 +671,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.playlistManager.markPlaybackErrorForActiveEntry(url: url)
             self.advancePlaylistAfterTrackFinished()
         }
+        playback.onStreamMetadata = { [weak self] url, title in
+            self?.playlistManager.updateStreamMetadata(title, for: url)
+        }
         playback.onPlaybackReady = { [weak self] url in
             guard let self else { return }
             self.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
@@ -2707,6 +2710,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if panel.runModal() == .OK { playlistManager.addFiles(panel.urls, to: playlist) }
+    }
+
+    /// Shows the Add URL interaction at the AppKit boundary. The entered
+    /// source is always appended to the selected playlist; this path never
+    /// clears the playlist or starts playback implicitly.
+    func addURLToActivePlaylist() {
+        guard let playlist = playlistManager.editingPlaylist else { return }
+        let alert = NSAlert()
+        alert.messageText = "Add URL"
+        alert.informativeText = "Enter a radio stream or playlist URL:"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.usesSingleLineMode = true
+        field.maximumNumberOfLines = 1
+        field.lineBreakMode = .byClipping
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.placeholderString = "http://example.com/stream.mp3"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        playlistManager.addURL(field.stringValue, to: playlist) { [weak self, weak playlist] result in
+            guard let self, let playlist else { return }
+            switch result {
+            case .success:
+                self.showPlaylistWindow(for: playlist)
+                self.connectFileMenu()
+            case .failure(let error):
+                let errorAlert = NSAlert()
+                errorAlert.messageText = "Could Not Add URL"
+                errorAlert.informativeText = error.localizedDescription
+                errorAlert.addButton(withTitle: "OK")
+                errorAlert.runModal()
+            }
+        }
     }
 
     func chooseTracksForPlaybackPlaylist() {
@@ -5718,6 +5758,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
     @objc private func selectMenuItem(_ sender: NSMenuItem) {
         switch sender.title {
         case "Add Files…": AppDelegate.shared?.addFilesToActivePlaylist()
+        case "Add URL…": AppDelegate.shared?.addURLToActivePlaylist()
         case "Automatic rating":
             if let playlist { AppDelegate.shared?.toggleAutomaticRating(for: playlist) }
         case "Add Folder…": AppDelegate.shared?.addFolderToActivePlaylist()
