@@ -5160,7 +5160,7 @@ private struct PlaylistView: View {
                 foregroundColor: playlistColor(isPlayingEntry ? colors.currentText : colors.normalText),
                 backgroundColor: playlistColor(isSelected ? colors.selectedBackground : colors.background),
                 showsRating: ratingPreferences.showsStars,
-                ratingFont: Font(skin.resolvedFont(ofSize: CGFloat(12 * fontScale.factor)))
+                ratingFont: Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)))
             )
 
             PlaylistRowInteractionArea(
@@ -5191,7 +5191,7 @@ private struct PlaylistView: View {
     /// matching line height so the glyphs never overlap or get clipped.
     private var playlistEntryHeight: CGFloat {
         let rowFontHeight = skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)).boundingRectForFont.height
-        let ratingFontHeight = skin.resolvedFont(ofSize: CGFloat(12 * fontScale.factor)).boundingRectForFont.height
+        let ratingFontHeight = skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)).boundingRectForFont.height
         let fontHeight = max(rowFontHeight, ratingFontHeight)
         return max(13, ceil(fontHeight + 3))
     }
