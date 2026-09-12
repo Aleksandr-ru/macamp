@@ -5285,6 +5285,9 @@ private struct PlaylistEntryContent: View {
     let ratingFont: Font
 
     var body: some View {
+        let durationText = entry.url.isFileURL
+            ? entry.duration.map(Self.formattedTime) ?? "--:--"
+            : "◉"
         HStack(alignment: .center, spacing: 3) {
             Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
             Spacer(minLength: 2)
@@ -5295,7 +5298,7 @@ private struct PlaylistEntryContent: View {
                     .frame(minHeight: entryHeight, alignment: .center)
                     .offset(y: -1)
             }
-            Text(entry.duration.map(Self.formattedTime) ?? "--:--")
+            Text(verbatim: durationText)
         }
         .font(font)
         .foregroundColor(foregroundColor)
