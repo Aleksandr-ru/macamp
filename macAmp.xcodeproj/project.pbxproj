@@ -22,6 +22,7 @@
 		E1A0001726A0000100000001 /* MilkDropRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001826A0000100000001 /* MilkDropRenderer.swift */; };
 		E1A0001926A0000100000001 /* MilkDropShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001A26A0000100000001 /* MilkDropShaders.metal */; };
 		E1A0001B26A0000100000001 /* VisualizationWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001C26A0000100000001 /* VisualizationWindow.swift */; };
+		E1A0002326A0000100000001 /* AudioPlaybackExceptionGuard.m in Sources */ = {isa = PBXBuildFile; fileRef = E1A0002426A0000100000001 /* AudioPlaybackExceptionGuard.m */; };
 		27067742242E89F200CFBEE7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067741242E89F200CFBEE7 /* Assets.xcassets */; };
 		27067745242E89F200CFBEE7 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067744242E89F200CFBEE7 /* Preview Assets.xcassets */; };
 		27067748242E89F200CFBEE7 /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 27067746242E89F200CFBEE7 /* Main.storyboard */; };
@@ -44,6 +45,8 @@
 		E1A0001826A0000100000001 /* MilkDropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MilkDropRenderer.swift; sourceTree = "<group>"; };
 		E1A0001A26A0000100000001 /* MilkDropShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = MilkDropShaders.metal; sourceTree = "<group>"; };
 		E1A0001C26A0000100000001 /* VisualizationWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualizationWindow.swift; sourceTree = "<group>"; };
+		E1A0002526A0000100000001 /* AudioPlaybackExceptionGuard.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AudioPlaybackExceptionGuard.h; sourceTree = "<group>"; };
+		E1A0002426A0000100000001 /* AudioPlaybackExceptionGuard.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AudioPlaybackExceptionGuard.m; sourceTree = "<group>"; };
 		27067741242E89F200CFBEE7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		27067744242E89F200CFBEE7 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		27067747242E89F200CFBEE7 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
@@ -96,6 +99,8 @@
 				E1A0001826A0000100000001 /* MilkDropRenderer.swift */,
 				E1A0001A26A0000100000001 /* MilkDropShaders.metal */,
 				E1A0001C26A0000100000001 /* VisualizationWindow.swift */,
+				E1A0002526A0000100000001 /* AudioPlaybackExceptionGuard.h */,
+				E1A0002426A0000100000001 /* AudioPlaybackExceptionGuard.m */,
 				27067741242E89F200CFBEE7 /* Assets.xcassets */,
 				27067746242E89F200CFBEE7 /* Main.storyboard */,
 				27067749242E89F200CFBEE7 /* Info.plist */,
@@ -216,6 +221,7 @@
 				2706773E242E89F100CFBEE7 /* AppDelegate.swift in Sources */,
 				E1A0001126A0000100000001 /* TrackNotificationController.swift in Sources */,
 				E1A0001526A0000100000001 /* JumpToFileController.swift in Sources */,
+				E1A0002326A0000100000001 /* AudioPlaybackExceptionGuard.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -367,6 +373,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = ru.aleksandr.macAmp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
+				SWIFT_OBJC_BRIDGING_HEADER = macAmp/macAmp-Bridging-Header.h;
 			};
 			name = Debug;
 		};
@@ -388,6 +395,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = ru.aleksandr.macAmp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
+				SWIFT_OBJC_BRIDGING_HEADER = macAmp/macAmp-Bridging-Header.h;
 			};
 			name = Release;
 		};

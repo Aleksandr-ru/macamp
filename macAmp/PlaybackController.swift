@@ -1542,8 +1542,25 @@ final class PlaybackController: NSObject, ObservableObject {
             reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
             return
         }
+        guard engine.isRunning else {
+            reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
+            return
+        }
         requestSpectrumFromNextPCMBuffer()
-        playerNode.play()
+        var playError: NSError?
+        guard MacAmpPlayAudioPlayerNode(playerNode, &playError) else {
+            playerNode.stop()
+            engine.stop()
+            engine.reset()
+            timer?.invalidate()
+            timer = nil
+            isPlaying = false
+            isPaused = false
+            reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
+            return
+        }
+        hasPlaybackError = false
+        title = preferredDisplayTitle
         isPlaying = true
         isPaused = false
         if let scopedURL { onPlaybackReady?(scopedURL) }
