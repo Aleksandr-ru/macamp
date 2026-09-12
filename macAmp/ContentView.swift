@@ -463,6 +463,12 @@ extension ContentView {
         rightClick: @escaping (NSEvent, NSView) -> Void
     ) -> some View {
         let width: CGFloat = toggle == .shuffle ? 47 : 28
+        let identity: String = {
+            switch toggle {
+            case .shuffle: return "playback-toggle-shuffle"
+            case .repeatTrack: return "playback-toggle-repeat"
+            }
+        }()
         return ZStack {
             Group {
                 if let image = skin.playbackToggleImage(
@@ -484,6 +490,7 @@ extension ContentView {
         }
         .frame(width: width, height: 15)
         .contentShape(Rectangle())
+        .id(identity)
     }
 
     private func windowToggleButton(

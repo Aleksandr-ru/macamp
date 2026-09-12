@@ -355,6 +355,35 @@ final class PlaylistLayout: ObservableObject {
     @Published var height: CGFloat = 232
 }
 
+/// Owns popup menu tracking so a new button cannot inherit the previous
+/// button's menu while AppKit is still finishing the prior mouse event.
+private final class PopupMenuCoordinator {
+    static let shared = PopupMenuCoordinator()
+
+    private weak var activeMenu: NSMenu?
+
+    private init() {}
+
+    func present(_ menu: NSMenu,
+                 in view: NSView,
+                 at location: NSPoint,
+                 onClosed: @escaping () -> Void = {}) {
+        activeMenu?.cancelTracking()
+        activeMenu = menu
+
+        guard activeMenu === menu else {
+            onClosed()
+            return
+        }
+
+        menu.popUp(positioning: nil, at: location, in: view)
+        if activeMenu === menu {
+            activeMenu = nil
+        }
+        onClosed()
+    }
+}
+
 /// Per-editor presentation state.  It deliberately lives beside the window,
 /// rather than in PlaylistModel, so model persistence remains AppKit-free.
 private final class PlaylistWindowContext {
@@ -2206,11 +2235,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func showShuffleMenu(for view: NSView, with event: NSEvent) {
-        NSMenu.popUpContextMenu(makeShuffleMenu(), with: event, for: view)
+        let location = view.convert(event.locationInWindow, from: nil)
+        let menu = makeShuffleMenu()
+        PopupMenuCoordinator.shared.present(menu, in: view, at: location)
     }
 
     func showRepeatMenu(for view: NSView, with event: NSEvent) {
-        NSMenu.popUpContextMenu(makeRepeatMenu(), with: event, for: view)
+        let location = view.convert(event.locationInWindow, from: nil)
+        let menu = makeRepeatMenu()
+        PopupMenuCoordinator.shared.present(menu, in: view, at: location)
     }
 
     private func makeOutputDeviceMenu() -> NSMenu {
@@ -2242,7 +2275,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showOutputDeviceMenu(with event: NSEvent) {
         guard let view = event.window?.contentView else { return }
         let point = view.convert(event.locationInWindow, from: nil)
-        makeOutputDeviceMenu().popUp(positioning: nil, at: point, in: view)
+        let menu = makeOutputDeviceMenu()
+        PopupMenuCoordinator.shared.present(menu, in: view, at: point)
     }
 
     private func configureFileItem(_ title: String, action: Selector, in menu: NSMenu) {
@@ -4974,21 +5008,34 @@ private struct PlaylistView: View {
         .position(x: x, y: 7)
     }
 
-    private var playlistBottomControls: some View {
-        ZStack(alignment: .topLeading) {
-            playlistMenuHotspot(x: 25, index: 0, titles: ["Add Files…", "Add Folder…", "Add URL…"])
-            playlistMenuHotspot(x: 54, index: 1, titles: [
-                "Remove Selected", "Crop", "Clear Playlist", "Remove with Error"
-            ], shortcuts: [
-                "Remove Selected": .delete,
-                "Remove with Error": .optionDelete
-            ])
-            playlistMenuHotspot(x: 83, index: 2, titles: ["Select All", "Select by rating", "Select None", "Invert Selection"], shortcuts: [
-                "Select All": .commandA
-            ])
-            playlistMenuHotspot(
-                x: 112,
+    private var playlistMenuButtons: [PlaylistMenuButtonDefinition] {
+        [
+            PlaylistMenuButtonDefinition(
+                index: 0,
+                centerX: 25,
+                titles: ["Add Files…", "Add Folder…", "Add URL…"],
+                pressedImage: skin.playlistMenuButtonPressedImage(index: 0)
+            ),
+            PlaylistMenuButtonDefinition(
+                index: 1,
+                centerX: 54,
+                titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove with Error"],
+                shortcuts: [
+                    "Remove Selected": .delete,
+                    "Remove with Error": .optionDelete
+                ],
+                pressedImage: skin.playlistMenuButtonPressedImage(index: 1)
+            ),
+            PlaylistMenuButtonDefinition(
+                index: 2,
+                centerX: 83,
+                titles: ["Select All", "Select by rating", "Select None", "Invert Selection"],
+                shortcuts: ["Select All": .commandA],
+                pressedImage: skin.playlistMenuButtonPressedImage(index: 2)
+            ),
+            PlaylistMenuButtonDefinition(
                 index: 3,
+                centerX: 112,
                 titles: [
                     "Automatic rating",
                     "File Info", "Edit metadata", "Reveal in Finder",
@@ -5000,15 +5047,28 @@ private struct PlaylistView: View {
                     "Edit metadata": .shiftE,
                     "Rebuild titles on selection": .commandOptionE
                 ],
-                separatorsBefore: ["File Info", "Sort by title", "Rebuild titles on selection"]
+                separatorsBefore: ["File Info", "Sort by title", "Rebuild titles on selection"],
+                pressedImage: skin.playlistMenuButtonPressedImage(index: 3)
+            ),
+            PlaylistMenuButtonDefinition(
+                index: 4,
+                centerX: layout.width - 33,
+                titles: ["New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"],
+                shortcuts: [
+                    "New Playlist": .commandN,
+                    "Load Playlist…": .commandO,
+                    "Save Playlist As…": .commandShiftS
+                ],
+                pressedImage: skin.playlistMenuButtonPressedImage(index: 4)
             )
-            playlistMenuHotspot(x: layout.width - 33, index: 4, titles: [
-                "New Playlist", "Load Playlist…", "Save Playlist As…", "Rename Playlist"
-            ], shortcuts: [
-                "New Playlist": .commandN,
-                "Load Playlist…": .commandO,
-                "Save Playlist As…": .commandShiftS
-            ])
+        ]
+    }
+
+    private var playlistBottomControls: some View {
+        ZStack(alignment: .topLeading) {
+            PlaylistMenuHotspot(buttons: playlistMenuButtons, playlist: playlist)
+                .frame(width: layout.width, height: 18)
+                .position(x: layout.width / 2, y: layout.height - 21)
 
             PlaylistStatusField(skin: skin, playback: playback, manager: manager, playlist: playlist)
                 .frame(width: 90, height: 8, alignment: .leading)
@@ -5252,23 +5312,6 @@ private struct PlaylistView: View {
         return String(format: "%02d:%02d:%02d", value / 3600, (value / 60) % 60, value % 60)
     }
 
-    private func playlistMenuHotspot(
-        x: CGFloat,
-        index: Int,
-        titles: [String],
-        shortcuts: [String: PlaylistMenuShortcut] = [:],
-        separatorsBefore: Set<String> = []
-    ) -> some View {
-        PlaylistMenuHotspot(
-            titles: titles,
-            shortcuts: shortcuts,
-            separatorsBefore: separatorsBefore,
-            playlist: playlist,
-            pressedImage: skin.playlistMenuButtonPressedImage(index: index)
-        )
-            .frame(width: 22, height: 18)
-            .position(x: x, y: layout.height - 21)
-    }
 }
 
 /// Observes only the entry represented by this row. Metadata completion can
@@ -5658,29 +5701,47 @@ private final class PlaylistContextMenuTarget: NSObject {
 
 /// AppKit receives the original mouse-down event, which is required to open a
 /// native popup menu. SwiftUI Button actions occur too late (on mouse-up).
-private struct PlaylistMenuHotspot: NSViewRepresentable {
+private struct PlaylistMenuButtonDefinition {
+    let index: Int
+    let centerX: CGFloat
     let titles: [String]
     let shortcuts: [String: PlaylistMenuShortcut]
     let separatorsBefore: Set<String>
-    let playlist: PlaylistModel
     let pressedImage: NSImage?
+
+    init(index: Int,
+         centerX: CGFloat,
+         titles: [String],
+         shortcuts: [String: PlaylistMenuShortcut] = [:],
+         separatorsBefore: Set<String> = [],
+         pressedImage: NSImage?) {
+        self.index = index
+        self.centerX = centerX
+        self.titles = titles
+        self.shortcuts = shortcuts
+        self.separatorsBefore = separatorsBefore
+        self.pressedImage = pressedImage
+    }
+
+    var hitRect: NSRect {
+        NSRect(x: centerX - 11, y: 0, width: 22, height: 18)
+    }
+}
+
+private struct PlaylistMenuHotspot: NSViewRepresentable {
+    let buttons: [PlaylistMenuButtonDefinition]
+    let playlist: PlaylistModel
 
     func makeNSView(context: Context) -> PlaylistMenuHotspotNSView {
         let view = PlaylistMenuHotspotNSView()
-        view.titles = titles
-        view.shortcuts = shortcuts
-        view.separatorsBefore = separatorsBefore
+        view.buttons = buttons
         view.playlist = playlist
-        view.pressedImage = pressedImage
         return view
     }
 
     func updateNSView(_ nsView: PlaylistMenuHotspotNSView, context: Context) {
-        nsView.titles = titles
-        nsView.shortcuts = shortcuts
-        nsView.separatorsBefore = separatorsBefore
+        nsView.buttons = buttons
         nsView.playlist = playlist
-        nsView.pressedImage = pressedImage
     }
 }
 
@@ -5699,27 +5760,46 @@ private struct PlaylistMenuShortcut {
 }
 
 private final class PlaylistMenuHotspotNSView: NSView {
-    var titles: [String] = []
-    var shortcuts: [String: PlaylistMenuShortcut] = [:]
-    var separatorsBefore: Set<String> = []
+    var buttons: [PlaylistMenuButtonDefinition] = [] { didSet { needsDisplay = true } }
     var playlist: PlaylistModel?
-    var pressedImage: NSImage? { didSet { needsDisplay = true } }
-    private var isPressed = false { didSet { needsDisplay = true } }
+    private var pressedButtonIndex: Int? { didSet { needsDisplay = true } }
+    private var pressGeneration = 0
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard isPressed else { return }
-        pressedImage?.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
+        guard let pressedButtonIndex,
+              let button = buttons.first(where: { $0.index == pressedButtonIndex }),
+              let pressedImage = button.pressedImage else { return }
+        pressedImage.draw(in: button.hitRect, from: .zero, operation: .copy, fraction: 1)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        buttons.contains(where: { $0.hitRect.contains(point) }) ? self : nil
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard !titles.isEmpty else { return }
-        isPressed = true
+        let point = convert(event.locationInWindow, from: nil)
+        guard let button = buttons.first(where: { $0.hitRect.contains(point) }),
+              !button.titles.isEmpty else { return }
+
+        pressGeneration += 1
+        let generation = pressGeneration
+        pressedButtonIndex = button.index
         displayIfNeeded()
 
+        let menu = makeMenu(for: button)
+        PopupMenuCoordinator.shared.present(menu, in: self, at: point) { [weak self] in
+            guard let self, self.pressGeneration == generation else { return }
+            self.pressedButtonIndex = nil
+        }
+    }
+
+    private func makeMenu(for button: PlaylistMenuButtonDefinition) -> NSMenu {
         let menu = NSMenu()
-        for title in titles {
-            if separatorsBefore.contains(title) { menu.addItem(.separator()) }
+        for title in button.titles {
+            if button.separatorsBefore.contains(title) { menu.addItem(.separator()) }
             if title == "Select by rating" {
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 let submenu = NSMenu(title: title)
@@ -5739,7 +5819,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
                 menu.addItem(item)
                 continue
             }
-            let shortcut = shortcuts[title]
+            let shortcut = button.shortcuts[title]
             let item = NSMenuItem(
                 title: title,
                 action: #selector(selectMenuItem(_:)),
@@ -5782,8 +5862,7 @@ private final class PlaylistMenuHotspotNSView: NSView {
             }
             menu.addItem(item)
         }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
-        isPressed = false
+        return menu
     }
 
     @objc private func selectRatingMenuItem(_ sender: NSMenuItem) {
@@ -6083,6 +6162,43 @@ private final class PlaylistWindowShadeResizeNSView: NSView {
     }
 }
 
+private struct EqualizerPresetMenuHotspot: NSViewRepresentable {
+    let isPressed: Binding<Bool>
+    let makeMenu: () -> NSMenu
+
+    func makeNSView(context: Context) -> EqualizerPresetMenuHotspotNSView {
+        let view = EqualizerPresetMenuHotspotNSView()
+        view.onPressed = { isPressed in self.isPressed.wrappedValue = isPressed }
+        view.makeMenu = makeMenu
+        return view
+    }
+
+    func updateNSView(_ nsView: EqualizerPresetMenuHotspotNSView, context: Context) {
+        nsView.onPressed = { isPressed in self.isPressed.wrappedValue = isPressed }
+        nsView.makeMenu = makeMenu
+    }
+}
+
+private final class EqualizerPresetMenuHotspotNSView: NSView {
+    var onPressed: ((Bool) -> Void)?
+    var makeMenu: (() -> NSMenu)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        onPressed?(true)
+        guard let makeMenu else {
+            onPressed?(false)
+            return
+        }
+        let menu = makeMenu()
+        let location = convert(event.locationInWindow, from: nil)
+        PopupMenuCoordinator.shared.present(menu, in: self, at: location) { [weak self] in
+            self?.onPressed?(false)
+        }
+    }
+}
+
 private struct EqualizerView: View {
     @ObservedObject private var skin = WinampSkinStore.shared
     @ObservedObject var interfaceScale: InterfaceScale
@@ -6249,21 +6365,16 @@ private struct EqualizerView: View {
     }
 
     private var presetButton: some View {
-        Group {
+        ZStack {
             if let image = skin.equalizerPresetsImage(pressed: isPresetPressed) {
                 Image(nsImage: image).interpolation(.none)
             } else {
                 Color.clear
             }
+            EqualizerPresetMenuHotspot(isPressed: $isPresetPressed, makeMenu: makePresetMenu)
         }
         .frame(width: 44, height: 12)
         .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 0)
-            .onChanged { _ in isPresetPressed = true }
-            .onEnded { value in
-                isPresetPressed = false
-                showPresetMenu(at: value.location)
-            })
         .position(x: 239, y: 24)
     }
 
@@ -6299,7 +6410,7 @@ private struct EqualizerView: View {
 
     private func normalized(_ db: Double) -> Double { min(1, max(0, (db + 20) / 40)) }
 
-    private func showPresetMenu(at location: CGPoint) {
+    private func makePresetMenu() -> NSMenu {
         let menu = NSMenu()
         var factoryPresets = EqualizerController.factoryPresets
         if let flatIndex = factoryPresets.firstIndex(where: { $0.name == "Flat" }) {
@@ -6343,7 +6454,7 @@ private struct EqualizerView: View {
         reset.target = EqualizerPresetMenuTarget.shared
         reset.representedObject = equalizer
         menu.addItem(reset)
-        NSMenu.popUpContextMenu(menu, with: NSApp.currentEvent ?? NSEvent(), for: NSApp.keyWindow?.contentView ?? NSView())
+        return menu
     }
 }
 
