@@ -2125,7 +2125,10 @@ final class WinampSkinStore: ObservableObject {
         return NSImage(cgImage: padded, size: targetSize)
     }
 
-    /// Classic `posbar.bmp`: a 248×10 track followed by normal and pressed 29×10 thumbs.
+    /// Classic `posbar.bmp`: a 248×10 track followed by normal and pressed
+    /// 29×10 thumbs. Some classic skins provide only the first seven rows;
+    /// Winamp still copies from source y=0 into the fixed 10-pixel destination
+    /// instead of rejecting the whole bitmap.
     func positionBarTrack() -> NSImage? {
         positionBarImage(cacheKey: "track", x: 0, width: 248)
     }
@@ -2138,12 +2141,43 @@ final class WinampSkinStore: ObservableObject {
         if let cached = positionBarCache[cacheKey] { return cached }
         guard let sheet = bitmap(named: "POSBAR.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              source.width >= x + width, source.height >= 10,
-              let cropped = source.cropping(to: CGRect(x: x, y: 0, width: width, height: 10)) else {
+              source.width >= x + width,
+              source.height > 0 else {
             return nil
         }
 
-        let image = NSImage(cgImage: cropped, size: NSSize(width: width, height: 10))
+        let targetHeight = 10
+        let availableHeight = min(targetHeight, source.height)
+        guard let cropped = source.cropping(to: CGRect(x: x,
+                                                        y: 0,
+                                                        width: width,
+                                                        height: availableHeight)),
+              let context = CGContext(
+                  data: nil,
+                  width: width,
+                  height: targetHeight,
+                  bitsPerComponent: 8,
+                  bytesPerRow: width * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                      | CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+
+        // draw_positionbar() uses BitBlt(..., sourceX, 0, ..., 10, ...),
+        // so a short source remains aligned to the source's top edge. In a
+        // Core Graphics image that means placing its rows at the high end of
+        // the bottom-left destination coordinate system.
+        context.clear(CGRect(x: 0, y: 0, width: width, height: targetHeight))
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .none
+        context.draw(cropped, in: CGRect(x: 0,
+                                         y: targetHeight - availableHeight,
+                                         width: width,
+                                         height: availableHeight))
+        guard let padded = context.makeImage() else { return nil }
+        let image = NSImage(cgImage: padded, size: NSSize(width: width, height: targetHeight))
         positionBarCache[cacheKey] = image
         return image
     }
