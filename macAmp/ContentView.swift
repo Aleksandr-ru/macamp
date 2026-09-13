@@ -82,8 +82,10 @@ struct ContentView: View {
 
     private var mainPlayerContent: some View {
         ZStack(alignment: .topLeading) {
-            if let main = skin.bitmap(named: "MAIN.BMP") {
-                Image(nsImage: main).resizable().interpolation(.none)
+            if let main = skin.mainWindowBackgroundImage() {
+                Image(nsImage: main)
+                    .interpolation(.none)
+                    .frame(width: 275, height: 116, alignment: .topLeading)
             } else {
                 Color(red: 0.12, green: 0.13, blue: 0.18)
             }

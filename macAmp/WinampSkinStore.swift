@@ -199,6 +199,7 @@ final class WinampSkinStore: ObservableObject {
     private var equalizerSliderCache: [String: NSImage] = [:]
     private var playlistTimeCache: [String: NSImage] = [:]
     private var playlistWindowShadeTrackCache: [String: NSImage] = [:]
+    private var mainWindowBackgroundCache: NSImage?
     private var textForegroundColorCache: NSColor?
     private var textBackgroundColorCache: NSColor?
     private var textForegroundColorResolved = false
@@ -1068,6 +1069,7 @@ final class WinampSkinStore: ObservableObject {
         equalizerSliderCache.removeAll()
         playlistTimeCache.removeAll()
         playlistWindowShadeTrackCache.removeAll()
+        mainWindowBackgroundCache = nil
         resolvedFontCache.removeAll()
         textForegroundColorCache = nil
         textBackgroundColorCache = nil
@@ -1112,6 +1114,29 @@ final class WinampSkinStore: ObservableObject {
         )
         image.cacheMode = .always
         bitmapCache[key] = image
+        return image
+    }
+
+    /// Classic Winamp's main surface is always 275×116 pixels. It copies
+    /// exactly that rectangle from Main.bmp, so skins with extra rows (such as
+    /// Pionner_HiFi's 275×134 sheet) are cropped rather than vertically
+    /// compressed into the player window.
+    func mainWindowBackgroundImage() -> NSImage? {
+        if let mainWindowBackgroundCache { return mainWindowBackgroundCache }
+        guard let sourceImage = bitmap(named: "MAIN.BMP"),
+              let source = sourceImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return nil
+        }
+        guard source.width >= 275, source.height >= 116,
+              let cropped = source.cropping(to: CGRect(x: 0, y: 0, width: 275, height: 116)) else {
+            // Keep the existing fallback behaviour for malformed undersized
+            // skins; valid classic skins always provide at least 275×116.
+            mainWindowBackgroundCache = sourceImage
+            return sourceImage
+        }
+        let image = NSImage(cgImage: cropped, size: NSSize(width: 275, height: 116))
+        image.cacheMode = .always
+        mainWindowBackgroundCache = image
         return image
     }
 
