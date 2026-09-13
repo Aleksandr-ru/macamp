@@ -1242,19 +1242,49 @@ private final class VisualizationNSView: NSView {
 
     private func drawOscilloscope(in context: CGContext) {
         let width = max(2, Int(bounds.width.rounded(.down)))
-        let height = max(1, bounds.height - 1)
+        let height = max(1, Int(bounds.height.rounded(.down)) - 1)
         guard samples.count > 1 else { return }
-        context.setStrokeColor((palette.last ?? .green).cgColor)
         context.setLineWidth(1)
-        context.beginPath()
+        var points = [CGPoint]()
+        points.reserveCapacity(width)
         for x in 0..<width {
             let source = x * (samples.count - 1) / (width - 1)
             let value = min(1, max(-1, samples[source]))
-            let y = (1 - (value + 1) / 2) * height
-            let point = CGPoint(x: CGFloat(x) + 0.5, y: y + 0.5)
-            x == 0 ? context.move(to: point) : context.addLine(to: point)
+            let normalizedValue: CGFloat = (value + 1) / 2
+            let y = (1 - normalizedValue) * CGFloat(height)
+            points.append(CGPoint(x: CGFloat(x) + 0.5, y: y + 0.5))
         }
-        context.strokePath()
+
+        // Winamp uses the five Oscilloscope entries (palette 18...22) based
+        // on the waveform's vertical position. Draw each segment separately
+        // so a skin's complete oscilloscope gradient remains visible.
+        for x in 0..<(points.count - 1) {
+            let start = points[x]
+            let end = points[x + 1]
+            let y = (start.y + end.y) * 0.5 - 0.5
+            let index = oscilloscopeColorIndex(for: y, height: height)
+            context.setStrokeColor(color(at: index, fallback: .green).cgColor)
+            context.beginPath()
+            context.move(to: start)
+            context.addLine(to: end)
+            context.strokePath()
+        }
+    }
+
+    private func oscilloscopeColorIndex(for y: CGFloat, height: Int) -> Int {
+        let normalizedRow = min(14, max(0, Int((y / CGFloat(max(1, height)) * 14).rounded(.down))))
+        let offset: Int
+        switch normalizedRow {
+        case 14: offset = 4
+        case 12...13: offset = 3
+        case 10...11: offset = 2
+        case 8...9: offset = 1
+        case 6...7: offset = 0
+        case 4...5: offset = 1
+        case 2...3: offset = 2
+        default: offset = 3
+        }
+        return 18 + offset
     }
 
     private func color(at index: Int, fallback: NSColor) -> NSColor {

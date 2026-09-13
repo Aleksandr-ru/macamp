@@ -2420,22 +2420,30 @@ final class WinampSkinStore: ObservableObject {
             return Self.defaultVisualizationPalette
         }
 
-        // VISCOLOR is an indexed table, not a list where malformed lines may
-        // be removed.  Preserve each line's index because color 2…17 are the
-        // spectrum gradient and color 23 is the independent peak marker.
+        // VISCOLOR is a list of RGB entries.  Some skins include blank lines,
+        // comments, or other malformed lines, so only valid RGB triplets
+        // consume an index (matching Winamp/Webamp's parser).
         var colors = Self.defaultVisualizationPalette
-        for (index, line) in text.split(whereSeparator: { $0.isNewline }).enumerated()
-            where index < colors.count {
-            let values = line.split(separator: "/", maxSplits: 1).first?
-                .split(separator: ",")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            guard let values, values.count >= 3 else { continue }
+        var index = 0
+        for line in text.split(whereSeparator: { $0.isNewline }) {
+            guard index < colors.count else { break }
+            // Classic skins append free-form comments after the RGB triplet
+            // (`0,10,0 = Spectrum 01`). Parse the first three numeric tokens
+            // instead of requiring the rest of the line to be comma-only.
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard trimmedLine.first?.isNumber == true else { continue }
+            let values = trimmedLine
+                .split { !$0.isNumber }
+                .prefix(3)
+                .compactMap { Int($0) }
+            guard values.count >= 3 else { continue }
             colors[index] = NSColor(
                 calibratedRed: CGFloat(min(255, max(0, values[0]))) / 255,
                 green: CGFloat(min(255, max(0, values[1]))) / 255,
                 blue: CGFloat(min(255, max(0, values[2]))) / 255,
                 alpha: 1
             )
+            index += 1
         }
         return colors
     }
