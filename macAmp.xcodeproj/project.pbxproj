@@ -23,6 +23,7 @@
 		E1A0001926A0000100000001 /* MilkDropShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001A26A0000100000001 /* MilkDropShaders.metal */; };
 		E1A0001B26A0000100000001 /* VisualizationWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001C26A0000100000001 /* VisualizationWindow.swift */; };
 		E1A0002326A0000100000001 /* AudioPlaybackExceptionGuard.m in Sources */ = {isa = PBXBuildFile; fileRef = E1A0002426A0000100000001 /* AudioPlaybackExceptionGuard.m */; };
+		E1A0002726A0000100000001 /* HTTPAudioStreamDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0002826A0000100000001 /* HTTPAudioStreamDecoder.swift */; };
 		27067742242E89F200CFBEE7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067741242E89F200CFBEE7 /* Assets.xcassets */; };
 		27067745242E89F200CFBEE7 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 27067744242E89F200CFBEE7 /* Preview Assets.xcassets */; };
 		27067748242E89F200CFBEE7 /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 27067746242E89F200CFBEE7 /* Main.storyboard */; };
@@ -47,6 +48,7 @@
 		E1A0001C26A0000100000001 /* VisualizationWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualizationWindow.swift; sourceTree = "<group>"; };
 		E1A0002526A0000100000001 /* AudioPlaybackExceptionGuard.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AudioPlaybackExceptionGuard.h; sourceTree = "<group>"; };
 		E1A0002426A0000100000001 /* AudioPlaybackExceptionGuard.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AudioPlaybackExceptionGuard.m; sourceTree = "<group>"; };
+		E1A0002826A0000100000001 /* HTTPAudioStreamDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPAudioStreamDecoder.swift; sourceTree = "<group>"; };
 		27067741242E89F200CFBEE7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		27067744242E89F200CFBEE7 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		27067747242E89F200CFBEE7 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
@@ -92,6 +94,7 @@
 				E1A0000426A0000100000001 /* InterfaceScale.swift */,
 				E1A0000826A0000100000001 /* DefaultSkin */,
 				E1A0000A26A0000100000001 /* PlaybackController.swift */,
+				E1A0002826A0000100000001 /* HTTPAudioStreamDecoder.swift */,
 				E1A0000C26A0000100000001 /* EqualizerController.swift */,
 				E1A0000E26A0000100000001 /* PlaylistManager.swift */,
 				E1A0001026A0000100000001 /* InfoWindow.swift */,
@@ -222,6 +225,7 @@
 				E1A0001126A0000100000001 /* TrackNotificationController.swift in Sources */,
 				E1A0001526A0000100000001 /* JumpToFileController.swift in Sources */,
 				E1A0002326A0000100000001 /* AudioPlaybackExceptionGuard.m in Sources */,
+				E1A0002726A0000100000001 /* HTTPAudioStreamDecoder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

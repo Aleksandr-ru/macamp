@@ -202,6 +202,149 @@ private final class FFTWorkspace {
     }
 }
 
+private struct StreamingEqualizerSettings {
+    var version: UInt64 = 0
+    var isEnabled = false
+    var preamp = 0.0
+    var bands = Array(repeating: 0.0, count: 10)
+}
+
+/// Per-tap DSP storage. AVPlayer does not pass URL playback through the
+/// AVAudioEngine graph, so its audio processing tap owns an equivalent bank
+/// of lightweight peaking filters. All storage is allocated in `prepare`;
+/// the real-time callback only updates coefficients and processes in place.
+private final class StreamingAudioTapContext {
+    private struct Coefficients {
+        var b0 = Float(1), b1 = Float(0), b2 = Float(0)
+        var a1 = Float(0), a2 = Float(0)
+    }
+
+    private struct FilterState {
+        var z1 = Float(0), z2 = Float(0)
+    }
+
+    weak var controller: PlaybackController?
+    private(set) var format = AudioStreamBasicDescription()
+    private var coefficients = Array(repeating: Coefficients(), count: 10)
+    private var activeBands = Array(repeating: false, count: 10)
+    private var states: [FilterState] = []
+    private var settingsVersion = UInt64.max
+    private var appliesEqualizer = false
+    private var preampScale = Float(1)
+
+    init(controller: PlaybackController) {
+        self.controller = controller
+    }
+
+    func prepare(format: AudioStreamBasicDescription) {
+        self.format = format
+        let channelCount = max(1, Int(format.mChannelsPerFrame))
+        states = Array(repeating: FilterState(), count: channelCount * 10)
+        settingsVersion = .max
+    }
+
+    func processEqualizer(
+        bufferList: UnsafeMutablePointer<AudioBufferList>,
+        frameCount: Int,
+        settings: StreamingEqualizerSettings
+    ) {
+        guard frameCount > 0,
+              format.mFormatID == kAudioFormatLinearPCM,
+              format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              format.mBitsPerChannel == 32 else { return }
+        if settings.version != settingsVersion {
+            updateCoefficients(settings)
+            settingsVersion = settings.version
+        }
+        guard appliesEqualizer else { return }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+        let isInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        if isInterleaved {
+            guard let buffer = buffers.first, let data = buffer.mData else { return }
+            let channelCount = max(1, Int(buffer.mNumberChannels))
+            let samples = data.assumingMemoryBound(to: Float.self)
+            for frame in 0..<frameCount {
+                for channel in 0..<channelCount {
+                    let index = frame * channelCount + channel
+                    samples[index] = process(samples[index] * preampScale, channel: channel)
+                }
+            }
+        } else {
+            var channel = 0
+            for buffer in buffers {
+                guard let data = buffer.mData else { continue }
+                let samples = data.assumingMemoryBound(to: Float.self)
+                let bufferChannelCount = max(1, Int(buffer.mNumberChannels))
+                for bufferChannel in 0..<bufferChannelCount {
+                    let channelIndex = channel + bufferChannel
+                    for frame in 0..<frameCount {
+                        let index = frame * bufferChannelCount + bufferChannel
+                        samples[index] = process(samples[index] * preampScale, channel: channelIndex)
+                    }
+                }
+                channel += bufferChannelCount
+            }
+        }
+    }
+
+    private func updateCoefficients(_ settings: StreamingEqualizerSettings) {
+        appliesEqualizer = settings.isEnabled && (
+            abs(settings.preamp) >= 0.001 || settings.bands.contains { abs($0) >= 0.001 }
+        )
+        preampScale = appliesEqualizer ? Float(pow(10, settings.preamp / 20)) : 1
+        guard appliesEqualizer, format.mSampleRate > 0 else {
+            for index in activeBands.indices { activeBands[index] = false }
+            for index in states.indices { states[index] = FilterState() }
+            return
+        }
+        let nyquist = format.mSampleRate / 2
+        for index in coefficients.indices {
+            let wasActive = activeBands[index]
+            activeBands[index] = abs(settings.bands[index]) >= 0.001
+            if wasActive != activeBands[index] {
+                for stateIndex in stride(from: index, to: states.count, by: coefficients.count) {
+                    states[stateIndex] = FilterState()
+                }
+            }
+            guard activeBands[index] else {
+                coefficients[index] = Coefficients()
+                continue
+            }
+            let frequency = min(Double(EqualizerController.frequencies[index]), nyquist - 1)
+            let gain = settings.bands[index]
+            let amplitude = pow(10, gain / 40)
+            let omega = 2 * Double.pi * frequency / format.mSampleRate
+            let sine = sin(omega)
+            let alpha = sine * sinh(log(2) * 0.5 * omega / max(abs(sine), 0.000_001))
+            let cosine = cos(omega)
+            let a0 = 1 + alpha / amplitude
+            coefficients[index] = Coefficients(
+                b0: Float((1 + alpha * amplitude) / a0),
+                b1: Float((-2 * cosine) / a0),
+                b2: Float((1 - alpha * amplitude) / a0),
+                a1: Float((-2 * cosine) / a0),
+                a2: Float((1 - alpha / amplitude) / a0)
+            )
+        }
+    }
+
+    private func process(_ input: Float, channel: Int) -> Float {
+        var value = input
+        for band in coefficients.indices {
+            guard activeBands[band] else { continue }
+            let stateIndex = channel * coefficients.count + band
+            guard states.indices.contains(stateIndex) else { break }
+            let coefficient = coefficients[band]
+            let output = coefficient.b0 * value + states[stateIndex].z1
+            states[stateIndex].z1 = coefficient.b1 * value - coefficient.a1 * output + states[stateIndex].z2
+            states[stateIndex].z2 = coefficient.b2 * value - coefficient.a2 * output
+            value = output
+        }
+        return value
+    }
+}
+
 struct AudioOutputDevice: Identifiable, Equatable {
     let id: AudioDeviceID
     let uid: String
@@ -639,6 +782,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var streamingEndObserver: Any?
     private var streamingTimeObserver: Any?
     private var streamingOpenGeneration: Int?
+    private var decodedHTTPStream: HTTPAudioStreamDecoder?
+    private var decodedHTTPFormat: AVAudioFormat?
+    private var decodedHasStarted = false
     /// Once a volume has demonstrated that AVAudioFile indexing is slow, do
     /// not repeat that speculative open for every following track from it.
     private var streamingPreferredVolumeRoots = Set<String>()
@@ -659,6 +805,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var analysisSnapshot = Array(repeating: Float(0), count: 1_024)
     private var liveAnalysisSampleCount = 0
     private var liveAnalysisSampleRate = 0.0
+    private let streamingEqualizerSettingsLock = NSLock()
+    private var streamingEqualizerSettings = StreamingEqualizerSettings()
     /// Protected by `analysisSamplesLock`. A new playback segment requests one
     /// immediate analyzer frame from the first fresh PCM buffer instead of
     /// waiting as long as a complete 6 Hz timer interval.
@@ -746,6 +894,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     deinit {
         timer?.invalidate()
+        decodedHTTPStream?.cancel()
         if let streamingEndObserver { NotificationCenter.default.removeObserver(streamingEndObserver) }
         if let streamingTimeObserver { streamingPlayer?.removeTimeObserver(streamingTimeObserver) }
         engine.mainMixerNode.removeTap(onBus: 0)
@@ -763,6 +912,21 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     func togglePlayback() { isPlaying ? pause() : play() }
 
     func play() {
+        if let decodedHTTPStream {
+            decodedHTTPStream.resume()
+            if decodedHasStarted {
+                var playError: NSError?
+                guard MacAmpPlayAudioPlayerNode(playerNode, &playError) else {
+                    reportPlaybackError(for: scopedURL, title: "AUDIO ENGINE ERROR")
+                    return
+                }
+                startTimer()
+            }
+            isPlaying = decodedHasStarted
+            isPaused = false
+            sourceStatus = decodedHasStarted ? "" : "BUFFERING"
+            return
+        }
         if let streamingPlayer {
             if streamingTimeObserver == nil { installStreamingTimeObserver(on: streamingPlayer) }
             streamingPlayer.play(); isPlaying = true; isPaused = false
@@ -780,6 +944,14 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     func pause() {
+        if let decodedHTTPStream {
+            decodedHTTPStream.suspend()
+            playerNode.pause()
+            timer?.invalidate(); timer = nil
+            isPlaying = false; isPaused = true
+            sourceStatus = ""
+            return
+        }
         if let streamingPlayer {
             streamingPlayer.pause()
             isPlaying = false; isPaused = true
@@ -796,6 +968,18 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     func stop() {
         playbackGeneration += 1
+        if decodedHTTPStream != nil {
+            stopDecodedHTTPPlayback()
+            position = 0
+            pendingSeekPosition = nil
+            isPlaying = false
+            isPaused = false
+            visualization.spectrumFrame = .empty
+            visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
+            visualization.waveformSamples = Array(repeating: 0, count: 76)
+            resetSpectrumAnimation()
+            return
+        }
         if streamingPlayer != nil {
             // AVPlayer can retain a decoder and continue network buffering
             // after `pause()`. That work was visible as 40 ms mouse-event
@@ -1020,6 +1204,12 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         equalizerNode.globalGain = Float(equalizer.preamp)
         for (band, value) in zip(equalizerNode.bands, equalizer.bands) { band.gain = Float(value) }
         equalizerNode.bypass = !hasEffectiveEqualizerCorrection
+        streamingEqualizerSettingsLock.lock()
+        streamingEqualizerSettings.version &+= 1
+        streamingEqualizerSettings.isEnabled = equalizer.isEnabled
+        streamingEqualizerSettings.preamp = equalizer.preamp
+        streamingEqualizerSettings.bands = equalizer.bands
+        streamingEqualizerSettingsLock.unlock()
         updateLiveAnalysisTap()
 
         // Bypassing AVAudioUnitEQ still leaves its ten filters on the render
@@ -1029,10 +1219,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         reconfigureAudioGraphForEqualizerState()
     }
 
-    private func connectAudioGraph(for format: AVAudioFormat) {
+    private func connectAudioGraph(for format: AVAudioFormat, forceEqualizerNode: Bool = false) {
         engine.disconnectNodeOutput(playerNode)
         engine.disconnectNodeOutput(equalizerNode)
-        routesThroughEqualizer = equalizer.isEnabled
+        routesThroughEqualizer = equalizer.isEnabled || forceEqualizerNode
         if routesThroughEqualizer {
             equalizerNode.bypass = !hasEffectiveEqualizerCorrection
             engine.connect(playerNode, to: equalizerNode, format: format)
@@ -1101,7 +1291,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             updateStreamingAnalysisTap()
             return
         }
-        let shouldInstall = sourceFile != nil && needsLiveAnalysis
+        let shouldInstall = (sourceFile != nil || decodedHTTPStream != nil) && needsLiveAnalysis
         guard shouldInstall != isLiveAnalysisTapInstalled else { return }
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
@@ -1164,7 +1354,12 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     /// to the player's item.  Do not keep that tap active while it has no
     /// visual or adaptive-EQ consumer: its callback runs on the audio thread.
     private func updateStreamingAnalysisTap() {
-        let shouldInstall = streamingPlayer != nil && streamingAudioTrack != nil && needsLiveAnalysis
+        // The same tap supplies visualization PCM and applies URL EQ. It must
+        // remain installed for audible EQ correction even when every visual
+        // surface and AUTO analysis are hidden.
+        let shouldInstall = streamingPlayer != nil
+            && streamingAudioTrack != nil
+            && (needsLiveAnalysis || hasEffectiveEqualizerCorrection)
         guard shouldInstall != isStreamingAnalysisTapInstalled else { return }
         guard let item = streamingPlayer?.currentItem else {
             isStreamingAnalysisTapInstalled = false
@@ -1206,6 +1401,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         }
         fileOpenGeneration &+= 1
         let generation = fileOpenGeneration
+        stopDecodedHTTPPlayback()
         stopStreamingPlayback()
         // Commit the track switch before touching the new URL. Apart from
         // making the Playlist highlight immediate, this lets the progressive
@@ -1223,7 +1419,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         title = "OPENING…"
         duration = 0
         bitrateKbps = nil
-        if isHTTPURL(url) || streamingPreferredVolumeRoots.contains(streamingVolumeRoot(for: url)) {
+        if isHTTPURL(url) {
+            startDecodedHTTPStream(for: url, generation: generation)
+            return
+        }
+        if streamingPreferredVolumeRoots.contains(streamingVolumeRoot(for: url)) {
             startStreamingFallback(for: url, generation: generation)
             return
         }
@@ -1388,6 +1588,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                         self.title = self.preferredDisplayTitle
                         self.sourceStatus = ""
                         self.loadStreamingBitrate(for: url, generation: generation)
+                        // Remote assets frequently expose no tracks while the
+                        // AVPlayerItem is being constructed. Resolve the item
+                        // track after it becomes ready, then attach the tap.
+                        self.streamingAudioTrack = item.tracks
+                            .compactMap(\.assetTrack)
+                            .first(where: { $0.mediaType == .audio }) ?? self.streamingAudioTrack
+                        self.updateStreamingAnalysisTap()
                         self.installStreamingTimeObserver(on: player)
                         self.requestSpectrumFromNextPCMBuffer()
                         player.play()
@@ -1400,6 +1607,109 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 }
             }
         }
+    }
+
+    private func startDecodedHTTPStream(for url: URL, generation: Int) {
+        guard generation == fileOpenGeneration, decodedHTTPStream == nil else { return }
+        streamingOpenGeneration = generation
+        let decoder = HTTPAudioStreamDecoder(url: url)
+        decodedHTTPStream = decoder
+        decoder.onReady = { [weak self, weak decoder] format, bitrate in
+            guard let self, let decoder, self.decodedHTTPStream === decoder,
+                  self.fileOpenGeneration == generation else { return }
+            do {
+                self.playerNode.stop()
+                self.engine.stop()
+                self.engine.reset()
+                self.engine.disconnectNodeOutput(self.playerNode)
+                self.engine.disconnectNodeOutput(self.equalizerNode)
+                self.decodedHTTPFormat = format
+                self.connectAudioGraph(for: format, forceEqualizerNode: true)
+                self.engine.prepare()
+                try self.engine.start()
+                self.scopedURL = url
+                self.position = 0
+                self.scheduledStartFrame = 0
+                self.sampleRateKHz = Int((format.sampleRate / 1_000).rounded())
+                self.channelCount = Int(format.channelCount)
+                self.bitrateKbps = bitrate
+                self.sourceStatus = "BUFFERING"
+                self.title = self.preferredDisplayTitle
+                self.smoothedBandEnergy = Array(repeating: -60, count: 10)
+                self.hasAdaptiveAnalysisHistory = false
+                self.updateLiveAnalysisTap()
+                self.requestSpectrumFromNextPCMBuffer()
+            } catch {
+                self.failDecodedHTTPStream(url: url, generation: generation)
+            }
+        }
+        decoder.onBuffer = { [weak self, weak decoder] buffer in
+            guard let self, let decoder, self.decodedHTTPStream === decoder,
+                  self.fileOpenGeneration == generation else { return }
+            self.playerNode.scheduleBuffer(buffer)
+            if self.decodedHasStarted {
+                if !self.isPaused, !self.playerNode.isPlaying {
+                    var playError: NSError?
+                    if !MacAmpPlayAudioPlayerNode(self.playerNode, &playError) {
+                        self.failDecodedHTTPStream(url: url, generation: generation)
+                    }
+                }
+                return
+            }
+            // URLSession and AudioConverter already buffer compressed input.
+            // Waiting for an additional arbitrary PCM threshold here can
+            // deadlock startup when AVAudioPlayerNode applies backpressure to
+            // scheduled buffers. Start as soon as the first decoded block is
+            // available; the underrun branch above resumes the node safely.
+            var playError: NSError?
+            guard MacAmpPlayAudioPlayerNode(self.playerNode, &playError) else {
+                self.failDecodedHTTPStream(url: url, generation: generation)
+                return
+            }
+            self.decodedHasStarted = true
+            self.hasPlaybackError = false
+            self.sourceStatus = ""
+            self.isPlaying = true
+            self.isPaused = false
+            self.startTimer()
+            self.onPlaybackReady?(url)
+        }
+        decoder.onMetadata = { [weak self, weak decoder] title in
+            guard let self, let decoder, self.decodedHTTPStream === decoder else { return }
+            self.onStreamMetadata?(url, title)
+        }
+        decoder.onFailure = { [weak self, weak decoder] _ in
+            guard let self, let decoder, self.decodedHTTPStream === decoder,
+                  self.fileOpenGeneration == generation else { return }
+            self.failDecodedHTTPStream(url: url, generation: generation)
+        }
+        decoder.start()
+    }
+
+    private func failDecodedHTTPStream(url: URL, generation: Int) {
+        let hadStarted = decodedHasStarted
+        stopDecodedHTTPPlayback()
+        if hadStarted {
+            reportPlaybackError(for: url, title: "SOURCE UNAVAILABLE")
+        } else {
+            // Formats outside the incremental MP3/AAC path (for example HLS)
+            // retain AVPlayer as a playback-only compatibility fallback.
+            startStreamingFallback(for: url, generation: generation)
+        }
+    }
+
+    private func stopDecodedHTTPPlayback() {
+        decodedHTTPStream?.cancel()
+        decodedHTTPStream = nil
+        decodedHTTPFormat = nil
+        decodedHasStarted = false
+        if streamingPlayer == nil { streamingOpenGeneration = nil }
+        playerNode.stop()
+        timer?.invalidate(); timer = nil
+        engine.mainMixerNode.removeTap(onBus: 0)
+        isLiveAnalysisTapInstalled = false
+        engine.pause()
+        sourceStatus = ""
     }
 
     private func installStreamingTimeObserver(on player: AVPlayer) {
@@ -1445,12 +1755,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     private func streamingAudioMix(for track: AVAssetTrack) -> AVAudioMix? {
+        let context = StreamingAudioTapContext(controller: self)
         var callbacks = MTAudioProcessingTapCallbacks(
             version: kMTAudioProcessingTapCallbacksVersion_0,
-            clientInfo: Unmanaged.passUnretained(self).toOpaque(),
+            clientInfo: Unmanaged.passRetained(context).toOpaque(),
             init: streamingTapInit,
-            finalize: nil,
-            prepare: nil,
+            finalize: streamingTapFinalize,
+            prepare: streamingTapPrepare,
             unprepare: nil,
             process: streamingTapProcess
         )
@@ -1460,7 +1771,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tap
-        ) == noErr, let tap else { return nil }
+        ) == noErr, let tap else {
+            Unmanaged.passUnretained(context).release()
+            return nil
+        }
         let parameters = AVMutableAudioMixInputParameters(track: track)
         parameters.audioTapProcessor = tap
         let mix = AVMutableAudioMix()
@@ -1500,21 +1814,51 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     /// small PCM slice; FFT work remains on the existing utility queue.
     fileprivate func captureStreamingAnalysisSamples(
         from bufferList: UnsafeMutablePointer<AudioBufferList>,
-        frameCount: Int
+        frameCount: Int,
+        format: AudioStreamBasicDescription
     ) {
         let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
-        guard frameCount > 0, let first = buffers.first, let data = first.mData else { return }
+        guard frameCount > 0,
+              format.mFormatID == kAudioFormatLinearPCM,
+              format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              format.mBitsPerChannel == 32 else { return }
         let sampleCount = min(frameCount, liveAnalysisSamples.count)
-        let samples = data.assumingMemoryBound(to: Float.self)
+        let sourceOffset = frameCount - sampleCount
+        let isInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         analysisSamplesLock.lock()
-        liveAnalysisSamples.withUnsafeMutableBufferPointer {
-            $0.baseAddress!.update(from: samples.advanced(by: frameCount - sampleCount), count: sampleCount)
+        liveAnalysisSamples.withUnsafeMutableBufferPointer { destination in
+            let output = destination.baseAddress!
+            output.initialize(repeating: 0, count: sampleCount)
+            var channelCount = 0
+            if isInterleaved, let buffer = buffers.first, let data = buffer.mData {
+                let channels = max(1, Int(buffer.mNumberChannels))
+                let samples = data.assumingMemoryBound(to: Float.self)
+                for channel in 0..<channels {
+                    for frame in 0..<sampleCount {
+                        output[frame] += samples[(sourceOffset + frame) * channels + channel]
+                    }
+                }
+                channelCount = channels
+            } else {
+                for buffer in buffers {
+                    guard let data = buffer.mData else { continue }
+                    let channels = max(1, Int(buffer.mNumberChannels))
+                    let samples = data.assumingMemoryBound(to: Float.self)
+                    for channel in 0..<channels {
+                        for frame in 0..<sampleCount {
+                            output[frame] += samples[(sourceOffset + frame) * channels + channel]
+                        }
+                    }
+                    channelCount += channels
+                }
+            }
+            if channelCount > 1 {
+                var scale = Float(1) / Float(channelCount)
+                vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(sampleCount))
+            }
         }
         liveAnalysisSampleCount = sampleCount
-        // AVPlayer's tap commonly supplies Float32 PCM. The FFT only needs a
-        // valid frequency scale; 44.1 kHz is the conservative fallback when
-        // a track does not expose its processing format to the tap.
-        liveAnalysisSampleRate = 44_100
+        liveAnalysisSampleRate = format.mSampleRate
         liveAnalysisGeneration &+= 1
         let shouldRequestSpectrum = requestsSpectrumOnNextBuffer
             && sampleCount >= visualFFTSize
@@ -1530,6 +1874,15 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 )
             }
         }
+    }
+
+    fileprivate var needsStreamingAnalysisSamples: Bool { needsLiveAnalysis }
+
+    fileprivate func currentStreamingEqualizerSettings() -> StreamingEqualizerSettings {
+        streamingEqualizerSettingsLock.lock()
+        let settings = streamingEqualizerSettings
+        streamingEqualizerSettingsLock.unlock()
+        return settings
     }
 
     /// Network shares mounted by Finder normally live at /Volumes/<share>.
@@ -1617,9 +1970,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         timer?.invalidate()
         let interval = liveAnalysisInterval
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self, let file = self.sourceFile else { return }
+            guard let self else { return }
+            let sampleRate: Double
+            if let file = self.sourceFile { sampleRate = file.processingFormat.sampleRate }
+            else if let format = self.decodedHTTPFormat { sampleRate = format.sampleRate }
+            else { return }
             guard !self.isVisualUpdatesSuspended else { return }
-            let rawPosition = Double(self.scheduledStartFrame + self.currentPlayedFrames()) / file.processingFormat.sampleRate
+            let rawPosition = Double(self.scheduledStartFrame + self.currentPlayedFrames()) / sampleRate
             let currentPosition = self.duration > 0 ? min(self.duration, rawPosition) : rawPosition
             // The time digits and progress thumb cannot display sub-quarter-
             // second changes.  Publishing them at the analyser cadence makes
@@ -1906,6 +2263,22 @@ private func streamingTapInit(
     tapStorageOut.pointee = clientInfo
 }
 
+private func streamingTapFinalize(_ tap: MTAudioProcessingTap) {
+    let storage = MTAudioProcessingTapGetStorage(tap)
+    Unmanaged<StreamingAudioTapContext>.fromOpaque(storage).release()
+}
+
+private func streamingTapPrepare(
+    _ tap: MTAudioProcessingTap,
+    _ maxFrames: CMItemCount,
+    _ processingFormat: UnsafePointer<AudioStreamBasicDescription>
+) {
+    let storage = MTAudioProcessingTapGetStorage(tap)
+    Unmanaged<StreamingAudioTapContext>.fromOpaque(storage)
+        .takeUnretainedValue()
+        .prepare(format: processingFormat.pointee)
+}
+
 private func streamingTapProcess(
     _ tap: MTAudioProcessingTap,
     _ numberFrames: CMItemCount,
@@ -1924,6 +2297,18 @@ private func streamingTapProcess(
     flagsOut.pointee = sourceFlags
     guard status == noErr else { return }
     let storage = MTAudioProcessingTapGetStorage(tap)
-    let controller = Unmanaged<PlaybackController>.fromOpaque(storage).takeUnretainedValue()
-    controller.captureStreamingAnalysisSamples(from: bufferList, frameCount: Int(sourceFrames))
+    let context = Unmanaged<StreamingAudioTapContext>.fromOpaque(storage).takeUnretainedValue()
+    guard let controller = context.controller else { return }
+    context.processEqualizer(
+        bufferList: bufferList,
+        frameCount: Int(sourceFrames),
+        settings: controller.currentStreamingEqualizerSettings()
+    )
+    if controller.needsStreamingAnalysisSamples {
+        controller.captureStreamingAnalysisSamples(
+            from: bufferList,
+            frameCount: Int(sourceFrames),
+            format: context.format
+        )
+    }
 }
