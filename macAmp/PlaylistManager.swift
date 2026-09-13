@@ -276,6 +276,16 @@ private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
             return
         }
 
+        // A web page is not a playlist.  In particular, playlist-generator
+        // links can redirect to an HTML landing page; treating every text/*
+        // response as M3U would then add arbitrary document lines to the
+        // editor.  Keep this check here as well as in the parser so both the
+        // probe and any future caller enforce the same content boundary.
+        if Self.looksLikeHTML(contentType: contentType, data: body) {
+            finish(.failure(PlaylistURLImportError.invalidPlaylist))
+            return
+        }
+
         // Some playlist generators answer with a plain-text redirect to the
         // actual station URL instead of returning an M3U body. Treat a single
         // HTTP(S) line as the stream it points to; otherwise the line would be
@@ -301,6 +311,33 @@ private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
         guard !data.isEmpty else { return true }
         return String(data: data, encoding: .utf8) != nil
             || String(data: data, encoding: .windowsCP1252) != nil
+    }
+
+    private static func looksLikeHTML(contentType: String, data: Data) -> Bool {
+        let normalizedType = contentType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            ?? ""
+        if normalizedType == "text/html"
+            || normalizedType == "application/xhtml+xml"
+            || normalizedType == "text/xhtml" {
+            return true
+        }
+
+        guard let text = String(data: data.prefix(Self.maximumProbeBytes), encoding: .utf8)
+                ?? String(data: data.prefix(Self.maximumProbeBytes), encoding: .windowsCP1252) else {
+            return false
+        }
+        let lower = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return lower.hasPrefix("<!doctype html")
+            || lower.hasPrefix("<html")
+            || lower.hasPrefix("<head")
+            || lower.hasPrefix("<body")
+            || lower.hasPrefix("<script")
+            || lower.hasPrefix("<meta ")
     }
 
     private static func looksLikePlaylist(_ data: Data) -> Bool {
@@ -1332,7 +1369,13 @@ final class PlaylistManager: ObservableObject {
 
         playlist.scannerState = .adding(playlist.entries.count)
         let token = UUID()
-        let probe = RemoteURLProbe(url: url) { [weak self, weak playlist] result in
+        // A few playlist-generator services expose the actual playlist URL in
+        // a `u=` query item and redirect the visible page to HTML. Probe the
+        // embedded playlist directly when its type is explicit; this keeps
+        // the generator page itself out of the playlist while preserving
+        // support for ordinary remote stream URLs.
+        let sourceURL = Self.playlistGeneratorSourceURL(from: url) ?? url
+        let probe = RemoteURLProbe(url: sourceURL) { [weak self, weak playlist] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
@@ -1425,6 +1468,27 @@ final class PlaylistManager: ObservableObject {
         return url
     }
 
+    private static func playlistGeneratorSourceURL(from url: URL) -> URL? {
+        let path = url.path.lowercased()
+        guard path.contains("playlistgenerator") else { return nil }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let queryItems = components.queryItems,
+              let targetValue = queryItems.first(where: { $0.name.lowercased() == "u" })?.value,
+              let targetURL = normalizedRemoteURL(from: targetValue) else {
+            return nil
+        }
+
+        let playlistExtensions = Set(["m3u", "m3u8", "pls"])
+        let targetIsPlaylist = playlistExtensions.contains(targetURL.pathExtension.lowercased())
+        let requestedType = queryItems
+            .first(where: { $0.name.lowercased() == "t" })?.value
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")).lowercased() }
+        guard targetIsPlaylist || (requestedType.map { playlistExtensions.contains($0) } ?? false) else {
+            return nil
+        }
+        return targetURL
+    }
+
     private static func displayTitle(for url: URL) -> String {
         let pathTitle = url.deletingPathExtension().lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1441,6 +1505,21 @@ final class PlaylistManager: ObservableObject {
         guard let text = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .utf16)
                 ?? String(data: data, encoding: .windowsCP1252) else { return nil }
+
+        // Do not interpret HTML/XML documents as a permissive line-oriented
+        // M3U file.  This is intentionally based on both the leading markup
+        // and the complete text so a document cannot leak individual URLs
+        // into the playlist merely because they happen to be on their own
+        // lines.
+        let lower = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let markupProbe = String(lower.prefix(8 * 1024))
+        guard !lower.hasPrefix("<!doctype html"),
+              !lower.hasPrefix("<html"),
+              !lower.hasPrefix("<head"),
+              !lower.hasPrefix("<body"),
+              !lower.hasPrefix("<?xml"),
+              !markupProbe.contains("<html"),
+              !markupProbe.contains("<head") else { return nil }
 
         let lines = text.components(separatedBy: .newlines)
         let upper = text.uppercased()
