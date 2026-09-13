@@ -20,7 +20,7 @@ final class PlaylistEntry: ObservableObject, Identifiable {
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
     /// Numeric POPM value, not the five-star presentation value. Zero means no
-    /// usable macAmp POPM record is available for this file.
+    /// usable POPM rating is available for this file.
     @Published var rating: UInt8 = 0
     /// Runtime-only result of an unsuccessful read/playback attempt.  This is
     /// deliberately absent from StoredEntry: a fresh launch retries files.
@@ -2170,7 +2170,10 @@ final class PlaylistManager: ObservableObject {
             let duration = asset.duration.seconds
             let artist = asset.commonMetadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
             let title = asset.commonMetadata.first(where: { $0.commonKey?.rawValue == "title" })?.stringValue
-            let rating = TrackRatingStore.readOrInitialize(url: work.entry.url, allowWrite: true)?.rating ?? 0
+            // Metadata scans must be strictly read-only. If another player
+            // supplied POPM values, TrackRatingStore averages them for
+            // display; an absent rating remains zero and shows no stars.
+            let rating = TrackRatingStore.read(url: work.entry.url)?.rating ?? 0
             return (duration.isFinite && duration > 0 ? duration : nil, artist, title, rating, true)
         }
         let applyResult = DispatchWorkItem { [self] in

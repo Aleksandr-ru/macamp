@@ -27,21 +27,41 @@ struct TrackRating: Equatable {
 /// and all writing goes through the editor's overlap-safe in-place writer.
 enum TrackRatingStore {
     static let identifier = "macAmp"
-    private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "automatic-rating")
 
-    static func readOrInitialize(url: URL, allowWrite: Bool) -> TrackRating? {
+    /// Reads the rating intended for display. A macAmp POPM record wins; in
+    /// its absence, ratings from other players are averaged. Reading never
+    /// changes the file.
+    static func read(url: URL) -> TrackRating? {
         guard let records = readRecords(url: url) else { return nil }
         if let ours = records.first(where: { $0.identifier == identifier }) { return ours.value }
-        guard allowWrite, FileManager.default.isWritableFile(atPath: url.path) else { return nil }
-        let others = records.filter { $0.identifier != identifier }.map { Int($0.value.rating) }
-        let initial = others.isEmpty ? 128 : UInt8(min(255, max(1, Int((Double(others.reduce(0, +)) / Double(others.count)).rounded()))))
-        let result = TrackRating(rating: initial, counter: 0)
-        do { try AudioTagWriter.updatePopularimeter(rating: result.rating, counter: result.counter, identifier: identifier, to: url); return result }
-        catch { logger.error("Rating initialization failed; path=\(url.path, privacy: .public); error=\(error.localizedDescription, privacy: .public)"); return nil }
+        return averageRating(records.filter { $0.identifier != identifier }.map(\.value))
+    }
+
+    /// Reads only the persisted macAmp value, including its adaptation count.
+    /// This is used when a user changes a rating and must preserve the count.
+    static func readOwn(url: URL) -> TrackRating? {
+        guard let records = readRecords(url: url) else { return nil }
+        return records.first(where: { $0.identifier == identifier })?.value
+    }
+
+    /// Supplies the starting point for an automatic-rating event without
+    /// persisting it. The caller writes the resulting changed value once.
+    static func ratingForAutomaticUpdate(url: URL) -> TrackRating? {
+        guard url.isFileURL, url.pathExtension.lowercased() == "mp3", !url.path.isEmpty else { return nil }
+        let records = readRecords(url: url) ?? []
+        if let ours = records.first(where: { $0.identifier == identifier }) { return ours.value }
+        return averageRating(records.filter { $0.identifier != identifier }.map(\.value))
+            ?? TrackRating(rating: 128, counter: 0)
     }
 
     static func write(_ value: TrackRating, to url: URL) throws {
         try AudioTagWriter.updatePopularimeter(rating: value.rating, counter: value.counter, identifier: identifier, to: url)
+    }
+
+    private static func averageRating(_ ratings: [TrackRating]) -> TrackRating? {
+        guard !ratings.isEmpty else { return nil }
+        let total = ratings.reduce(0) { $0 + Int($1.rating) }
+        return TrackRating(rating: UInt8(min(255, max(0, Int((Double(total) / Double(ratings.count)).rounded())))), counter: 0)
     }
 
     private static func readRecords(url: URL) -> [(identifier: String, value: TrackRating)]? {
@@ -646,10 +666,10 @@ final class TagEditorModel: ObservableObject {
         }
     }
 
-    /// Rating persistence is currently POPM/ID3-only.  Keep this capability
-    /// separate from general metadata editing: a file may have readable tags
-    /// while still not supporting the rating command.
-    static func canSetRating(for url: URL, metadata: [AVMetadataItem]) -> Bool {
+    /// Rating persistence is POPM/ID3-only, but it does not require an
+    /// existing ID3v2 tag: a manual rating may create the minimal tag needed
+    /// to hold its POPM frame.
+    static func canSetRating(for url: URL) -> Bool {
         guard url.isFileURL,
               url.pathExtension.lowercased() == "mp3",
               !url.path.isEmpty,
@@ -658,7 +678,7 @@ final class TagEditorModel: ObservableObject {
               values.isRegularFile == true,
               values.isDirectory != true,
               values.isSymbolicLink != true else { return false }
-        return hasMetadataTag(for: url, metadata: metadata)
+        return true
     }
 
     private static func hasEditableID3Metadata(in metadata: [AVMetadataItem]) -> Bool {
@@ -1048,9 +1068,8 @@ private enum AudioTagWriter {
         }
     }
 
-    /// Updates only macAmp's POPM frame. This deliberately refuses a file
-    /// without an existing ID3v2 tag: automatic rating must never create tags
-    /// for previously untagged audio.
+    /// Updates only macAmp's POPM frame. For an untagged MP3 this creates the
+    /// minimal ID3v2 tag required for POPM, without adding user metadata.
     static func updatePopularimeter(rating: UInt8, counter: UInt32, identifier: String, to url: URL) throws {
         guard isSafeRegularFile(url), url.pathExtension.lowercased() == "mp3" else {
             throw TagEditorError.unsupportedFormat(url.pathExtension)
@@ -1062,7 +1081,6 @@ private enum AudioTagWriter {
         defer { try? input.close() }
         let length = try input.seekToEnd(); input.seek(toFileOffset: 0)
         let header = try readID3Header(from: input, fileLength: length)
-        guard header.audioStart > 0 else { throw TagEditorError.metadataReadFailed }
         var frames = try preservedID3Frames(from: header.tagData, version: header.version)
         frames.removeAll { frame in
             guard frame.count >= 10, String(bytes: frame.prefix(4), encoding: .ascii) == "POPM" else { return false }

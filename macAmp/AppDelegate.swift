@@ -2631,7 +2631,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let event = playbackRatingEvent, !event.invalidated,
               let playlist = playlistManager.playlist(id: event.playlistID), playlist.automaticRatingEnabled,
               let entry = playlist.entries.first(where: { $0.id == event.entryID }),
-              let old = TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: true), old.rating > 0 else { return }
+              let old = TrackRatingStore.ratingForAutomaticUpdate(url: entry.url), old.rating > 0 else { return }
         let fraction = completed ? 1.0 : min(1, max(0, playback.duration > 0 ? playback.position / playback.duration : 0))
         let factor = fraction < 0.5 ? 1 - 2 * fraction : 2 * fraction - 1
         let delta = max(1, Int((Double(RatingPreferences.shared.adaptationPeriod.rawValue) * factor / (Double(old.counter) + 1)).rounded()))
@@ -2654,7 +2654,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
         for entry in playlist.entries where entryIDs.contains(entry.id)
             && entry.url.isFileURL && !entry.url.path.isEmpty {
-            do { try TrackRatingStore.write(TrackRating(rating: value, counter: TrackRatingStore.readOrInitialize(url: entry.url, allowWrite: false)?.counter ?? 0), to: entry.url); updateRating(value, for: entry.url) }
+            do { try TrackRatingStore.write(TrackRating(rating: value, counter: TrackRatingStore.readOwn(url: entry.url)?.counter ?? 0), to: entry.url); updateRating(value, for: entry.url) }
             catch { presentRatingWriteError(error) }
         }
     }
@@ -2667,7 +2667,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }) else {
             let value: UInt8 = stars == 0 ? 0 : UInt8(min(255, max(1, stars * 51)))
             do {
-                let counter = TrackRatingStore.readOrInitialize(url: url, allowWrite: false)?.counter ?? 0
+                let counter = TrackRatingStore.readOwn(url: url)?.counter ?? 0
                 try TrackRatingStore.write(TrackRating(rating: value, counter: counter), to: url)
                 infoModel.applyKnownRating(value, for: url)
             } catch { presentRatingWriteError(error) }

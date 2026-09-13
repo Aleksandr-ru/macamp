@@ -240,15 +240,6 @@ final class InfoWindowModel: ObservableObject {
                 return key == frame || identifier?.hasSuffix("/\(frame)") == true
             }
         }
-        func isPOPM(_ item: AVMetadataItem) -> Bool {
-            let key = (item.key as? String)?.uppercased()
-            let identifier = item.identifier?.rawValue.uppercased()
-            return key == "POPM" || identifier == "POPM" || identifier?.hasSuffix("/POPM") == true
-        }
-        func popmOwner(_ item: AVMetadataItem) -> String? {
-            guard let data = item.dataValue, let separator = data.firstIndex(of: 0) else { return nil }
-            return String(data: data[..<separator], encoding: .isoLatin1)
-        }
         func text(_ item: AVMetadataItem?) -> String? {
             guard let value = item?.stringValue else { return nil }
             // Metadata containers may use CRLF or a lone CR for paragraph
@@ -293,19 +284,12 @@ final class InfoWindowModel: ObservableObject {
             ?? metadata.first(where: { $0.commonKey == .commonKeyArtwork })?.dataValue {
             result.artwork = NSImage(data: artworkData)
         }
-        if let ownRating = TrackRatingStore.readOrInitialize(url: url, allowWrite: false) {
-            result.rating = TrackRating.stars(for: ownRating.rating)
-        } else if let popularity = metadata.first(where: { isPOPM($0) && popmOwner($0) == TrackRatingStore.identifier })
-                    ?? metadata.first(where: isPOPM) {
-            let byte: Int?
-            if let data = popularity.dataValue, let separator = data.firstIndex(of: 0), separator + 1 < data.endIndex {
-                byte = Int(data[data.index(after: separator)])
-            } else {
-                byte = popularity.numberValue?.intValue
-            }
-            if let byte { result.rating = TrackRating.stars(for: UInt8(min(255, max(0, byte)))) }
+        // Info is also a read-only consumer. It uses the same macAmp-first,
+        // other-players-average policy as the playlist without creating POPM.
+        if let rating = TrackRatingStore.read(url: url) {
+            result.rating = TrackRating.stars(for: rating.rating)
         }
-        result.canSetRating = TagEditorModel.canSetRating(for: url, metadata: metadata)
+        result.canSetRating = TagEditorModel.canSetRating(for: url)
 
         var technical: [String] = []
         let duration = asset.duration.seconds
@@ -531,10 +515,10 @@ final class InfoPanelView: NSView {
             leftArtworkHeight = placeholderSize
         }
 
-        // Showing a stored rating is independent from whether this file can
-        // accept a new one. Keep ratings visible for read-only/unsupported
-        // files, while the context menu below remains editing-only.
-        if model.content.canSetRating || model.content.rating > 0 {
+        // Do not reserve a five-star control for an unrated file. Rating can
+        // still be set through the context menu, but stars appear only when a
+        // stored (including another player's) rating was actually read.
+        if model.content.rating > 0 {
             let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 12 * pixelScale), color: skin.playlistColors().normalText)
             rating.menu = copyMenu
             rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
