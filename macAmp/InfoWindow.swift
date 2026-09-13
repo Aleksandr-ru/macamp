@@ -683,7 +683,7 @@ final class InfoPanelView: NSView {
     private var resizeRect: NSRect { let scale = pixelScale; return NSRect(x: bounds.width - 20 * scale, y: 0, width: 20 * scale, height: 20 * scale) }
     private var titleRect: NSRect { let scale = pixelScale; return NSRect(x: 0, y: bounds.height - 20 * scale, width: max(1, bounds.width - 20 * scale), height: 20 * scale) }
 
-    override func resetCursorRects() { addCursorRect(resizeRect, cursor: skin.cursor(named: "PSIZE.CUR") ?? SkinCursors.resizeNorthwestSoutheast); addCursorRect(titleRect, cursor: skin.cursor(named: "TITLEBAR.CUR") ?? .arrow) }
+    override func resetCursorRects() { addCursorRect(resizeRect, cursor: skin.cursor(named: "PSIZE.CUR") ?? SkinCursors.resizeNorthwestSoutheast); addCursorRect(titleRect, cursor: skin.cursor(named: "TITLEBAR.CUR") ?? SkinCursors.move) }
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if closeRect.contains(point) { trackClose(); return }

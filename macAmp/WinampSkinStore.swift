@@ -1451,7 +1451,8 @@ final class WinampSkinStore: ObservableObject {
         return NSFontManager.shared.font(withFamily: family, traits: [], weight: 5, size: size)
     }
 
-    /// Classic skins provide a dedicated diagonal Playlist resize cursor.
+    /// Classic skins provide dedicated cursors, including Playlist resize and
+    /// normal-window cursors that may be encoded as RIFF/ANI.
     func cursor(named filename: String, hotSpot: NSPoint = NSPoint(x: 8, y: 8)) -> NSCursor? {
         guard useSkinCursors, let directory = extractedDirectory else { return nil }
         let fileKey = filename.lowercased()
@@ -1471,12 +1472,72 @@ final class WinampSkinStore: ObservableObject {
             return nil
         }
         guard let image = NSImage(contentsOf: url) else {
-            missingSkinFiles.insert(fileKey)
-            return nil
+            guard let data = try? Data(contentsOf: url),
+                  let frameData = firstAnimatedCursorFrame(in: data),
+                  let image = NSImage(data: frameData) else {
+                missingSkinFiles.insert(fileKey)
+                return nil
+            }
+            let cursor = NSCursor(image: image, hotSpot: hotSpot)
+            cursorCache[key] = cursor
+            return cursor
         }
         let cursor = NSCursor(image: image, hotSpot: hotSpot)
         cursorCache[key] = cursor
         return cursor
+    }
+
+    /// macOS does not load Windows RIFF/ANI cursors through NSImage. Classic
+    /// skins may use ANI for a normal Playlist cursor (for example Pioneer),
+    /// so extract its first embedded CUR/ICO frame as a static NSImage. The
+    /// frame is sufficient for NSCursor, which has no animated-image API.
+    private func firstAnimatedCursorFrame(in data: Data) -> Data? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 12,
+              bytes[0] == 0x52, bytes[1] == 0x49, bytes[2] == 0x46, bytes[3] == 0x46,
+              bytes[8] == 0x41, bytes[9] == 0x43, bytes[10] == 0x4F, bytes[11] == 0x4E else {
+            return nil
+        }
+
+        let listID: UInt32 = 0x5453494C // "LIST"
+        let iconID: UInt32 = 0x6E6F6369 // "icon"
+
+        func uint32(at offset: Int) -> UInt32 {
+            UInt32(bytes[offset])
+                | (UInt32(bytes[offset + 1]) << 8)
+                | (UInt32(bytes[offset + 2]) << 16)
+                | (UInt32(bytes[offset + 3]) << 24)
+        }
+
+        func findFrame(in start: Int, end: Int) -> Data? {
+            var offset = start
+            while offset + 8 <= end {
+                let chunkID = uint32(at: offset)
+                let chunkLength = Int(uint32(at: offset + 4))
+                let payloadStart = offset + 8
+                guard chunkLength >= 0,
+                      payloadStart <= end,
+                      chunkLength <= end - payloadStart else { return nil }
+                let payloadEnd = payloadStart + chunkLength
+
+                if chunkID == iconID {
+                    return Data(bytes[payloadStart..<payloadEnd])
+                }
+                if chunkID == listID, chunkLength >= 4,
+                   let frame = findFrame(in: payloadStart + 4, end: payloadEnd) {
+                    return frame
+                }
+
+                // RIFF chunks are word-aligned; malformed padding is treated
+                // as the end of this list rather than walking out of bounds.
+                let nextOffset = payloadEnd + (chunkLength & 1)
+                guard nextOffset > offset else { return nil }
+                offset = nextOffset
+            }
+            return nil
+        }
+
+        return findFrame(in: 12, end: bytes.count)
     }
 
     /// The classic title bar uses rows 0/15; windowshade uses the compact rows 29/42.

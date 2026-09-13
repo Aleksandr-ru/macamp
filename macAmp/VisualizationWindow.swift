@@ -232,7 +232,7 @@ final class VisualizationPanelView: NSView {
 
     override func resetCursorRects() {
         addCursorRect(resizeRect, cursor: skin.cursor(named: "PSIZE.CUR") ?? SkinCursors.resizeNorthwestSoutheast)
-        addCursorRect(titleRect, cursor: skin.cursor(named: "TITLEBAR.CUR") ?? .arrow)
+        addCursorRect(titleRect, cursor: skin.cursor(named: "TITLEBAR.CUR") ?? SkinCursors.move)
     }
 
     override func mouseDown(with event: NSEvent) {

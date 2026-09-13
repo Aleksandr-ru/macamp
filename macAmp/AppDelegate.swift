@@ -201,6 +201,7 @@ private final class PlayerWindow: NSWindow {
                    defer: flag)
         hidesOnDeactivate = false
         collectionBehavior = [.managed]
+        acceptsMouseMovedEvents = true
     }
 
     override var canBecomeKey: Bool { true }
@@ -284,6 +285,12 @@ private final class PlayerWindow: NSWindow {
         if activatesPanel {
             contentView?.layoutSubtreeIfNeeded()
             contentView?.displayIfNeeded()
+        }
+        // Winamp resolves the cursor for the complete window in WM_SETCURSOR.
+        // SwiftUI/AppKit child views can otherwise restore the system arrow
+        // after their own event handling, especially inside Playlist Editor.
+        if event.type == .mouseMoved || event.type == .cursorUpdate {
+            AppDelegate.shared?.updateSkinCursor(event)
         }
     }
 }
@@ -865,7 +872,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyboardShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .mouseMoved]) { [weak self] event in
             guard let self else { return event }
             if event.type == .mouseMoved {
-                self.updateInfoHoverCursor(event)
+                self.updateSkinCursor(event)
                 return event
             }
             return self.handleLocalPlaybackShortcut(event) ? nil : event
@@ -876,6 +883,179 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard event.window === infoWindow,
               let panel = infoWindow?.contentView as? InfoPanelView else { return }
         panel.updateHoverCursor(at: event.locationInWindow)
+    }
+
+    /// Winamp selects a cursor from a coordinate table for every classic
+    /// player window. SwiftUI controls do not expose AppKit cursor rectangles
+    /// for their complete hit areas, so keep the same table at the window
+    /// boundary and update it from the local mouse stream.
+    func updateSkinCursor(_ event: NSEvent) {
+        guard let sourceWindow = event.window,
+              isSkinnedPlayerWindow(sourceWindow) else { return }
+
+        let scale = max(CGFloat(interfaceScale.factor), 0.0001)
+        let contentBounds = sourceWindow.contentView?.bounds
+            ?? NSRect(origin: .zero, size: sourceWindow.frame.size)
+        let logicalWidth = contentBounds.width / scale
+        let logicalHeight = contentBounds.height / scale
+        let point = NSPoint(
+            x: (event.locationInWindow.x - contentBounds.minX) / scale,
+            y: logicalHeight - (event.locationInWindow.y - contentBounds.minY) / scale
+        )
+
+        let cursor: NSCursor
+        if sourceWindow === window {
+            cursor = mainWindowCursor(at: point, isWindowShaded: windowShade.isEnabled)
+        } else if sourceWindow === equalizerWindow {
+            cursor = equalizerWindowCursor(at: point)
+        } else if let isWindowShaded = playlistWindowShadeState(for: sourceWindow) {
+            cursor = playlistWindowCursor(at: point,
+                                          width: logicalWidth,
+                                          height: logicalHeight,
+                                          isWindowShaded: isWindowShaded)
+        } else if sourceWindow === infoWindow || sourceWindow === visualizationWindow {
+            cursor = genericWindowCursor(at: point, width: logicalWidth, height: logicalHeight)
+        } else {
+            return
+        }
+        cursor.set()
+        // Info text has interactive links that are more specific than the
+        // window-wide Winamp cursor table. Reapply that hit-test after the
+        // default so a child view cannot leave the link with an arrow.
+        if sourceWindow === infoWindow {
+            updateInfoHoverCursor(event)
+        }
+    }
+
+    private func mainWindowCursor(at point: NSPoint, isWindowShaded: Bool) -> NSCursor {
+        if isWindowShaded {
+            if cursorRegion(point, x: 254, y: 3, width: 8, height: 9) {
+                return skinCursor(named: "WINBUT.CUR", fallback: .arrow)
+            }
+            if cursorRegion(point, x: 244, y: 3, width: 9, height: 9) {
+                return skinCursor(named: "MIN.CUR", fallback: .arrow)
+            }
+            if cursorRegion(point, x: 228, y: 3, width: 14, height: 9) {
+                return skinCursor(named: "WSPOSBAR.CUR", fallback: .resizeLeftRight)
+            }
+            if cursorRegion(point, x: 264, y: 3, width: 8, height: 9) {
+                return skinCursor(named: "CLOSE.CUR", fallback: .arrow)
+            }
+            if cursorRegion(point, x: 5, y: 3, width: 12, height: 10) {
+                return skinCursor(named: "MMENU.CUR", fallback: .arrow)
+            }
+            return skinCursor(named: "WSNORMAL.CUR", fallback: .arrow)
+        }
+
+        if cursorRegion(point, x: 107, y: 58, width: 108, height: 8) {
+            return skinCursor(named: "VOLBAL.CUR", fallback: .resizeLeftRight)
+        }
+        if cursorRegion(point, x: 18, y: 73, width: 245, height: 8) {
+            return skinCursor(named: "POSBAR.CUR", fallback: .resizeLeftRight)
+        }
+        if cursorRegion(point, x: 254, y: 3, width: 8, height: 9) {
+            return skinCursor(named: "WINBUT.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 244, y: 3, width: 9, height: 9) {
+            return skinCursor(named: "MIN.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 264, y: 3, width: 8, height: 9) {
+            return skinCursor(named: "CLOSE.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 5, y: 3, width: 12, height: 10) {
+            return skinCursor(named: "MAINMENU.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 0, y: 0, width: 275, height: 13) {
+            return skinCursor(named: "TITLEBAR.CUR", fallback: SkinCursors.move)
+        }
+        if cursorRegion(point, x: 105, y: 24, width: 161, height: 11) {
+            return skinCursor(named: "SONGNAME.CUR", fallback: .arrow)
+        }
+        return skinCursor(named: "NORMAL.CUR", fallback: .arrow)
+    }
+
+    private func equalizerWindowCursor(at point: NSPoint) -> NSCursor {
+        if cursorRegion(point, x: 264, y: 3, width: 8, height: 9) {
+            return skinCursor(named: "EQCLOSE.CUR", fallback: .arrow)
+        }
+        let sliderY = 39...98
+        if sliderY.contains(Int(point.y)) {
+            if cursorRegion(point, x: 21, y: 39, width: 12, height: 59) {
+                return skinCursor(named: "EQSLID.CUR", fallback: .resizeUpDown)
+            }
+            for slider in 0..<10 {
+                let x = CGFloat(78 + slider * 18)
+                if cursorRegion(point, x: x, y: 39, width: 12, height: 59) {
+                    return skinCursor(named: "EQSLID.CUR", fallback: .resizeUpDown)
+                }
+            }
+        }
+        if cursorRegion(point, x: 0, y: 0, width: 275, height: 13) {
+            return skinCursor(named: "EQTITLE.CUR", fallback: SkinCursors.move)
+        }
+        return skinCursor(named: "EQNORMAL.CUR", fallback: .arrow)
+    }
+
+    private func playlistWindowCursor(
+        at point: NSPoint,
+        width: CGFloat,
+        height: CGFloat,
+        isWindowShaded: Bool
+    ) -> NSCursor {
+        if isWindowShaded {
+            if cursorRegion(point, x: width - 21, y: 3, width: 8, height: 9) {
+                return skinCursor(named: "PWINBUT.CUR", fallback: .arrow)
+            }
+            if cursorRegion(point, x: width - 11, y: 3, width: 8, height: 9) {
+                return skinCursor(named: "PCLOSE.CUR", fallback: .arrow)
+            }
+            if cursorRegion(point, x: width - 29, y: 3, width: 9, height: 9) {
+                return skinCursor(named: "PWSIZE.CUR", fallback: .resizeLeftRight)
+            }
+            return skinCursor(named: "PWSNORM.CUR", fallback: .arrow)
+        }
+
+        if cursorRegion(point, x: width - 21, y: 3, width: 8, height: 9) {
+            return skinCursor(named: "PWINBUT.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: width - 11, y: 3, width: 8, height: 9) {
+            return skinCursor(named: "PCLOSE.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 0, y: 0, width: width, height: 13) {
+            return skinCursor(named: "PTBAR.CUR", fallback: SkinCursors.move)
+        }
+        if cursorRegion(point, x: width - 15, y: 20, width: 8, height: max(0, height - 58)) {
+            return skinCursor(named: "PVSCROLL.CUR", fallback: .resizeUpDown)
+        }
+        if cursorRegion(point, x: width - 20, y: height - 20, width: 19, height: 19) {
+            return skinCursor(named: "PSIZE.CUR", fallback: SkinCursors.resizeNorthwestSoutheast)
+        }
+        return skinCursor(named: "PNORMAL.CUR", fallback: .arrow)
+    }
+
+    private func genericWindowCursor(at point: NSPoint, width: CGFloat, height: CGFloat) -> NSCursor {
+        if cursorRegion(point, x: width - 20, y: height - 20, width: 20, height: 20) {
+            return skinCursor(named: "PSIZE.CUR", fallback: SkinCursors.resizeNorthwestSoutheast)
+        }
+        if cursorRegion(point, x: 0, y: height - 20, width: max(0, width - 20), height: 20) {
+            return skinCursor(named: "TITLEBAR.CUR", fallback: SkinCursors.move)
+        }
+        return .arrow
+    }
+
+    private func playlistWindowShadeState(for sourceWindow: NSWindow) -> Bool? {
+        if sourceWindow === playlistWindow { return playlistShade.isEnabled }
+        guard let id = playlistWindows.first(where: { $0.value === sourceWindow })?.key else { return nil }
+        return playlistWindowContexts[id]?.shade.isEnabled
+    }
+
+    private func cursorRegion(_ point: NSPoint, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) -> Bool {
+        point.x >= x && point.x <= x + width
+            && point.y >= y && point.y <= y + height
+    }
+
+    private func skinCursor(named filename: String, fallback: NSCursor) -> NSCursor {
+        WinampSkinStore.shared.cursor(named: filename) ?? fallback
     }
 
     /// Local monitoring is the only AppKit path that consistently carries the
