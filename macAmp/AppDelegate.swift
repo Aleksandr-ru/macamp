@@ -882,6 +882,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// key event's source panel for non-activating player windows.
     private func handleLocalPlaybackShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Settings is a native control window, not part of the Winamp player
+        // surface. Consume only the player's physical hotkeys here so their
+        // Playback-menu key equivalents cannot act on the player while a
+        // setting is being edited. Text input continues through AppKit.
+        if (event.window ?? NSApp.keyWindow) === preferencesWindow {
+            return suppressPlaybackShortcutInSettings(event, modifiers: modifiers)
+        }
+
         if handleCurrentTrackMetadataShortcut(event, modifiers: modifiers) { return true }
 
         // The metadata editor owns its keyboard navigation and editing shortcuts.
@@ -972,6 +981,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: return false
         }
         return true
+    }
+
+    private func suppressPlaybackShortcutInSettings(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard !isEditingText(for: event) else { return false }
+
+        let keyCode = event.keyCode
+        // Ignore hardware-specific flags such as `.function` and
+        // `.numericPad`; the player router treats those as the same physical
+        // key as well.
+        let shortcutModifiers = modifiers.intersection([.command, .option, .control, .shift])
+        switch shortcutModifiers {
+        case []:
+            // Transport, seek, jump-to-file and volume shortcuts.
+            return [1, 6, 7, 8, 9, 11, 15, 38, 123, 124, 125, 126].contains(keyCode)
+        case [.command]:
+            // Windowshade and player-surface zoom.
+            return keyCode == 13 || keyCode == 24 || keyCode == 27
+        case [.option]:
+            // Always-on-top, close, metadata editor and player-window toggles.
+            return [0, 5, 13, 14, 20, 34].contains(keyCode)
+        case [.command, .option]:
+            // Playlist title rebuild.
+            return keyCode == 14
+        case [.command, .shift]:
+            // Visualization toggle (physical K key).
+            return keyCode == 40
+        default:
+            // Control+0…5 is the player rating shortcut. It has no effect
+            // through Settings today, but keeping it suppressed makes this
+            // window boundary explicit if routing changes later.
+            return shortcutModifiers == [.control] && ratingShortcutValue(for: keyCode) != nil
+        }
     }
 
     private func isEditingText(for event: NSEvent) -> Bool {
