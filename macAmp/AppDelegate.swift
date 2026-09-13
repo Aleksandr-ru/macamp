@@ -704,6 +704,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.playlistManager.updateStreamMetadata(title, for: url)
             self?.infoModel.updateStreamMetadata(title, for: url)
         }
+        playback.onBitrateUpdated = { [weak self] url, bitrate in
+            self?.infoModel.updateStreamBitrate(bitrate, for: url)
+        }
         playback.onPlaybackReady = { [weak self] url in
             guard let self else { return }
             self.playlistManager.clearPlaybackErrorForActiveEntry(url: url)

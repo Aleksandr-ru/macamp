@@ -107,6 +107,17 @@ final class InfoWindowModel: ObservableObject {
                 fields.insert(("Title:", title), at: 0)
             }
         }
+
+        mutating func applyStreamBitrate(_ kbps: Int) {
+            guard kbps > 0 else { return }
+            let value = String(kbps) + " kbps"
+            bitrate = value
+            // A remote stream may initially be loaded by AVFoundation without
+            // an estimated rate. Replace any provisional rate once the HTTP
+            // stream reports its authoritative ICY/format bitrate.
+            technicalInfo.removeAll { $0.lowercased().hasSuffix("kbps") }
+            technicalInfo.insert(value, at: 0)
+        }
     }
 
     @Published private(set) var content = Content()
@@ -117,6 +128,7 @@ final class InfoWindowModel: ObservableObject {
     /// incomplete later metadata result for that URL.
     private var artworkCache: [URL: NSImage] = [:]
     private var streamMetadataByURL: [URL: String] = [:]
+    private var streamBitrateByURL: [URL: Int] = [:]
     private let queue = DispatchQueue(label: "ru.aleksandr.macAmp.info", qos: .utility)
 
     func show(_ url: URL?) { show(url, metadataDelay: 0) }
@@ -154,6 +166,9 @@ final class InfoWindowModel: ObservableObject {
         if let url, let streamMetadata = streamMetadataByURL[url] {
             initial.applyStreamMetadata(streamMetadata)
         }
+        if let url, let streamBitrate = streamBitrateByURL[url] {
+            initial.applyStreamBitrate(streamBitrate)
+        }
         content = initial
         guard let url else { return }
 
@@ -183,6 +198,9 @@ final class InfoWindowModel: ObservableObject {
                 if let streamMetadata = self.streamMetadataByURL[url] {
                     resolved.applyStreamMetadata(streamMetadata)
                 }
+                if let streamBitrate = self.streamBitrateByURL[url] {
+                    resolved.applyStreamBitrate(streamBitrate)
+                }
                 self.content = resolved
             }
         }
@@ -195,6 +213,15 @@ final class InfoWindowModel: ObservableObject {
         guard content.url == url else { return }
         var updated = content
         updated.applyStreamMetadata(title)
+        content = updated
+    }
+
+    func updateStreamBitrate(_ kbps: Int?, for url: URL) {
+        guard let kbps, kbps > 0 else { return }
+        streamBitrateByURL[url] = kbps
+        guard content.url == url else { return }
+        var updated = content
+        updated.applyStreamBitrate(kbps)
         content = updated
     }
 
@@ -304,6 +331,11 @@ final class InfoWindowModel: ObservableObject {
     }
 
     private static func fileSize(for url: URL) -> Int? {
+        // Remote station URLs often have a path such as "/". Passing that
+        // path to FileManager would inspect the local root directory and
+        // display its filesystem metadata (for example, "704 bytes") as if
+        // it were the stream size.
+        guard url.isFileURL else { return nil }
         if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { return size }
         return (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue
     }

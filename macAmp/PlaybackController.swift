@@ -707,6 +707,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     var onPlaybackError: ((URL) -> Void)?
     var onPlaybackReady: ((URL) -> Void)?
     var onStreamMetadata: ((URL, String) -> Void)?
+    var onBitrateUpdated: ((URL, Int?) -> Void)?
     @Published private(set) var title = "MACAMP — READY"
     @Published private(set) var isPlaying = false
     @Published private(set) var isPaused = false
@@ -761,6 +762,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     /// Changes only when `open` starts a new source attempt. Seeking and
     /// resuming may invoke onPlaybackReady again, but remain in this generation.
     var currentTrackGeneration: Int { fileOpenGeneration }
+
+    private func publishBitrate(_ value: Int?, for url: URL? = nil) {
+        bitrateKbps = value
+        if let url { onBitrateUpdated?(url, value) }
+    }
 
     let equalizer = EqualizerController()
     let networkPreferences = NetworkPreferences()
@@ -1558,7 +1564,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
                 self.streamingMetadataOutput = metadataOutput
-                self.bitrateKbps = bitrateKbps
+                self.publishBitrate(bitrateKbps, for: url)
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
                 self.updateLiveAnalysisTap()
@@ -1639,7 +1645,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.scheduledStartFrame = 0
                 self.sampleRateKHz = Int((format.sampleRate / 1_000).rounded())
                 self.channelCount = Int(format.channelCount)
-                self.bitrateKbps = bitrate
+                self.publishBitrate(bitrate, for: url)
                 self.sourceStatus = "BUFFERING"
                 self.title = self.preferredDisplayTitle
                 self.smoothedBandEnergy = Array(repeating: -60, count: 10)
@@ -2030,7 +2036,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                       self.sourceFile != nil, self.streamingOpenGeneration == nil else { return }
                 self.sampleRateKHz = sampleRate
                 self.channelCount = channels
-                self.bitrateKbps = bitrate
+                self.publishBitrate(bitrate, for: url)
                 if trackDuration.isFinite, trackDuration > 0 {
                     self.duration = trackDuration
                 }
@@ -2063,7 +2069,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             DispatchQueue.main.async {
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else { return }
-                self.bitrateKbps = bitrate
+                self.publishBitrate(bitrate, for: url)
                 if duration.isFinite, duration > 0 {
                     self.duration = duration
                 }
