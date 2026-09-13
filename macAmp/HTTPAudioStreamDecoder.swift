@@ -1,6 +1,183 @@
 import AVFoundation
 import AudioToolbox
+import CFNetwork
+import Combine
 import Foundation
+import Network
+
+enum NetworkProxyMode: String, CaseIterable, Identifiable {
+    case direct
+    case system
+    case custom
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .direct: return "Do not use proxy"
+        case .system: return "Use system proxy"
+        case .custom: return "Use custom proxy"
+        }
+    }
+}
+
+private struct ParsedNetworkProxy {
+    enum Kind { case http, https, socks }
+    let kind: Kind
+    let host: String
+    let port: Int
+    let username: String?
+    let password: String?
+}
+
+enum NetworkProxyError: LocalizedError {
+    case invalidAddress
+
+    var errorDescription: String? {
+        "Enter a proxy as http://host:port, https://host:port, or socks://host:port."
+    }
+}
+
+struct NetworkProxySnapshot {
+    let mode: NetworkProxyMode
+    let customAddress: String
+
+    func sessionConfiguration() throws -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 30
+        switch mode {
+        case .system:
+            // A nil override preserves System Settings, including PAC and
+            // automatic proxy discovery.
+            break
+        case .direct:
+            configuration.connectionProxyDictionary = Self.disabledProxyDictionary
+            if #available(macOS 14.0, *) { configuration.proxyConfigurations = [] }
+        case .custom:
+            let proxy = try Self.parse(customAddress)
+            if #available(macOS 14.0, *) {
+                let endpoint = NWEndpoint.hostPort(
+                    host: NWEndpoint.Host(proxy.host),
+                    port: NWEndpoint.Port(rawValue: UInt16(proxy.port))!
+                )
+                var proxyConfiguration: ProxyConfiguration
+                switch proxy.kind {
+                case .socks:
+                    proxyConfiguration = ProxyConfiguration(socksv5Proxy: endpoint)
+                case .http:
+                    proxyConfiguration = ProxyConfiguration(httpCONNECTProxy: endpoint)
+                case .https:
+                    proxyConfiguration = ProxyConfiguration(
+                        httpCONNECTProxy: endpoint,
+                        tlsOptions: NWProtocolTLS.Options()
+                    )
+                }
+                proxyConfiguration.allowFailover = false
+                if let username = proxy.username {
+                    proxyConfiguration.applyCredential(username: username, password: proxy.password ?? "")
+                }
+                configuration.connectionProxyDictionary = Self.disabledProxyDictionary
+                configuration.proxyConfigurations = [proxyConfiguration]
+            } else {
+                configuration.connectionProxyDictionary = Self.legacyDictionary(for: proxy)
+            }
+        }
+        return configuration
+    }
+
+    var validationMessage: String? {
+        guard mode == .custom else { return nil }
+        do { _ = try Self.parse(customAddress); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    private static func parse(_ value: String) throws -> ParsedNetworkProxy {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let rawScheme = components.scheme?.lowercased(),
+              let host = components.host, !host.isEmpty,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else {
+            throw NetworkProxyError.invalidAddress
+        }
+        let kind: ParsedNetworkProxy.Kind
+        let defaultPort: Int
+        switch rawScheme {
+        case "http": kind = .http; defaultPort = 8080
+        case "https": kind = .https; defaultPort = 443
+        case "socks", "socks5": kind = .socks; defaultPort = 1080
+        default: throw NetworkProxyError.invalidAddress
+        }
+        let port = components.port ?? defaultPort
+        guard (1...65_535).contains(port) else { throw NetworkProxyError.invalidAddress }
+        return ParsedNetworkProxy(
+            kind: kind,
+            host: host,
+            port: port,
+            username: components.user,
+            password: components.password
+        )
+    }
+
+    private static var disabledProxyDictionary: [AnyHashable: Any] {
+        [
+            kCFNetworkProxiesHTTPEnable as String: 0,
+            kCFNetworkProxiesHTTPSEnable as String: 0,
+            kCFNetworkProxiesSOCKSEnable as String: 0,
+            kCFNetworkProxiesProxyAutoConfigEnable as String: 0,
+            kCFNetworkProxiesProxyAutoDiscoveryEnable as String: 0
+        ]
+    }
+
+    private static func legacyDictionary(for proxy: ParsedNetworkProxy) -> [AnyHashable: Any] {
+        switch proxy.kind {
+        case .socks:
+            return [
+                kCFNetworkProxiesSOCKSEnable as String: 1,
+                kCFNetworkProxiesSOCKSProxy as String: proxy.host,
+                kCFNetworkProxiesSOCKSPort as String: proxy.port
+            ]
+        case .http, .https:
+            // Legacy CFNetwork distinguishes destination schemes rather than
+            // proxy transport. Set both so every HTTP(S) radio URL is routed
+            // through the chosen endpoint on macOS 11–13.
+            return [
+                kCFNetworkProxiesHTTPEnable as String: 1,
+                kCFNetworkProxiesHTTPProxy as String: proxy.host,
+                kCFNetworkProxiesHTTPPort as String: proxy.port,
+                kCFNetworkProxiesHTTPSEnable as String: 1,
+                kCFNetworkProxiesHTTPSProxy as String: proxy.host,
+                kCFNetworkProxiesHTTPSPort as String: proxy.port
+            ]
+        }
+    }
+}
+
+final class NetworkPreferences: ObservableObject {
+    private enum Key {
+        static let mode = "macAmp.network.proxyMode"
+        static let customAddress = "macAmp.network.customProxyAddress"
+    }
+
+    @Published var proxyMode: NetworkProxyMode {
+        didSet { UserDefaults.standard.set(proxyMode.rawValue, forKey: Key.mode) }
+    }
+    @Published var customProxyAddress: String {
+        didSet { UserDefaults.standard.set(customProxyAddress, forKey: Key.customAddress) }
+    }
+
+    var snapshot: NetworkProxySnapshot {
+        NetworkProxySnapshot(mode: proxyMode, customAddress: customProxyAddress)
+    }
+
+    var validationMessage: String? { snapshot.validationMessage }
+
+    init(defaults: UserDefaults = .standard) {
+        proxyMode = defaults.string(forKey: Key.mode).flatMap(NetworkProxyMode.init(rawValue:)) ?? .system
+        customProxyAddress = defaults.string(forKey: Key.customAddress) ?? ""
+    }
+}
 
 /// Incrementally parses and decodes an Icecast/Shoutcast MP3 or AAC response.
 /// Unlike AVPlayer.audioMix, this path works for unbounded HTTP radio streams
@@ -12,15 +189,13 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     var onFailure: ((Error) -> Void)?
 
     private let url: URL
+    private let sessionConfiguration: URLSessionConfiguration
     private lazy var session: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 30
         let queue = OperationQueue()
         queue.name = "ru.aleksandr.macAmp.http-audio"
         queue.maxConcurrentOperationCount = 1
         queue.qualityOfService = .userInitiated
-        return URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+        return URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: queue)
     }()
     private var task: URLSessionDataTask?
     private var fileStream: AudioFileStreamID?
@@ -35,8 +210,9 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     private var metadata = Data()
     private var isCancelled = false
 
-    init(url: URL) {
+    init(url: URL, proxy: NetworkProxySnapshot) throws {
         self.url = url
+        sessionConfiguration = try proxy.sessionConfiguration()
         super.init()
     }
 

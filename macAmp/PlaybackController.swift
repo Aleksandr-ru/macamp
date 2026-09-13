@@ -763,6 +763,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     var currentTrackGeneration: Int { fileOpenGeneration }
 
     let equalizer = EqualizerController()
+    let networkPreferences = NetworkPreferences()
     let outputDeviceManager = AudioOutputDeviceManager()
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
@@ -1611,8 +1612,14 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     private func startDecodedHTTPStream(for url: URL, generation: Int) {
         guard generation == fileOpenGeneration, decodedHTTPStream == nil else { return }
+        guard let decoder = try? HTTPAudioStreamDecoder(
+            url: url,
+            proxy: networkPreferences.snapshot
+        ) else {
+            reportPlaybackError(for: url, title: "INVALID PROXY")
+            return
+        }
         streamingOpenGeneration = generation
-        let decoder = HTTPAudioStreamDecoder(url: url)
         decodedHTTPStream = decoder
         decoder.onReady = { [weak self, weak decoder] format, bitrate in
             guard let self, let decoder, self.decodedHTTPStream === decoder,

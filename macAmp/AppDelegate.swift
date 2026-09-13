@@ -3217,7 +3217,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             visualization: playback.visualizationPreferences,
             skin: WinampSkinStore.shared,
             statusBarPreferences: statusBarPreferences,
-            outputDevices: playback.outputDeviceManager
+            outputDevices: playback.outputDeviceManager,
+            networkPreferences: playback.networkPreferences
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -4377,6 +4378,7 @@ private struct SettingsView: View {
         case general
         case skin
         case output
+        case network
     }
 
     private enum TrayIconSelection: String, CaseIterable, Identifiable {
@@ -4404,6 +4406,7 @@ private struct SettingsView: View {
     @ObservedObject var skin: WinampSkinStore
     @ObservedObject var statusBarPreferences: StatusBarPreferences
     @ObservedObject var outputDevices: AudioOutputDeviceManager
+    @ObservedObject var networkPreferences: NetworkPreferences
     @ObservedObject private var ratingPreferences = RatingPreferences.shared
     @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
     @State private var selectedTab: Tab = .general
@@ -4414,6 +4417,7 @@ private struct SettingsView: View {
                 Text("General").tag(Tab.general)
                 Text("Skin").tag(Tab.skin)
                 Text("Output").tag(Tab.output)
+                Text("System").tag(Tab.network)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -4435,6 +4439,8 @@ private struct SettingsView: View {
                         outputSettings
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
+                case .network:
+                    networkSettings
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -4595,6 +4601,42 @@ private struct SettingsView: View {
             }
         }
         .padding(20)
+    }
+
+    private var networkSettings: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsGroup(title: "Network proxy") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Proxy mode", selection: $networkPreferences.proxyMode) {
+                        ForEach(NetworkProxyMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+
+                    TextField(
+                        "http://host:port, https://host:port, or socks://host:port",
+                        text: $networkPreferences.customProxyAddress
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(networkPreferences.proxyMode != .custom)
+
+                    if let message = networkPreferences.validationMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("The selected proxy is used when a URL stream is opened.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var selectedOutputDevice: Binding<AudioDeviceID?> {
