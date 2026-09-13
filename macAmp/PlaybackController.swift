@@ -1656,6 +1656,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.failDecodedHTTPStream(url: url, generation: generation)
             }
         }
+        decoder.onBitrate = { [weak self, weak decoder] bitrate in
+            guard let self, let decoder, self.decodedHTTPStream === decoder,
+                  self.fileOpenGeneration == generation else { return }
+            self.publishBitrate(bitrate, for: url)
+        }
         decoder.onBuffer = { [weak self, weak decoder] buffer in
             guard let self, let decoder, self.decodedHTTPStream === decoder,
                   self.fileOpenGeneration == generation else { return }

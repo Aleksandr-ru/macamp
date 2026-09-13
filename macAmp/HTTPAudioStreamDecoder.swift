@@ -45,7 +45,13 @@ struct NetworkProxySnapshot {
     func sessionConfiguration() throws -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 30
+        // URLSession applies the request timeout to the lifetime of a data
+        // task as well. A radio response is intentionally unbounded, so keep
+        // the transport alive; HTTPAudioStreamDecoder owns a separate bounded
+        // timeout which is cancelled as soon as response headers arrive.
+        let continuousStreamLifetime: TimeInterval = 365 * 24 * 60 * 60
+        configuration.timeoutIntervalForRequest = continuousStreamLifetime
+        configuration.timeoutIntervalForResource = continuousStreamLifetime
         switch mode {
         case .system:
             // A nil override preserves System Settings, including PAC and
@@ -184,6 +190,7 @@ final class NetworkPreferences: ObservableObject {
 /// and delivers PCM to the app's AVAudioEngine graph.
 final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     var onReady: ((AVAudioFormat, Int?) -> Void)?
+    var onBitrate: ((Int) -> Void)?
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     var onMetadata: ((String) -> Void)?
     var onFailure: ((Error) -> Void)?
@@ -198,17 +205,30 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
         return URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: queue)
     }()
     private var task: URLSessionDataTask?
+    private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var fileStream: AudioFileStreamID?
+    private var fileTypeHint: AudioFileTypeID = kAudioFileMP3Type
     private var converter: AudioConverterRef?
+    private var converterSourceFormat: AudioStreamBasicDescription?
     private var sourceFormat = AudioStreamBasicDescription()
+    private var preferredSourceFormat: AudioStreamBasicDescription?
+    private var isReadyToProducePackets = false
     private var outputFormat: AVAudioFormat?
     private var hasReportedReady = false
+    private var reportedOutputSampleRate: Double?
+    private var reportedOutputChannelCount: AVAudioChannelCount?
     private var reportedBitrateKbps: Int?
+    private var deliveredBitrateKbps: Int?
     private var icyMetadataInterval: Int?
     private var audioBytesRemaining = 0
     private var metadataBytesRemaining = 0
     private var metadata = Data()
     private var isCancelled = false
+    private var packetDeliveryGeneration = 0
+    private var parserRecoveryData = Data()
+
+    private static let parserInputChunkBytes = 2 * 1_024
+    private static let parserStallRecoveryBytes = 8 * 1_024
 
     init(url: URL, proxy: NetworkProxySnapshot) throws {
         self.url = url
@@ -224,6 +244,12 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
         request.setValue("macAmp/1.0", forHTTPHeaderField: "User-Agent")
         let task = session.dataTask(with: request)
         self.task = task
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.fileStream == nil, !self.isCancelled else { return }
+            self.fail(URLError(.timedOut))
+        }
+        connectionTimeoutWorkItem = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
         task.resume()
     }
 
@@ -232,6 +258,8 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
 
     func cancel() {
         isCancelled = true
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         task?.cancel()
         task = nil
         session.invalidateAndCancel()
@@ -248,22 +276,18 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
             fail(URLError(.badServerResponse))
             return
         }
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         if let value = Self.header("icy-br", in: http), let bitrate = Int(value) {
-            reportedBitrateKbps = bitrate
+            updateBitrate(bitrate)
         }
         if let value = Self.header("icy-metaint", in: http), let interval = Int(value), interval > 0 {
             icyMetadataInterval = interval
             audioBytesRemaining = interval
         }
         let contentType = (http.mimeType ?? "").lowercased()
-        let hint: AudioFileTypeID = contentType.contains("aac") ? kAudioFileAAC_ADTSType : kAudioFileMP3Type
-        let status = AudioFileStreamOpen(
-            Unmanaged.passUnretained(self).toOpaque(),
-            httpStreamPropertyListener,
-            httpStreamPacketsListener,
-            hint,
-            &fileStream
-        )
+        fileTypeHint = contentType.contains("aac") ? kAudioFileAAC_ADTSType : kAudioFileMP3Type
+        let status = openFileStream()
         guard status == noErr else {
             completionHandler(.cancel)
             fail(HTTPAudioStreamError.cannotOpenParser(status))
@@ -321,19 +345,26 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     fileprivate func handleProperty(_ propertyID: AudioFileStreamPropertyID) {
         guard let fileStream else { return }
         switch propertyID {
+        case kAudioFileStreamProperty_FormatList:
+            preferredSourceFormat = preferredFormat(in: fileStream)
+            if isReadyToProducePackets { reconfigureConverterForPreferredFormatIfNeeded() }
         case kAudioFileStreamProperty_DataFormat:
+            var discoveredFormat = AudioStreamBasicDescription()
             var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-            guard AudioFileStreamGetProperty(fileStream, propertyID, &size, &sourceFormat) == noErr,
-                  sourceFormat.mSampleRate > 0, sourceFormat.mChannelsPerFrame > 0 else { return }
-            configureConverterIfNeeded()
+            guard AudioFileStreamGetProperty(fileStream, propertyID, &size, &discoveredFormat) == noErr,
+                  discoveredFormat.mSampleRate > 0, discoveredFormat.mChannelsPerFrame > 0 else { return }
+            sourceFormat = preferredSourceFormat ?? discoveredFormat
+            if isReadyToProducePackets { reconfigureConverterForPreferredFormatIfNeeded() }
         case kAudioFileStreamProperty_BitRate:
             var bitrate = UInt32(0)
             var size = UInt32(MemoryLayout<UInt32>.size)
             if AudioFileStreamGetProperty(fileStream, propertyID, &size, &bitrate) == noErr, bitrate > 0 {
-                reportedBitrateKbps = Int((Double(bitrate) / 1_000).rounded())
+                updateBitrate(Int((Double(bitrate) / 1_000).rounded()))
             }
         case kAudioFileStreamProperty_ReadyToProducePackets:
-            configureConverterIfNeeded()
+            isReadyToProducePackets = true
+            if let preferredSourceFormat { sourceFormat = preferredSourceFormat }
+            reconfigureConverterForPreferredFormatIfNeeded()
             applyMagicCookie()
         default:
             break
@@ -347,6 +378,7 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
         descriptions: UnsafeMutablePointer<AudioStreamPacketDescription>?
     ) {
         guard packetCount > 0, byteCount > 0 else { return }
+        packetDeliveryGeneration &+= 1
         configureConverterIfNeeded()
         guard converter != nil else { return }
         let data = Data(bytes: bytes, count: Int(byteCount))
@@ -387,15 +419,104 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
             &primeMethod
         )
         self.converter = converter
+        converterSourceFormat = sourceFormat
         self.outputFormat = outputFormat
         applyMagicCookie()
-        if !hasReportedReady {
+        let outputChanged = reportedOutputSampleRate != outputFormat.sampleRate
+            || reportedOutputChannelCount != outputFormat.channelCount
+        if !hasReportedReady || outputChanged {
             hasReportedReady = true
+            reportedOutputSampleRate = outputFormat.sampleRate
+            reportedOutputChannelCount = outputFormat.channelCount
+            deliveredBitrateKbps = reportedBitrateKbps
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.isCancelled else { return }
                 self.onReady?(outputFormat, self.reportedBitrateKbps)
             }
         }
+    }
+
+    private func updateBitrate(_ bitrateKbps: Int) {
+        guard bitrateKbps > 0, bitrateKbps != reportedBitrateKbps else { return }
+        reportedBitrateKbps = bitrateKbps
+        guard hasReportedReady, bitrateKbps != deliveredBitrateKbps else { return }
+        deliveredBitrateKbps = bitrateKbps
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isCancelled else { return }
+            self.onBitrate?(bitrateKbps)
+        }
+    }
+
+    private func preferredFormat(in fileStream: AudioFileStreamID) -> AudioStreamBasicDescription? {
+        var writable = DarwinBoolean(false)
+        var byteCount: UInt32 = 0
+        guard AudioFileStreamGetPropertyInfo(
+            fileStream,
+            kAudioFileStreamProperty_FormatList,
+            &byteCount,
+            &writable
+        ) == noErr,
+        byteCount >= UInt32(MemoryLayout<AudioFormatListItem>.stride) else { return nil }
+
+        let count = Int(byteCount) / MemoryLayout<AudioFormatListItem>.stride
+        let items = UnsafeMutablePointer<AudioFormatListItem>.allocate(capacity: count)
+        defer { items.deallocate() }
+        guard AudioFileStreamGetProperty(
+            fileStream,
+            kAudioFileStreamProperty_FormatList,
+            &byteCount,
+            items
+        ) == noErr else { return nil }
+
+        var playableIndex = UInt32(0)
+        var playableIndexSize = UInt32(MemoryLayout<UInt32>.size)
+        let playableStatus = AudioFormatGetProperty(
+            kAudioFormatProperty_FirstPlayableFormatFromList,
+            byteCount,
+            items,
+            &playableIndexSize,
+            &playableIndex
+        )
+        if playableStatus == noErr, Int(playableIndex) < count {
+            let format = items[Int(playableIndex)].mASBD
+            if format.mSampleRate > 0, format.mChannelsPerFrame > 0 { return format }
+        }
+
+        // The list is sorted best-first by Core Audio. Retain a defensive
+        // fallback for streams whose format list cannot be queried by the
+        // current system decoder.
+        return UnsafeBufferPointer(start: items, count: count)
+            .lazy
+            .map(\.mASBD)
+            .first { $0.mSampleRate > 0 && $0.mChannelsPerFrame > 0 }
+    }
+
+    private func reconfigureConverterForPreferredFormatIfNeeded() {
+        if let preferredSourceFormat { sourceFormat = preferredSourceFormat }
+        guard let converterSourceFormat,
+              !Self.sameFormat(converterSourceFormat, sourceFormat) else {
+            configureConverterIfNeeded()
+            return
+        }
+        if let converter { AudioConverterDispose(converter) }
+        converter = nil
+        self.converterSourceFormat = nil
+        outputFormat = nil
+        configureConverterIfNeeded()
+    }
+
+    private static func sameFormat(
+        _ lhs: AudioStreamBasicDescription,
+        _ rhs: AudioStreamBasicDescription
+    ) -> Bool {
+        lhs.mSampleRate == rhs.mSampleRate
+            && lhs.mFormatID == rhs.mFormatID
+            && lhs.mFormatFlags == rhs.mFormatFlags
+            && lhs.mBytesPerPacket == rhs.mBytesPerPacket
+            && lhs.mFramesPerPacket == rhs.mFramesPerPacket
+            && lhs.mBytesPerFrame == rhs.mBytesPerFrame
+            && lhs.mChannelsPerFrame == rhs.mChannelsPerFrame
+            && lhs.mBitsPerChannel == rhs.mBitsPerChannel
     }
 
     private func applyMagicCookie() {
@@ -474,11 +595,83 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     }
 
     private func parseAudio(_ data: Data) {
-        guard let fileStream, !data.isEmpty else { return }
-        data.withUnsafeBytes { buffer in
-            guard let bytes = buffer.baseAddress else { return }
-            let status = AudioFileStreamParseBytes(fileStream, UInt32(buffer.count), bytes, [])
-            if status != noErr { fail(HTTPAudioStreamError.cannotParse(status)) }
+        guard fileStream != nil, !data.isEmpty else { return }
+        var offset = 0
+        while offset < data.count, !isCancelled {
+            let end = min(offset + Self.parserInputChunkBytes, data.count)
+            let chunk = data[offset..<end]
+            parserRecoveryData.append(chunk)
+            let generationBeforeParsing = packetDeliveryGeneration
+            let status = parseBytes(chunk)
+            guard status == noErr else {
+                fail(HTTPAudioStreamError.cannotParse(status))
+                return
+            }
+            if packetDeliveryGeneration != generationBeforeParsing {
+                parserRecoveryData.removeAll(keepingCapacity: true)
+            } else if parserRecoveryData.count >= Self.parserStallRecoveryBytes {
+                recoverStalledParser()
+            }
+            offset = end
+        }
+    }
+
+    private func parseBytes(_ data: Data) -> OSStatus {
+        guard let fileStream else { return kAudioFileUnspecifiedError }
+        return data.withUnsafeBytes { buffer in
+            guard let bytes = buffer.baseAddress else { return noErr }
+            return AudioFileStreamParseBytes(fileStream, UInt32(buffer.count), bytes, [])
+        }
+    }
+
+    private func openFileStream() -> OSStatus {
+        AudioFileStreamOpen(
+            Unmanaged.passUnretained(self).toOpaque(),
+            httpStreamPropertyListener,
+            httpStreamPacketsListener,
+            fileTypeHint,
+            &fileStream
+        )
+    }
+
+    /// Some Shoutcast AAC+ stations concatenate a short introduction and the
+    /// live encoder output in one HTTP response. AudioFileStream can accept
+    /// the following ADTS bytes without an error yet stop producing packets at
+    /// that logical boundary. Once a bounded amount of valid audio has passed
+    /// without a packet callback, reopen the lightweight parser and replay
+    /// only those stalled bytes. The AudioConverter is retained when the
+    /// decoded format remains the same, avoiding a graph interruption.
+    private func recoverStalledParser() {
+        let recoveryData = parserRecoveryData
+        parserRecoveryData.removeAll(keepingCapacity: true)
+        guard !recoveryData.isEmpty else { return }
+
+        if let fileStream { AudioFileStreamClose(fileStream) }
+        fileStream = nil
+        preferredSourceFormat = nil
+        isReadyToProducePackets = false
+        sourceFormat = AudioStreamBasicDescription()
+        let openStatus = openFileStream()
+        guard openStatus == noErr else {
+            fail(HTTPAudioStreamError.cannotOpenParser(openStatus))
+            return
+        }
+
+        let generationBeforeRecovery = packetDeliveryGeneration
+        var offset = 0
+        while offset < recoveryData.count, !isCancelled {
+            let end = min(offset + Self.parserInputChunkBytes, recoveryData.count)
+            let status = parseBytes(recoveryData[offset..<end])
+            guard status == noErr else {
+                fail(HTTPAudioStreamError.cannotParse(status))
+                return
+            }
+            offset = end
+        }
+        if packetDeliveryGeneration == generationBeforeRecovery {
+            // Wait for another full bounded window before retrying. This
+            // prevents a malformed source from creating a tight reopen loop.
+            parserRecoveryData.removeAll(keepingCapacity: true)
         }
     }
 
@@ -497,6 +690,8 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     private func fail(_ error: Error) {
         guard !isCancelled else { return }
         isCancelled = true
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         task?.cancel()
         task = nil
         session.invalidateAndCancel()
@@ -504,8 +699,11 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     }
 
     private func close() {
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         if let converter { AudioConverterDispose(converter) }
         converter = nil
+        converterSourceFormat = nil
         if let fileStream { AudioFileStreamClose(fileStream) }
         fileStream = nil
     }
