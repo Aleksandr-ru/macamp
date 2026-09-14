@@ -5505,9 +5505,10 @@ private struct PlaylistView: View {
                         .fill(dropIndicatorColor)
                         .frame(maxWidth: .infinity)
                         .frame(height: 1)
+                        .offset(y: CGFloat(playlist.entries.count) * entryHeight)
                 }
             },
-            alignment: .bottom
+            alignment: .top
         )
         .background(GeometryReader { geometry in
             Color.clear.preference(
