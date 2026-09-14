@@ -642,9 +642,21 @@ final class WinampSkinStore: ObservableObject {
                                                             includingPropertiesForKeys: [.isSymbolicLinkKey],
                                                             options: [])
         for item in contents {
+            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard isDirectChild(item.standardizedFileURL, of: skinRoot),
-                  (try? item.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                  values.isSymbolicLink != true else {
                 throw SkinError.unsafePath
+            }
+            // Classic Winamp archives can contain an empty duplicate wrapper
+            // directory (for example Skin/Skin/) alongside the real assets.
+            // Winamp ignored directory entries and extracted only the files;
+            // do the same for empty directories so they cannot collide with
+            // the outer wrapper during promotion.
+            if values.isDirectory == true,
+               try fileManager.contentsOfDirectory(at: item,
+                                                    includingPropertiesForKeys: nil,
+                                                    options: []).isEmpty {
+                continue
             }
             let destination = staging.appendingPathComponent(item.lastPathComponent,
                                                               isDirectory: item.hasDirectoryPath).standardizedFileURL
