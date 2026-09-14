@@ -407,11 +407,12 @@ final class PlaylistManager: ObservableObject {
         let entryID: UUID
     }
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
-    /// Bump when a stored display-title format needs one background refresh.
-    /// Existing snapshots did not retain separate artist/title fields, so they
-    /// must be revisited once for system notification presentation.
+    /// Bump when stored display metadata needs one background refresh. Version
+    /// 3 re-reads POPM values using the current read-only policy: older
+    /// snapshots may cache a zero rating even when the file has a rating that
+    /// Info now correctly displays.
     private static let displayMetadataFormatVersionKey = "macAmp.playlist.displayMetadataFormatVersion"
-    private static let displayMetadataFormatVersion = 2
+    private static let displayMetadataFormatVersion = 3
     @Published private(set) var playlists: [PlaylistModel] = []
     @Published private(set) var activePlaylistID: UUID?
     @Published private(set) var focusedPlaylistID: UUID?
