@@ -1938,17 +1938,21 @@ final class PlaylistManager: ObservableObject {
 
     /// Moves entry objects, rather than re-creating them, so bookmarks,
     /// playback errors and metadata already read remain intact.
-    func moveDraggedEntries(_ payload: PlaylistDragPayload, to destination: PlaylistModel, at insertionIndex: Int) {
+    @discardableResult
+    func moveDraggedEntries(_ payload: PlaylistDragPayload, to destination: PlaylistModel, at insertionIndex: Int) -> Bool {
         guard let source = playlist(id: payload.sourcePlaylistID),
-              source.id != destination.id,
               playlists.contains(where: { $0.id == destination.id }),
               source.sortingProgress == nil,
               destination.sortingProgress == nil,
-              !payload.entryIDs.isEmpty else { return }
+              !payload.entryIDs.isEmpty else { return false }
+
+        if source.id == destination.id {
+            return moveDraggedEntriesWithinPlaylist(payload, playlist: destination, at: insertionIndex)
+        }
 
         let requestedIDs = Set(payload.entryIDs)
         let movingEntries = source.entries.filter { requestedIDs.contains($0.id) }
-        guard !movingEntries.isEmpty else { return }
+        guard !movingEntries.isEmpty else { return false }
         let movingIDs = Set(movingEntries.map(\.id))
         let targetIndex = min(max(0, insertionIndex), destination.entries.count)
         let movedPlayingEntry = playingEntryID.map(movingIDs.contains) == true
@@ -1986,6 +1990,41 @@ final class PlaylistManager: ObservableObject {
         scheduleMetadata(for: destination)
         requestMetadataReprioritization()
         save()
+        return true
+    }
+
+    /// Reorders a drag payload inside its source playlist. The drop target's
+    /// insertion index is measured before removal, so subtract the selected
+    /// rows that precede it before inserting into the shortened list.
+    private func moveDraggedEntriesWithinPlaylist(
+        _ payload: PlaylistDragPayload,
+        playlist: PlaylistModel,
+        at insertionIndex: Int
+    ) -> Bool {
+        let requestedIDs = Set(payload.entryIDs)
+        let movingEntries = playlist.entries.filter { requestedIDs.contains($0.id) }
+        guard !movingEntries.isEmpty else { return false }
+
+        let currentIDs = playlist.entries.map(\.id)
+        let clampedIndex = min(max(0, insertionIndex), playlist.entries.count)
+        let removedBeforeInsertion = playlist.entries.prefix(clampedIndex).reduce(into: 0) { count, entry in
+            if requestedIDs.contains(entry.id) { count += 1 }
+        }
+        let remainingEntries = playlist.entries.filter { !requestedIDs.contains($0.id) }
+        let targetIndex = min(
+            max(0, clampedIndex - removedBeforeInsertion),
+            remainingEntries.count
+        )
+        var reorderedEntries = remainingEntries
+        reorderedEntries.insert(contentsOf: movingEntries, at: targetIndex)
+        guard reorderedEntries.map(\.id) != currentIDs else { return true }
+
+        playlist.entries = reorderedEntries
+        playlist.structureRevision &+= 1
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist)
+        save()
+        return true
     }
 
     func savePlaylist(_ playlist: PlaylistModel, to url: URL) throws {

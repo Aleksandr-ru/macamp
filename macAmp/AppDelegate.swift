@@ -5791,10 +5791,8 @@ private class PlaylistDropTargetNSView: NSView {
         let pasteboard = sender.draggingPasteboard
         let index = dropIndex(for: sender)
         if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier)),
-           let payload = try? JSONDecoder().decode(PlaylistDragPayload.self, from: data),
-           payload.sourcePlaylistID != playlist.id {
-            manager.moveDraggedEntries(payload, to: playlist, at: index)
-            return true
+           let payload = try? JSONDecoder().decode(PlaylistDragPayload.self, from: data) {
+            return manager.moveDraggedEntries(payload, to: playlist, at: index)
         }
         let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
@@ -5822,7 +5820,7 @@ private class PlaylistDropTargetNSView: NSView {
         let pasteboard = sender.draggingPasteboard
         if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(PlaylistDragTransfer.typeIdentifier)),
            let payload = try? JSONDecoder().decode(PlaylistDragPayload.self, from: data) {
-            return payload.sourcePlaylistID != playlist.id ? .move : []
+            return payload.entryIDs.isEmpty ? [] : .move
         }
         // Dropping from Finder only creates playlist entries; it must never
         // ask Finder to remove or relocate the original filesystem objects.
