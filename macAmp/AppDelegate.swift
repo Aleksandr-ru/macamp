@@ -3498,6 +3498,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             equalizer: playback.equalizer,
             visualization: playback.visualizationPreferences,
             skin: WinampSkinStore.shared,
+            settingsWindowState: settingsWindowState,
             statusBarPreferences: statusBarPreferences,
             outputDevices: playback.outputDeviceManager,
             networkPreferences: playback.networkPreferences
@@ -4686,6 +4687,7 @@ private struct SettingsView: View {
     @ObservedObject var equalizer: EqualizerController
     @ObservedObject var visualization: VisualizationPreferences
     @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var settingsWindowState: SettingsWindowState
     @ObservedObject var statusBarPreferences: StatusBarPreferences
     @ObservedObject var outputDevices: AudioOutputDeviceManager
     @ObservedObject var networkPreferences: NetworkPreferences
@@ -4956,7 +4958,7 @@ private struct SettingsView: View {
     }
 
     private var skinSettings: some View {
-        SkinSettingsView(skin: skin)
+        SkinSettingsView(skin: skin, settingsWindowState: settingsWindowState)
     }
 }
 
@@ -5021,6 +5023,7 @@ private struct SettingsSlider: View {
 
 private struct SkinSettingsView: View {
     @ObservedObject var skin: WinampSkinStore
+    @ObservedObject var settingsWindowState: SettingsWindowState
     @State private var selectedSkinDirectoryName: String?
 
     private var selectedSkin: WinampSkinStore.SkinDescriptor? {
@@ -5036,24 +5039,57 @@ private struct SkinSettingsView: View {
                 Text("Installed skins")
                     .font(.headline)
 
-                List(selection: $selectedSkinDirectoryName) {
-                    ForEach(skin.availableSkins) { item in
-                        HStack(spacing: 6) {
-                            Text(item.displayName)
-                                .lineLimit(1)
-                            if item.isBundled {
-                                Spacer(minLength: 4)
-                                Text("Built-in")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                ScrollViewReader { proxy in
+                    List(selection: $selectedSkinDirectoryName) {
+                        ForEach(skin.availableSkins) { item in
+                            HStack(spacing: 6) {
+                                Text(item.displayName)
+                                    .lineLimit(1)
+                                if item.isBundled {
+                                    Spacer(minLength: 4)
+                                    Text("Built-in")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
                             }
+                            .tag(item.directoryName as String?)
+                            .id(item.directoryName)
                         }
-                        .tag(item.directoryName as String?)
+                    }
+                    .listStyle(.inset)
+                    .frame(minWidth: 220, maxWidth: 250)
+                    .disabled(skin.isImporting)
+                    .onAppear {
+                        selectedSkinDirectoryName = skin.activeSkinDirectoryName
+                        centerSelectedSkin(using: proxy)
+                    }
+                    .onChange(of: selectedSkinDirectoryName) { selectedName in
+                        guard let selectedName,
+                              selectedName.caseInsensitiveCompare(skin.activeSkinDirectoryName) != .orderedSame else {
+                            centerSelectedSkin(using: proxy)
+                            return
+                        }
+                        _ = skin.selectSkin(named: selectedName)
+                        centerSelectedSkin(named: selectedName, using: proxy)
+                    }
+                    .onChange(of: skin.activeSkinDirectoryName) { activeName in
+                        selectedSkinDirectoryName = activeName
+                        centerSelectedSkin(named: activeName, using: proxy)
+                    }
+                    .onChange(of: skin.availableSkins.map(\.directoryName)) { _ in
+                        centerSelectedSkin(using: proxy)
+                    }
+                    .onChange(of: skin.isImporting) { isImporting in
+                        guard !isImporting else { return }
+                        selectedSkinDirectoryName = skin.activeSkinDirectoryName
+                        centerSelectedSkin(using: proxy)
+                    }
+                    .onChange(of: settingsWindowState.isVisible) { isVisible in
+                        guard isVisible else { return }
+                        selectedSkinDirectoryName = skin.activeSkinDirectoryName
+                        centerSelectedSkin(using: proxy)
                     }
                 }
-                .listStyle(.inset)
-                .frame(minWidth: 220, maxWidth: 250)
-                .disabled(skin.isImporting)
 
                 HStack(spacing: 0) {
                     Button(action: importSkin) {
@@ -5085,16 +5121,20 @@ private struct SkinSettingsView: View {
             }
         }
         .padding(18)
-        .onAppear {
-            selectedSkinDirectoryName = skin.activeSkinDirectoryName
-        }
-        .onChange(of: selectedSkinDirectoryName) { selectedName in
-            guard let selectedName,
-                  selectedName.caseInsensitiveCompare(skin.activeSkinDirectoryName) != .orderedSame else { return }
-            _ = skin.selectSkin(named: selectedName)
-        }
-        .onChange(of: skin.activeSkinDirectoryName) { activeName in
-            selectedSkinDirectoryName = activeName
+    }
+
+    private func centerSelectedSkin(using proxy: ScrollViewProxy) {
+        centerSelectedSkin(named: selectedSkinDirectoryName ?? skin.activeSkinDirectoryName, using: proxy)
+    }
+
+    private func centerSelectedSkin(named directoryName: String, using proxy: ScrollViewProxy) {
+        guard skin.availableSkins.contains(where: {
+            $0.directoryName.caseInsensitiveCompare(directoryName) == .orderedSame
+        }) else { return }
+        // List lays out its rows after the state update. Defer the scroll until
+        // that pass so the target row exists in the ScrollViewReader proxy.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            proxy.scrollTo(directoryName, anchor: .center)
         }
     }
 
