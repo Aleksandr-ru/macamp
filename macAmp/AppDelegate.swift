@@ -1174,6 +1174,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // `.numericPad`; the player router treats those as the same physical
         // key as well.
         let shortcutModifiers = modifiers.intersection([.command, .option, .control, .shift])
+        // A SwiftUI List is hosted by an NSTableView. Move its selection here
+        // and consume the event: passing it through would let the Controls
+        // menu reinterpret the same arrow as a player volume shortcut.
+        if shortcutModifiers.isEmpty,
+           [125, 126].contains(event.keyCode),
+           moveSettingsListSelection(for: event) {
+            return true
+        }
         switch shortcutModifiers {
         case []:
             // Transport, seek, jump-to-file and volume shortcuts.
@@ -1196,6 +1204,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // window boundary explicit if routing changes later.
             return shortcutModifiers == [.control] && ratingShortcutValue(for: keyCode) != nil
         }
+    }
+
+    private func moveSettingsListSelection(for event: NSEvent) -> Bool {
+        var responder = (event.window ?? NSApp.keyWindow)?.firstResponder
+        while let current = responder {
+            if let table = current as? NSTableView {
+                let rows = table.numberOfRows
+                guard rows > 0 else { return false }
+                let selectedRows = table.selectedRowIndexes
+                let target: Int
+                if event.keyCode == 126 { // ↑
+                    target = selectedRows.isEmpty ? rows - 1 : max(0, selectedRows.first! - 1)
+                } else { // ↓
+                    target = selectedRows.isEmpty ? 0 : min(rows - 1, selectedRows.last! + 1)
+                }
+                table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
+                table.scrollRowToVisible(target)
+                return true
+            }
+            responder = current.nextResponder
+        }
+        return false
     }
 
     private func isEditingText(for event: NSEvent) -> Bool {
