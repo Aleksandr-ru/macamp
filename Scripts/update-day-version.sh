@@ -9,6 +9,15 @@ project_root="${SRCROOT:-}"
 if [[ -z "$project_root" || ! -f "$product_info_plist" ]]; then
     exit 0
 fi
+
+# Keep the copyright shown by AppKit's standard About panel current for every
+# build.  This is intentionally independent of the day-version calculation:
+# even a build from a checkout without a Day-* commit should have the current
+# copyright year.
+build_year="$(date +%Y)"
+copyright="Copyright © 2020-${build_year} Aleksandr.ru. All rights reserved."
+/usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $copyright" "$product_info_plist"
+
 if ! git -C "$project_root" rev-parse --show-toplevel >/dev/null 2>&1; then
     exit 0
 fi
