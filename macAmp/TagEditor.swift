@@ -1745,6 +1745,11 @@ final class TagEditorPanelView: NSView {
     private func setup() {
         fileLabel.font = NSFont.systemFont(ofSize: 12)
         fileLabel.textColor = .secondaryLabelColor
+        // Keep the full source path available for copying. A label is
+        // non-selectable by default, so the path at the top of the editor
+        // could only be read and not selected with the mouse.
+        fileLabel.isEditable = false
+        fileLabel.isSelectable = true
         fileLabel.lineBreakMode = .byTruncatingMiddle
         fileLabel.alignment = .left
 
