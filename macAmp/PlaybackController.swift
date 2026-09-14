@@ -1027,9 +1027,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         resetSpectrumAnimation()
     }
 
-    /// Keeps analysis work proportional to what is actually on screen.  The
-    /// audio engine is independent of the visualizer, so turning it off must
-    /// also stop disk reads and DSP work rather than merely hiding the view.
+    /// Keeps display analysis work proportional to what is actually on screen.
+    /// AUTO EQ remains an audio consumer while both EQ ON and AUTO are active.
     func setVisualization(enabled: Bool, waveform: Bool) {
         mainVisualizationEnabled = enabled
         mainNeedsWaveformSamples = enabled && waveform
@@ -1074,8 +1073,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         }
     }
 
-    /// The audio graph keeps running in the background, but rendering state
-    /// and file-based spectrum analysis have no user-visible value there.
+    /// The audio graph keeps running in the background. Display analysis is
+    /// paused while the player is occluded, while active AUTO EQ still needs
+    /// its PCM input when both EQ ON and AUTO are enabled.
     func setInterfaceVisible(_ visible: Bool) {
         guard isInterfaceVisible != visible else { return }
         isInterfaceVisible = visible
@@ -1275,7 +1275,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var needsLiveAnalysis: Bool {
         milkDropVisualizationEnabled
             || (isInterfaceVisible
-                && (mainVisualizationEnabled || (equalizer.isEnabled && equalizer.isAdaptiveEnabled)))
+                && mainVisualizationEnabled)
+            || (equalizer.isEnabled && equalizer.isAdaptiveEnabled)
     }
 
     private var liveAnalysisInterval: TimeInterval {
@@ -1283,7 +1284,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         if isInterfaceVisible, mainVisualizationEnabled {
             return equalizer.adaptiveConfiguration.analysisInterval
         }
-        if isInterfaceVisible, equalizer.isEnabled, equalizer.isAdaptiveEnabled {
+        if equalizer.isEnabled, equalizer.isAdaptiveEnabled {
             return adaptiveAnalysisInterval
         }
         return 1.0
