@@ -1727,6 +1727,71 @@ final class PlaylistManager: ObservableObject {
         return entry
     }
 
+    /// Returns whether at least one selected row can move by one position.
+    /// Selection is kept as a set of stable IDs, so moving a group preserves
+    /// both its members and their relative order.
+    func canMoveSelectedEntries(in playlist: PlaylistModel, by offset: Int) -> Bool {
+        guard abs(offset) == 1,
+              playlists.contains(where: { $0.id == playlist.id }),
+              playlist.entries.count > 1,
+              playlist.sortingProgress == nil,
+              sortingTasks[playlist.id] == nil,
+              !isLoadingEntries(playlist) else { return false }
+
+        let selectedIDs = playlist.selectedIDs
+        let selectedIndices = playlist.entries.indices.filter {
+            selectedIDs.contains(playlist.entries[$0].id)
+        }
+        guard !selectedIndices.isEmpty else { return false }
+
+        if offset < 0 {
+            return selectedIndices.contains { index in
+                index > 0 && !selectedIDs.contains(playlist.entries[index - 1].id)
+            }
+        }
+        return selectedIndices.contains { index in
+            index + 1 < playlist.entries.count
+                && !selectedIDs.contains(playlist.entries[index + 1].id)
+        }
+    }
+
+    /// Moves every selected row by one position, swapping only with an
+    /// unselected neighbour. This matches the Playlist Editor's expected
+    /// multi-selection behaviour and never recreates entry objects.
+    @discardableResult
+    func moveSelectedEntries(in playlist: PlaylistModel, by offset: Int) -> Bool {
+        guard canMoveSelectedEntries(in: playlist, by: offset) else { return false }
+
+        let selectedIDs = playlist.selectedIDs
+        let selectedIndices = playlist.entries.indices.filter {
+            selectedIDs.contains(playlist.entries[$0].id)
+        }
+        var moved = false
+
+        if offset < 0 {
+            for index in selectedIndices {
+                guard index > 0,
+                      !selectedIDs.contains(playlist.entries[index - 1].id) else { continue }
+                playlist.entries.swapAt(index, index - 1)
+                moved = true
+            }
+        } else {
+            for index in selectedIndices.reversed() {
+                guard index + 1 < playlist.entries.count,
+                      !selectedIDs.contains(playlist.entries[index + 1].id) else { continue }
+                playlist.entries.swapAt(index, index + 1)
+                moved = true
+            }
+        }
+
+        guard moved else { return false }
+        playlist.structureRevision &+= 1
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist)
+        save()
+        return true
+    }
+
     /// Scroll only when keyboard navigation moved the selected row beyond the
     /// current viewport. This is deliberately based on the editor's measured
     /// visible range, not a fixed row count.

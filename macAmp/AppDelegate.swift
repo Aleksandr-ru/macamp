@@ -1100,6 +1100,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if handleInfoSummaryShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistMetadataShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistSelectionShortcut(event, modifiers: modifiers) { return true }
+        if handlePlaylistReorderShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistErrorRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistRemovalShortcut(event, modifiers: modifiers) { return true }
         if handlePlaylistTitleRebuildShortcut(event, modifiers: modifiers) { return true }
@@ -1445,6 +1446,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
         playlistManager.selectAll(in: playlist)
+        return true
+    }
+
+    /// Option+Up/Down reorders the selected rows in the key Playlist Editor.
+    /// It is handled before the unmodified arrow routing so it can never reach
+    /// the global volume shortcuts, and another player window cannot reorder
+    /// the editor merely because it is the active playlist.
+    private func handlePlaylistReorderShortcut(
+        _ event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        // Arrow events can carry `.numericPad`/`.function`; compare only the
+        // four actual shortcut modifiers, just like the Settings router.
+        let shortcutModifiers = modifiers.intersection([.command, .option, .control, .shift])
+        guard shortcutModifiers == [.option],
+              (event.keyCode == 126 || event.keyCode == 125),
+              let sourceWindow = event.window ?? NSApp.keyWindow,
+              let playlistID = playlistWindows.first(where: { $0.value === sourceWindow })?.key,
+              let playlist = playlistManager.playlist(id: playlistID) else {
+            return false
+        }
+
+        let offset = event.keyCode == 126 ? -1 : 1
+        _ = playlistManager.moveSelectedEntries(in: playlist, by: offset)
         return true
     }
 
@@ -5857,6 +5882,16 @@ private final class PlaylistRowInteractionNSView: PlaylistDropTargetNSView, NSDr
             && selectedEntries.allSatisfy { $0.url.isFileURL && !$0.url.path.isEmpty }
         menu.addItem(rate)
         menu.addItem(.separator())
+        let moveUp = contextItem("Move Up", action: #selector(PlaylistContextMenuTarget.moveUp(_:)), target: target)
+        moveUp.keyEquivalent = PlaylistMenuShortcut.optionUp.keyEquivalent
+        moveUp.keyEquivalentModifierMask = PlaylistMenuShortcut.optionUp.modifierFlags
+        moveUp.isEnabled = manager.canMoveSelectedEntries(in: playlist, by: -1)
+        menu.addItem(moveUp)
+        let moveDown = contextItem("Move Down", action: #selector(PlaylistContextMenuTarget.moveDown(_:)), target: target)
+        moveDown.keyEquivalent = PlaylistMenuShortcut.optionDown.keyEquivalent
+        moveDown.keyEquivalentModifierMask = PlaylistMenuShortcut.optionDown.modifierFlags
+        moveDown.isEnabled = manager.canMoveSelectedEntries(in: playlist, by: 1)
+        menu.addItem(moveDown)
         let reveal = contextItem("Reveal in Finder", action: #selector(PlaylistContextMenuTarget.revealInFinder(_:)), target: target)
         reveal.isEnabled = entry.url.isFileURL && !entry.url.path.isEmpty
         menu.addItem(reveal)
@@ -5991,6 +6026,8 @@ private final class PlaylistContextMenuTarget: NSObject {
         AppDelegate.shared?.showTagEditor(for: playlist, entry: entry)
     }
     @objc func viewInfo(_ sender: NSMenuItem) { AppDelegate.shared?.showFileInfo(for: playlist) }
+    @objc func moveUp(_ sender: NSMenuItem) { manager.moveSelectedEntries(in: playlist, by: -1) }
+    @objc func moveDown(_ sender: NSMenuItem) { manager.moveSelectedEntries(in: playlist, by: 1) }
     @objc func rateItems(_ sender: NSMenuItem) {
         let stars = PlaylistRatingMenu.titles.firstIndex(of: sender.title).map { 5 - $0 } ?? 0
         AppDelegate.shared?.setManualRating(stars: stars, for: playlist)
@@ -6048,8 +6085,14 @@ private struct PlaylistMenuShortcut {
     let keyEquivalent: String
     let modifierFlags: NSEvent.ModifierFlags
 
+    private static func menuKey(_ keyCode: Int) -> String {
+        UnicodeScalar(keyCode).map(String.init) ?? ""
+    }
+
     static let delete = Self(keyEquivalent: "\u{8}", modifierFlags: [])
     static let optionDelete = Self(keyEquivalent: "\u{8}", modifierFlags: [.option])
+    static let optionUp = Self(keyEquivalent: menuKey(NSUpArrowFunctionKey), modifierFlags: [.option])
+    static let optionDown = Self(keyEquivalent: menuKey(NSDownArrowFunctionKey), modifierFlags: [.option])
     static let commandA = Self(keyEquivalent: "a", modifierFlags: [.command])
     static let commandN = Self(keyEquivalent: "n", modifierFlags: [.command])
     static let commandO = Self(keyEquivalent: "o", modifierFlags: [.command])
