@@ -2489,13 +2489,16 @@ final class WinampSkinStore: ObservableObject {
 
     private func loadVisualizationPalette(from directory: URL) -> [NSColor] {
         guard let file = skinResourceURL(named: "VISCOLOR.TXT", in: directory),
-              let text = try? String(contentsOf: file, encoding: .utf8) else {
+              let data = try? Data(contentsOf: file),
+              let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .windowsCP1252)
+                ?? String(data: data, encoding: .isoLatin1) else {
             return Self.defaultVisualizationPalette
         }
 
         // VISCOLOR is a list of RGB entries.  Some skins include blank lines,
-        // comments, or other malformed lines, so only valid RGB triplets
-        // consume an index (matching Winamp/Webamp's parser).
+        // comments, malformed lines, or legacy Windows text, so only valid RGB
+        // triplets consume an index (matching Winamp/Webamp's parser).
         var colors = Self.defaultVisualizationPalette
         var index = 0
         for line in text.split(whereSeparator: { $0.isNewline }) {
