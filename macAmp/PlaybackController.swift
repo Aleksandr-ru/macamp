@@ -840,7 +840,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var lastAnalyzedSampleGeneration: UInt64 = 0
     private let visualBarFalloffQ4 = 12
     private let visualPeakFalloff: Float = 1.1
-    private let classicSpectrumInterval: TimeInterval = 1.0 / 6.0
+    private let visualAnalysisInterval: TimeInterval = 1.0 / 12.0
+    /// Keep the tap cadence below the visual update interval. The analyzer
+    /// retains only the newest 1024 samples, so a 4096-frame tap would throw
+    /// away three quarters of the possible refresh points.
+    private let visualAnalysisBufferSize: AVAudioFrameCount = 2_048
     private var routesThroughEqualizer = false
     private var isLiveAnalysisTapInstalled = false
     private var isStreamingAnalysisTapInstalled = false
@@ -855,14 +859,19 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var isInterfaceVisible = true
     private var lastPublishedPosition = Date.distantPast
     private let positionPublishInterval: TimeInterval = 0.25
-    /// Spectrum animation is updated at 6 FPS, but the less visible AUTO EQ
+    /// Spectrum animation is updated at 12 FPS, but the less visible AUTO EQ
     /// correction only needs 3 FPS. Keeping the two cadences separate avoids
     /// spending an FFT on every visual frame.
     private let adaptiveAnalysisInterval: TimeInterval = 1.0 / 3.0
     private var lastAdaptiveAnalysis = Date.distantPast
-    /// The visible analyzer has only 16 bands and 15 LED rows. It does not
-    /// benefit from the more expensive window needed by Adaptive EQ.
-    private let visualFFTSize = 512
+    /// The visible analyzer uses the complete live sample snapshot. The extra
+    /// frequency resolution is important for bass and for notes between the
+    /// logarithmic band centres.
+    private let visualFFTSize = 1_024
+    private let visualLowestFrequency = 45.0
+    private let visualOctaveSpan = 8.7
+    private let visualDisplayFloorDB = -72.0
+    private let visualDisplayGainDB = 6.0
     private var fftSize: Int { equalizer.adaptiveConfiguration.fftSize }
     private lazy var adaptiveFFTWorkspace = FFTWorkspace(size: fftSize)
     private lazy var visualFFTWorkspace = FFTWorkspace(size: visualFFTSize)
@@ -1282,7 +1291,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var liveAnalysisInterval: TimeInterval {
         if milkDropVisualizationEnabled { return 1.0 / 30.0 }
         if isInterfaceVisible, mainVisualizationEnabled {
-            return equalizer.adaptiveConfiguration.analysisInterval
+            return visualAnalysisInterval
         }
         if equalizer.isEnabled, equalizer.isAdaptiveEnabled {
             return adaptiveAnalysisInterval
@@ -1304,7 +1313,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
         guard shouldInstall else { return }
-        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4_096, format: nil) { [weak self] buffer, _ in
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: self.visualAnalysisBufferSize, format: nil) { [weak self] buffer, _ in
             guard let self,
                   let channels = buffer.floatChannelData else { return }
             let count = min(Int(buffer.frameLength), self.liveAnalysisSamples.count)
@@ -2181,17 +2190,40 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         } ?? Array(repeating: -120, count: frequencies.count)
     }
 
-    /// A single 512-point FFT replaces sixteen independent Goertzel scans.
-    /// The classic display has only sixteen columns, so nearest-bin sampling
-    /// is both sufficient and substantially cheaper.
+    /// A single FFT replaces sixteen independent Goertzel scans. Each display
+    /// band samples its logarithmic frequency range, which keeps tonal content
+    /// visible even when it falls between two band centres.
     private func visualLevels(samples: ArraySlice<Float>, sampleRate: Double) -> [CGFloat] {
         visualFFTWorkspace?.withPower(samples: samples) { power in
-            (0..<16).map { index in
-                let frequency = min(sampleRate / 2 - 1, 45 * pow(2, Double(index) * 8.7 / 15))
-                let bin = min(power.count - 1, max(1, Int((Double(visualFFTSize) * frequency / sampleRate).rounded())))
-                let magnitude = sqrt(Double(max(0, power[bin]))) / Double(visualFFTSize / 2)
-                let db = 20 * log10(max(magnitude, 0.000_000_1))
-                return CGFloat(min(1, max(0, (db + 65) / 65)))
+            let nyquist = max(2, sampleRate / 2)
+            let bandRatio = pow(2.0, visualOctaveSpan / 15.0)
+            return (0..<16).map { index in
+                let centre = visualLowestFrequency * pow(bandRatio, Double(index))
+                let lowerFrequency = max(1, centre / sqrt(bandRatio))
+                let upperFrequency = min(nyquist - 1, centre * sqrt(bandRatio))
+                let lowBin = max(1, min(power.count - 1,
+                                        Int(floor(lowerFrequency * Double(visualFFTSize) / sampleRate))))
+                let highBin = max(lowBin, min(power.count - 1,
+                                              Int(ceil(upperFrequency * Double(visualFFTSize) / sampleRate))))
+                var maximumPower: Float = 0
+                var totalPower: Float = 0
+                var binCount = 0
+                for bin in lowBin...highBin {
+                    let value = max(0, power[bin])
+                    maximumPower = max(maximumPower, value)
+                    totalPower += value
+                    binCount += 1
+                }
+                // A single-bin peak catches tonal content that lands between
+                // the old fixed centres; the mean keeps broad-band content
+                // visible without making the wider high-frequency bands too
+                // dominant.
+                let meanPower = totalPower / Float(max(1, binCount))
+                let representativePower = maximumPower * 0.75 + meanPower * 0.25
+                let magnitude = sqrt(Double(representativePower)) / Double(visualFFTSize / 2)
+                let db = 20 * log10(max(magnitude, 0.000_000_1)) + visualDisplayGainDB
+                let level = (db - visualDisplayFloorDB) / -visualDisplayFloorDB
+                return CGFloat(min(1, max(0, level)))
             }
         } ?? Array(repeating: 0, count: 16)
     }
@@ -2203,12 +2235,12 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         -> (bars: [CGFloat], peaks: [CGFloat]) {
         var bars = Array(repeating: CGFloat(0), count: 16)
         var peaks = Array(repeating: CGFloat(0), count: 16)
-        let elapsed = lastClassicSpectrumUpdate.map { timestamp - $0 } ?? classicSpectrumInterval
+        let elapsed = lastClassicSpectrumUpdate.map { timestamp - $0 } ?? visualAnalysisInterval
         lastClassicSpectrumUpdate = timestamp
         // Keep Winamp's original per-frame dynamics, but scale them to elapsed
         // time. This prevents MilkDrop's shared 30 Hz analysis cadence from
         // making the classic bars and peaks fall five times faster.
-        let frameScale = Float(min(3, max(0.25, elapsed / classicSpectrumInterval)))
+        let frameScale = Float(min(3, max(0.25, elapsed / visualAnalysisInterval)))
         let barFalloff = max(1, Int((Float(visualBarFalloffQ4) * frameScale).rounded()))
 
         for index in 0..<16 {
