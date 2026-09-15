@@ -719,7 +719,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
             if let pending = self.pendingTrackNotification {
                 self.pendingTrackNotification = nil
-                if pending.shouldNotify {
+                if pending.shouldNotify && !self.hasFocusedPlayerWindow {
                     var artist = pending.entry.artist
                     var title = pending.entry.trackTitle ?? pending.entry.title
                     if artist == nil, pending.entry.trackTitle == nil,
@@ -2713,7 +2713,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let entry = PlaylistEntry(url: url)
         standalonePlaybackURL = url
         resetInfoTarget()
-        prepareTrackNotification(for: entry, automatic: false)
+        prepareTrackNotification(for: entry)
         playback.open(url, displayTitle: entry.title)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(url)
@@ -2841,7 +2841,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // current viewport (including a shuffle jump to a distant row).
         let shouldReveal = !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
-        prepareTrackNotification(for: entry, automatic: automatic)
+        prepareTrackNotification(for: entry)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
@@ -2862,22 +2862,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         evaluateAutomaticRating(completed: false)
         let shouldReveal = revealIfNotVisible && !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
-        prepareTrackNotification(for: entry, automatic: false)
+        prepareTrackNotification(for: entry)
         playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
         playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
     }
 
-    private func prepareTrackNotification(for entry: PlaylistEntry, automatic: Bool) {
+    private var hasFocusedPlayerWindow: Bool {
+        // NSApp.windows includes the main player, docked auxiliary panels,
+        // floating playlist editors, Settings and native file panels. A key
+        // visible window is enough to treat the player as being attended.
+        NSApp.windows.contains {
+            $0.isVisible && !$0.isMiniaturized && ($0.isKeyWindow || (NSApp.isActive && $0.isMainWindow))
+        }
+    }
+
+    private func prepareTrackNotification(for entry: PlaylistEntry) {
         // During application activation a skinned panel can own keyboard
         // focus before NSApp.isActive changes. Settings and file panels count
         // as well.
-        let hasActiveWindow = NSApp.windows.contains {
-            $0.isVisible && !$0.isMiniaturized && ($0.isKeyWindow || (NSApp.isActive && $0.isMainWindow))
-        }
         let shouldNotify = TrackNotificationController.shouldNotify(
-            enabled: trackNotifications.isEnabled, automatic: automatic, hasActiveWindow: hasActiveWindow)
+            enabled: trackNotifications.isEnabled, hasActiveWindow: hasFocusedPlayerWindow)
         trackNotifications.invalidate(removeDelivered: !shouldNotify)
         pendingTrackNotification = (entry, shouldNotify)
     }

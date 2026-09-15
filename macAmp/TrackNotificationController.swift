@@ -50,8 +50,8 @@ final class TrackNotificationController: NSObject, ObservableObject, UNUserNotif
         super.init()
     }
 
-    static func shouldNotify(enabled: Bool, automatic: Bool, hasActiveWindow: Bool) -> Bool {
-        enabled && (automatic || !hasActiveWindow)
+    static func shouldNotify(enabled: Bool, hasActiveWindow: Bool) -> Bool {
+        enabled && !hasActiveWindow
     }
 
     func configure() {
