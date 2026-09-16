@@ -459,7 +459,7 @@ final class WinampSkinStore: ObservableObject {
         if let cached = windowRegionCache[key] { return cached }
         guard let directory = extractedDirectory,
               let regionFile = skinResourceURL(named: "REGION.TXT", in: directory),
-              let contents = try? String(contentsOf: regionFile, encoding: .utf8),
+              let contents = skinText(at: regionFile),
               let region = parseWindowRegion(section: section, from: contents) else {
             missingWindowRegions.insert(key)
             return nil
@@ -837,6 +837,19 @@ final class WinampSkinStore: ObservableObject {
         return files.first(where: { $0.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame })
     }
 
+    /// Classic skin text files are commonly ANSI/Windows-1252 rather than
+    /// UTF-8. Decode the complete file before parsing it: a single legacy
+    /// character in a comment must not make otherwise valid skin data vanish.
+    private func skinText(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .windowsCP1252)
+                ?? String(data: data, encoding: .isoLatin1) else {
+            return nil
+        }
+        return text.first == "\u{FEFF}" ? String(text.dropFirst()) : text
+    }
+
     private func containsSkinCursor(in directory: URL) -> Bool {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: directory,
@@ -859,7 +872,7 @@ final class WinampSkinStore: ObservableObject {
     /// a font, matching Winamp's PLEDIT.TXT contract.
     private func loadSkinFontName(from directory: URL) -> String? {
         guard let file = fileURL(named: "PLEDIT.TXT", in: directory),
-              let contents = try? String(contentsOf: file, encoding: .utf8) else {
+              let contents = skinText(at: file) else {
             return nil
         }
 
@@ -1326,7 +1339,7 @@ final class WinampSkinStore: ObservableObject {
         )
         guard let directory = extractedDirectory,
               let file = skinResourceURL(named: "PLEDIT.TXT", in: directory),
-              let contents = try? String(contentsOf: file, encoding: .utf8) else {
+              let contents = skinText(at: file) else {
             playlistColorsCache = defaults
             return defaults
         }
@@ -2489,10 +2502,7 @@ final class WinampSkinStore: ObservableObject {
 
     private func loadVisualizationPalette(from directory: URL) -> [NSColor] {
         guard let file = skinResourceURL(named: "VISCOLOR.TXT", in: directory),
-              let data = try? Data(contentsOf: file),
-              let text = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .windowsCP1252)
-                ?? String(data: data, encoding: .isoLatin1) else {
+              let text = skinText(at: file) else {
             return Self.defaultVisualizationPalette
         }
 
