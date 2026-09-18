@@ -1478,10 +1478,10 @@ final class WinampSkinStore: ObservableObject {
 
     /// Classic skins provide dedicated cursors, including Playlist resize and
     /// normal-window cursors that may be encoded as RIFF/ANI.
-    func cursor(named filename: String, hotSpot: NSPoint = NSPoint(x: 8, y: 8)) -> NSCursor? {
+    func cursor(named filename: String, hotSpot: NSPoint? = nil) -> NSCursor? {
         guard useSkinCursors, let directory = extractedDirectory else { return nil }
         let fileKey = filename.lowercased()
-        let key = "\(fileKey)-\(hotSpot.x)-\(hotSpot.y)"
+        let key = hotSpot.map { "\(fileKey)-\($0.x)-\($0.y)" } ?? "\(fileKey)-embedded-hotspot"
         if let cached = cursorCache[key] { return cached }
         if missingSkinFiles.contains(fileKey) { return nil }
         let url: URL
@@ -1496,20 +1496,91 @@ final class WinampSkinStore: ObservableObject {
             missingSkinFiles.insert(fileKey)
             return nil
         }
-        guard let image = NSImage(contentsOf: url) else {
-            guard let data = try? Data(contentsOf: url),
-                  let frameData = firstAnimatedCursorFrame(in: data),
-                  let image = NSImage(data: frameData) else {
-                missingSkinFiles.insert(fileKey)
-                return nil
-            }
-            let cursor = NSCursor(image: image, hotSpot: hotSpot)
-            cursorCache[key] = cursor
-            return cursor
+        guard let fileData = try? Data(contentsOf: url) else {
+            missingSkinFiles.insert(fileKey)
+            return nil
         }
-        let cursor = NSCursor(image: image, hotSpot: hotSpot)
+        let cursorData: Data
+        let image: NSImage
+        if let decodedImage = NSImage(contentsOf: url) {
+            cursorData = fileData
+            image = decodedImage
+        } else if let frameData = firstAnimatedCursorFrame(in: fileData),
+                  let decodedImage = NSImage(data: frameData) {
+            cursorData = frameData
+            image = decodedImage
+        } else {
+            missingSkinFiles.insert(fileKey)
+            return nil
+        }
+        let resolvedHotSpot = hotSpot
+            ?? windowsCursorHotSpot(in: cursorData, imageSize: image.size)
+            ?? NSPoint(x: 8, y: 8)
+        let cursor = NSCursor(image: image, hotSpot: resolvedHotSpot)
         cursorCache[key] = cursor
         return cursor
+    }
+
+    /// A Windows CUR directory stores the click point in each image entry.
+    /// NSImage decodes the pixels but does not expose this metadata, so using
+    /// a fixed centre point visibly offsets clicks from the cursor tip.
+    private func windowsCursorHotSpot(in data: Data, imageSize: NSSize) -> NSPoint? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 22 else { return nil }
+
+        func uint16(at offset: Int) -> UInt16 {
+            UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+        }
+
+        func uint32(at offset: Int) -> UInt32 {
+            UInt32(bytes[offset])
+                | (UInt32(bytes[offset + 1]) << 8)
+                | (UInt32(bytes[offset + 2]) << 16)
+                | (UInt32(bytes[offset + 3]) << 24)
+        }
+
+        guard uint16(at: 0) == 0, uint16(at: 2) == 2 else { return nil }
+        let entryCount = Int(uint16(at: 4))
+        guard entryCount > 0, entryCount <= (bytes.count - 6) / 16 else { return nil }
+
+        struct CursorEntry {
+            let width: CGFloat
+            let height: CGFloat
+            let hotSpot: NSPoint
+            let distanceFromDecodedSize: CGFloat
+        }
+
+        var entries: [CursorEntry] = []
+        entries.reserveCapacity(entryCount)
+        for index in 0..<entryCount {
+            let offset = 6 + index * 16
+            let width = CGFloat(bytes[offset] == 0 ? 256 : Int(bytes[offset]))
+            let height = CGFloat(bytes[offset + 1] == 0 ? 256 : Int(bytes[offset + 1]))
+            let resourceSize = Int(uint32(at: offset + 8))
+            let resourceOffset = Int(uint32(at: offset + 12))
+            guard resourceSize > 0,
+                  resourceOffset >= 0,
+                  resourceOffset <= bytes.count,
+                  resourceSize <= bytes.count - resourceOffset else { continue }
+
+            let x = CGFloat(uint16(at: offset + 4))
+            let y = CGFloat(uint16(at: offset + 6))
+            guard x < width, y < height else { continue }
+            entries.append(CursorEntry(
+                width: width,
+                height: height,
+                hotSpot: NSPoint(x: x, y: y),
+                distanceFromDecodedSize: abs(width - imageSize.width) + abs(height - imageSize.height)
+            ))
+        }
+
+        guard let entry = entries.min(by: {
+            $0.distanceFromDecodedSize < $1.distanceFromDecodedSize
+        }) else { return nil }
+        return NSPoint(
+            x: entry.hotSpot.x * imageSize.width / entry.width,
+            y: entry.hotSpot.y * imageSize.height / entry.height
+        )
     }
 
     /// macOS does not load Windows RIFF/ANI cursors through NSImage. Classic

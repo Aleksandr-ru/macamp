@@ -118,7 +118,6 @@ class SkinnedTitleDragNSView: NSView {
         window?.invalidateCursorRects(for: self)
         if window == nil {
             isCursorInside = false
-            NSCursor.arrow.set()
         }
     }
 
@@ -153,7 +152,6 @@ class SkinnedTitleDragNSView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         isCursorInside = false
-        NSCursor.arrow.set()
     }
 
     func refreshCursorIfInside() {
@@ -202,10 +200,24 @@ private final class PlayerWindow: NSWindow {
         hidesOnDeactivate = false
         collectionBehavior = [.managed]
         acceptsMouseMovedEvents = true
+        // Cursor selection for classic windows is owned by the Winamp
+        // coordinate table in AppDelegate. SwiftUI rebuilds parts of its view
+        // hierarchy as playback state changes; allowing AppKit to rebuild the
+        // child cursor rectangles at the same time can replace that cursor
+        // with the default arrow even though the mouse has not moved.
+        disableCursorRects()
     }
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func update() {
+        super.update()
+        // SwiftUI can update tracking state after the mouse event which chose
+        // the Winamp cursor. Reconcile once at the end of that window update;
+        // AppDelegate avoids calling NSCursor.set() when it is already right.
+        AppDelegate.shared?.refreshSkinCursorIfNeeded(in: self)
+    }
 
     /// Keep the region mask on an AppKit-owned layer. SwiftUI owns the
     /// NSHostingView backing layer and may replace its layer state during a
@@ -289,8 +301,15 @@ private final class PlayerWindow: NSWindow {
         // Winamp resolves the cursor for the complete window in WM_SETCURSOR.
         // SwiftUI/AppKit child views can otherwise restore the system arrow
         // after their own event handling, especially inside Playlist Editor.
-        if event.type == .mouseMoved || event.type == .cursorUpdate {
+        switch event.type {
+        case .mouseMoved, .cursorUpdate,
+             .mouseEntered, .mouseExited,
+             .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+             .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+             .otherMouseDown, .otherMouseUp, .otherMouseDragged:
             AppDelegate.shared?.updateSkinCursor(event)
+        default:
+            break
         }
     }
 }
@@ -879,10 +898,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func updateInfoHoverCursor(_ event: NSEvent) {
-        guard event.window === infoWindow,
+    private func updateInfoHoverCursor(in sourceWindow: NSWindow, at windowPoint: NSPoint) {
+        guard sourceWindow === infoWindow,
               let panel = infoWindow?.contentView as? InfoPanelView else { return }
-        panel.updateHoverCursor(at: event.locationInWindow)
+        panel.updateHoverCursor(at: windowPoint)
     }
 
     /// Winamp selects a cursor from a coordinate table for every classic
@@ -892,15 +911,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func updateSkinCursor(_ event: NSEvent) {
         guard let sourceWindow = event.window,
               isSkinnedPlayerWindow(sourceWindow) else { return }
+        updateSkinCursor(in: sourceWindow, at: event.locationInWindow)
+    }
 
+    /// Reconciles cursor state after an AppKit window update. Playback changes
+    /// can rebuild SwiftUI tracking state without producing a new mouse event,
+    /// so event-only cursor ownership leaves the default arrow visible until
+    /// the pointer moves again.
+    func refreshSkinCursorIfNeeded(in sourceWindow: NSWindow) {
+        guard sourceWindow.isVisible,
+              isSkinnedPlayerWindow(sourceWindow),
+              let contentView = sourceWindow.contentView else { return }
+        let windowPoint = sourceWindow.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let contentPoint = contentView.convert(windowPoint, from: nil)
+        guard contentView.bounds.contains(contentPoint) else { return }
+        updateSkinCursor(in: sourceWindow, at: windowPoint)
+    }
+
+    private func updateSkinCursor(in sourceWindow: NSWindow, at windowPoint: NSPoint) {
         let scale = max(CGFloat(interfaceScale.factor), 0.0001)
         let contentBounds = sourceWindow.contentView?.bounds
             ?? NSRect(origin: .zero, size: sourceWindow.frame.size)
         let logicalWidth = contentBounds.width / scale
         let logicalHeight = contentBounds.height / scale
         let point = NSPoint(
-            x: (event.locationInWindow.x - contentBounds.minX) / scale,
-            y: logicalHeight - (event.locationInWindow.y - contentBounds.minY) / scale
+            x: (windowPoint.x - contentBounds.minX) / scale,
+            y: logicalHeight - (windowPoint.y - contentBounds.minY) / scale
         )
 
         let cursor: NSCursor
@@ -918,12 +954,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             return
         }
-        cursor.set()
+        if NSCursor.current !== cursor {
+            cursor.set()
+        }
         // Info text has interactive links that are more specific than the
         // window-wide Winamp cursor table. Reapply that hit-test after the
         // default so a child view cannot leave the link with an arrow.
         if sourceWindow === infoWindow {
-            updateInfoHoverCursor(event)
+            updateInfoHoverCursor(in: sourceWindow, at: windowPoint)
         }
     }
 
