@@ -943,7 +943,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if sourceWindow === window {
             cursor = mainWindowCursor(at: point, isWindowShaded: windowShade.isEnabled)
         } else if sourceWindow === equalizerWindow {
-            cursor = equalizerWindowCursor(at: point)
+            cursor = equalizerWindowCursor(at: point, isWindowShaded: equalizerShade.isEnabled)
         } else if let isWindowShaded = playlistWindowShadeState(for: sourceWindow) {
             cursor = playlistWindowCursor(at: point,
                                           width: logicalWidth,
@@ -974,7 +974,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return skinCursor(named: "MIN.CUR", fallback: .arrow)
             }
             if cursorRegion(point, x: 228, y: 3, width: 14, height: 9) {
-                return skinCursor(named: "WSPOSBAR.CUR", fallback: .resizeLeftRight)
+                return skinCursor(named: "WSPOSBAR.CUR", fallback: .arrow)
             }
             if cursorRegion(point, x: 264, y: 3, width: 8, height: 9) {
                 return skinCursor(named: "CLOSE.CUR", fallback: .arrow)
@@ -986,10 +986,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if cursorRegion(point, x: 107, y: 58, width: 108, height: 8) {
-            return skinCursor(named: "VOLBAL.CUR", fallback: .resizeLeftRight)
+            return skinCursor(named: "VOLBAL.CUR", fallback: .arrow)
         }
         if cursorRegion(point, x: 18, y: 73, width: 245, height: 8) {
-            return skinCursor(named: "POSBAR.CUR", fallback: .resizeLeftRight)
+            return skinCursor(named: "POSBAR.CUR", fallback: .arrow)
         }
         if cursorRegion(point, x: 254, y: 3, width: 8, height: 9) {
             return skinCursor(named: "WINBUT.CUR", fallback: .arrow)
@@ -1012,23 +1012,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return skinCursor(named: "NORMAL.CUR", fallback: .arrow)
     }
 
-    private func equalizerWindowCursor(at point: NSPoint) -> NSCursor {
+    private func equalizerWindowCursor(at point: NSPoint, isWindowShaded: Bool) -> NSCursor {
         if cursorRegion(point, x: 264, y: 3, width: 8, height: 9) {
             return skinCursor(named: "EQCLOSE.CUR", fallback: .arrow)
         }
-        let sliderY = 39...98
-        if sliderY.contains(Int(point.y)) {
+        if !isWindowShaded, (39...98).contains(Int(point.y)) {
             if cursorRegion(point, x: 21, y: 39, width: 12, height: 59) {
-                return skinCursor(named: "EQSLID.CUR", fallback: .resizeUpDown)
+                return skinCursor(named: "EQSLID.CUR", fallback: .arrow)
             }
             for slider in 0..<10 {
                 let x = CGFloat(78 + slider * 18)
                 if cursorRegion(point, x: x, y: 39, width: 12, height: 59) {
-                    return skinCursor(named: "EQSLID.CUR", fallback: .resizeUpDown)
+                    return skinCursor(named: "EQSLID.CUR", fallback: .arrow)
                 }
             }
         }
-        if cursorRegion(point, x: 0, y: 0, width: 275, height: 13) {
+        if isWindowShaded,
+           cursorRegion(point, x: 61, y: 3, width: 145, height: 9) {
+            // The windowshade volume and balance controls occupy x=61...206.
+            // Although visually part of the title strip, they consume drags
+            // and therefore must not advertise the window-move cursor.
+            return skinCursor(named: "EQNORMAL.CUR", fallback: .arrow)
+        }
+        if cursorRegion(point, x: 4, y: 0, width: 245, height: 14) {
             return skinCursor(named: "EQTITLE.CUR", fallback: SkinCursors.move)
         }
         return skinCursor(named: "EQNORMAL.CUR", fallback: .arrow)
@@ -1075,7 +1081,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if cursorRegion(point, x: width - 20, y: height - 20, width: 20, height: 20) {
             return skinCursor(named: "PSIZE.CUR", fallback: SkinCursors.resizeNorthwestSoutheast)
         }
-        if cursorRegion(point, x: 0, y: height - 20, width: max(0, width - 20), height: 20) {
+        if cursorRegion(point, x: 0, y: 0, width: max(0, width - 20), height: 20) {
             return skinCursor(named: "TITLEBAR.CUR", fallback: SkinCursors.move)
         }
         return .arrow
