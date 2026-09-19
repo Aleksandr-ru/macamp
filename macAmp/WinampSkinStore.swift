@@ -274,6 +274,18 @@ final class WinampSkinStore: ObservableObject {
             return false
         }
 
+        return importArchive(at: archive)
+    }
+
+    /// Imports a skin passed by Finder or another application. This shares the
+    /// exact validation and safe staging path used by the interactive picker.
+    @discardableResult
+    func importArchive(at archive: URL) -> Bool {
+        guard !isImporting else {
+            status = "SKIN IMPORT ALREADY IN PROGRESS"
+            return false
+        }
+
         let selectedSkinName = archive.deletingPathExtension().lastPathComponent
         guard isValidSkinDirectoryName(selectedSkinName) else {
             status = "INVALID SKIN NAME"

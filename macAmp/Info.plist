@@ -8,6 +8,24 @@
 	<array>
 		<dict>
 			<key>CFBundleTypeName</key>
+			<string>macAmp Music</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>mp3</string>
+				<string>m4a</string>
+				<string>aac</string>
+				<string>wav</string>
+				<string>aiff</string>
+				<string>aif</string>
+				<string>flac</string>
+				<string>ogg</string>
+				<string>opus</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
 			<string>macAmp Playlist</string>
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
@@ -15,16 +33,29 @@
 			<array>
 				<string>m3u</string>
 				<string>m3u8</string>
+				<string>pls</string>
 			</array>
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
-			<string>macAmp Audio</string>
+			<string>Winamp Skin Archive</string>
 			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
-			<key>LSItemContentTypes</key>
+			<string>Editor</string>
+			<key>CFBundleTypeExtensions</key>
 			<array>
-				<string>public.audio</string>
+				<string>wsz</string>
+				<string>zip</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Winamp Equalizer Preset</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>eqf</string>
+				<string>q1</string>
 			</array>
 		</dict>
 	</array>

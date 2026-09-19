@@ -10,9 +10,19 @@ import Cocoa
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers
+import CoreServices
 import MediaPlayer
 import QuartzCore
 import os
+
+// LaunchServices accepts a null handler to clear an explicit default. The
+// SDK's Swift import currently marks this C parameter nonnull.
+@_silgen_name("LSSetDefaultRoleHandlerForContentType")
+private func setDefaultRoleHandler(
+    _ contentType: CFString,
+    _ role: LSRolesMask,
+    _ handler: CFString?
+) -> OSStatus
 
 /// AppKit has no built-in equivalents of the classic move and diagonal resize
 /// cursors on all supported macOS versions. Render those shapes consistently
@@ -344,8 +354,16 @@ final class AlwaysOnTopState: ObservableObject {
     @Published var isEnabled = false
 }
 
+enum SettingsTab: Hashable {
+    case general
+    case skin
+    case output
+    case system
+}
+
 final class SettingsWindowState: ObservableObject {
     @Published var isVisible = false
+    @Published var selectedTab: SettingsTab = .general
 }
 
 enum RatingAdaptationPeriod: Int, CaseIterable, Identifiable {
@@ -530,6 +548,92 @@ private final class StatusBarPreferences: ObservableObject {
     }
 }
 
+/// Keeps Finder's default-app choice separate for every file extension. The
+/// document declarations in Info.plist make macAmp appear in Finder's “Open
+/// With” menu regardless of this preference; this object changes only the
+/// default handler selected by the checkboxes in Settings.
+private final class FileAssociationPreferences: ObservableObject {
+    struct Group: Identifiable {
+        let id: String
+        let title: String
+        let extensions: [String]
+    }
+
+    static let groups: [Group] = [
+        Group(id: "music", title: "Music", extensions: PlaylistManager.supportedExtensions.sorted()),
+        Group(id: "playlists", title: "Playlists", extensions: ["m3u", "m3u8", "pls"]),
+        Group(id: "other", title: "Other", extensions: ["wsz", "eqf", "q1"])
+    ]
+
+    private enum Key {
+        static let previousHandlerPrefix = "macAmp.fileAssociation.previousHandler."
+    }
+
+    @Published private(set) var changeRevision = 0
+    @Published private(set) var statusMessage: String?
+
+    func isAssociated(_ fileExtension: String) -> Bool {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier,
+              let handler = defaultHandler(for: fileExtension) else {
+            return false
+        }
+        return handler == bundleIdentifier
+    }
+
+    func setAssociated(_ shouldAssociate: Bool, fileExtension: String) {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+        let key = Key.previousHandlerPrefix + fileExtension
+        let handlerToRestore: String?
+
+        if shouldAssociate {
+            if UserDefaults.standard.object(forKey: key) == nil,
+               let currentHandler = defaultHandler(for: fileExtension),
+               currentHandler != bundleIdentifier {
+                UserDefaults.standard.set(currentHandler, forKey: key)
+            }
+            handlerToRestore = bundleIdentifier
+        } else {
+            handlerToRestore = UserDefaults.standard.string(forKey: key)
+        }
+
+        // The C API accepts a null handler to restore LaunchServices' normal
+        // resolution. Swift imports that parameter as non-optional, so retain
+        // the native ABI here rather than substituting an unrelated app.
+        let status = setDefaultRoleHandler(
+            contentTypeIdentifier(for: fileExtension) as CFString,
+            .all,
+            handlerToRestore as CFString?
+        )
+        guard status == noErr else {
+            statusMessage = "macOS could not update the default application for .\(fileExtension)."
+            changeRevision &+= 1
+            return
+        }
+
+        if !shouldAssociate {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        statusMessage = nil
+        changeRevision &+= 1
+    }
+
+    func setAssociated(_ shouldAssociate: Bool, in group: Group) {
+        group.extensions.forEach { setAssociated(shouldAssociate, fileExtension: $0) }
+    }
+
+    private func defaultHandler(for fileExtension: String) -> String? {
+        LSCopyDefaultRoleHandlerForContentType(
+            contentTypeIdentifier(for: fileExtension) as CFString,
+            .all
+        )?.takeRetainedValue() as String?
+    }
+
+    private func contentTypeIdentifier(for fileExtension: String) -> String {
+        UTType(filenameExtension: fileExtension)?.identifier
+            ?? "ru.aleksandr.macAmp.file.\(fileExtension)"
+    }
+}
+
 private enum StatusBarImages {
     static let application = makeApplication()
     static let play = makeGlyph("play")
@@ -599,6 +703,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var playbackRatingEvent: PlaybackRatingEvent?
     private let trackNotifications = TrackNotificationController()
     private let statusBarPreferences = StatusBarPreferences()
+    private let fileAssociationPreferences = FileAssociationPreferences()
     private var statusItem: NSStatusItem?
     private var pendingTrackNotification: (entry: PlaylistEntry, shouldNotify: Bool)?
     /// A file opened with the "Play file" preference is not inserted into a
@@ -2720,7 +2825,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.allowedFileTypes = (Array(PlaylistManager.supportedExtensions) + ["m3u", "m3u8"]).sorted()
+        panel.allowedFileTypes = FileAssociationPreferences.groups
+            .flatMap(\.extensions)
+            .sorted()
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard handleOpenedFiles([url]) else { NSSound.beep(); return }
@@ -2781,9 +2888,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sender.reply(toOpenOrPrint: didOpen ? .success : .failure)
     }
 
-    /// Handles both document types accepted by the app. Playlist documents
-    /// retain their existing import behaviour; audio documents use the
-    /// preference selected in Settings.
+    /// Routes each supported document type to the same action as its native
+    /// UI command. Only audio documents consult the music-file preference.
     @discardableResult
     private func handleOpenedFiles(_ urls: [URL]) -> Bool {
         var didOpen = false
@@ -2791,7 +2897,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         for url in urls {
             let extensionName = url.pathExtension.lowercased()
-            if ["m3u", "m3u8"].contains(extensionName) {
+            if ["m3u", "m3u8", "pls"].contains(extensionName) {
                 if let playlist = playlistManager.loadPlaylistAsynchronously(from: url) {
                     showPlaylistWindow(for: playlist)
                     connectFileMenu()
@@ -2799,6 +2905,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             } else if PlaylistManager.supportedExtensions.contains(extensionName) {
                 audioURLs.append(url)
+            } else if ["wsz", "zip"].contains(extensionName) {
+                if WinampSkinStore.shared.importArchive(at: url) {
+                    showPreferences(selecting: .skin)
+                    didOpen = true
+                }
+            } else if ["eqf", "q1"].contains(extensionName) {
+                do {
+                    try playback.equalizer.importUserPresets(from: url)
+                    showEqualizerWindow()
+                    didOpen = true
+                } catch {
+                    showEQPresetFileError(error, operation: "import")
+                }
             }
         }
 
@@ -3610,6 +3729,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         (visualizationWindow?.contentView as? VisualizationPanelView)?.updateRenderingState()
     }
 
+    private func showPreferences(selecting tab: SettingsTab) {
+        settingsWindowState.selectedTab = tab
+        showPreferences(nil)
+    }
+
     @objc func showPreferences(_ sender: Any?) {
         trackNotifications.refreshPermission()
         if let preferencesWindow {
@@ -3639,7 +3763,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settingsWindowState: settingsWindowState,
             statusBarPreferences: statusBarPreferences,
             outputDevices: playback.outputDeviceManager,
-            networkPreferences: playback.networkPreferences
+            networkPreferences: playback.networkPreferences,
+            fileAssociationPreferences: fileAssociationPreferences
         ))
         preferences.center()
         preferences.makeKeyAndOrderFront(nil)
@@ -3710,6 +3835,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        showEqualizerWindow()
+    }
+
+    private func showEqualizerWindow() {
         let isFirstPresentation = equalizerWindow == nil
         let equalizer = makeEqualizerWindowIfNeeded()
         if isFirstPresentation { dockEqualizerBelowPlayer() }
@@ -4795,13 +4924,6 @@ private enum OpenMusicFileAction: String, CaseIterable, Identifiable {
 }
 
 private struct SettingsView: View {
-    private enum Tab: Hashable {
-        case general
-        case skin
-        case output
-        case network
-    }
-
     private enum TrayIconSelection: String, CaseIterable, Identifiable {
         case off
         case application
@@ -4829,17 +4951,17 @@ private struct SettingsView: View {
     @ObservedObject var statusBarPreferences: StatusBarPreferences
     @ObservedObject var outputDevices: AudioOutputDeviceManager
     @ObservedObject var networkPreferences: NetworkPreferences
+    @ObservedObject var fileAssociationPreferences: FileAssociationPreferences
     @ObservedObject private var ratingPreferences = RatingPreferences.shared
     @AppStorage(OpenMusicFileAction.preferenceKey) private var openMusicFileActionRawValue = OpenMusicFileAction.play.rawValue
-    @State private var selectedTab: Tab = .general
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Settings section", selection: $selectedTab) {
-                Text("General").tag(Tab.general)
-                Text("Skin").tag(Tab.skin)
-                Text("Output").tag(Tab.output)
-                Text("System").tag(Tab.network)
+            Picker("Settings section", selection: $settingsWindowState.selectedTab) {
+                Text("General").tag(SettingsTab.general)
+                Text("Skin").tag(SettingsTab.skin)
+                Text("Output").tag(SettingsTab.output)
+                Text("System").tag(SettingsTab.system)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -4848,7 +4970,7 @@ private struct SettingsView: View {
             .padding(.bottom, 8)
 
             Group {
-                switch selectedTab {
+                switch settingsWindowState.selectedTab {
                 case .general:
                     ScrollView(.vertical) {
                         generalSettings
@@ -4861,8 +4983,10 @@ private struct SettingsView: View {
                         outputSettings
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
-                case .network:
-                    networkSettings
+                case .system:
+                    ScrollView(.vertical) {
+                        networkSettings
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -4910,16 +5034,6 @@ private struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-            }
-
-            SettingsGroup(title: "Open file action") {
-                Picker("When opening a music file", selection: $openMusicFileActionRawValue) {
-                    ForEach(OpenMusicFileAction.allCases) { action in
-                        Text(action.title).tag(action.rawValue)
-                    }
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
             }
 
             SettingsGroup(title: "Tray icon") {
@@ -5031,7 +5145,58 @@ private struct SettingsView: View {
 
     private var networkSettings: some View {
         VStack(alignment: .leading, spacing: 18) {
-            SettingsGroup(title: "Network proxy") {
+            ForEach(FileAssociationPreferences.groups) { group in
+                SettingsGroup(title: group.title) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        LazyVGrid(
+                            columns: Array(
+                                repeating: GridItem(.flexible(minimum: 74, maximum: 96), spacing: 8),
+                                count: 4
+                            ),
+                            alignment: .leading,
+                            spacing: 6
+                        ) {
+                            ForEach(group.extensions, id: \.self) { fileExtension in
+                                Toggle(".\(fileExtension)", isOn: fileAssociationBinding(for: fileExtension))
+                            }
+                        }
+
+                        HStack(spacing: 10) {
+                            SettingsTextLink("Select all") {
+                                fileAssociationPreferences.setAssociated(true, in: group)
+                            }
+                            SettingsTextLink("Select none") {
+                                fileAssociationPreferences.setAssociated(false, in: group)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let message = fileAssociationPreferences.statusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            SettingsGroup(title: "Open music file action") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("When opening a music file", selection: $openMusicFileActionRawValue) {
+                        ForEach(OpenMusicFileAction.allCases) { action in
+                            Text(action.title).tag(action.rawValue)
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+
+                    Text("This setting applies only to music files.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            SettingsGroup(title: "Network") {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("Proxy mode", selection: $networkPreferences.proxyMode) {
                         ForEach(NetworkProxyMode.allCases) { mode in
@@ -5063,6 +5228,16 @@ private struct SettingsView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func fileAssociationBinding(for fileExtension: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                _ = fileAssociationPreferences.changeRevision
+                return fileAssociationPreferences.isAssociated(fileExtension)
+            },
+            set: { fileAssociationPreferences.setAssociated($0, fileExtension: fileExtension) }
+        )
     }
 
     private var selectedOutputDevice: Binding<AudioDeviceID?> {
@@ -5124,6 +5299,42 @@ private struct SettingsGroup<Content: View>: View {
                 .frame(width: 145, alignment: .leading)
             content
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// A compact text action for Settings. AppKit's cursor stack is balanced on
+/// both hover exit and view removal so it cannot leak into the skinned player.
+private struct SettingsTextLink: View {
+    let title: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    init(_ title: String, action: @escaping () -> Void) {
+        self.title = title
+        self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .foregroundColor(.black)
+                .underline()
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            guard hovering != isHovering else { return }
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .onDisappear {
+            guard isHovering else { return }
+            isHovering = false
+            NSCursor.pop()
         }
     }
 }
