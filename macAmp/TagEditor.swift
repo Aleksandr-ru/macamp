@@ -28,6 +28,11 @@ struct TrackRating: Equatable {
 enum TrackRatingStore {
     static let identifier = "macAmp"
 
+    enum AutomaticRatingUpdateStart {
+        case existing(TrackRating)
+        case unrated
+    }
+
     /// Reads the rating intended for display. A macAmp POPM record wins; in
     /// its absence, ratings from other players are averaged. Reading never
     /// changes the file.
@@ -45,13 +50,16 @@ enum TrackRatingStore {
     }
 
     /// Supplies the starting point for an automatic-rating event without
-    /// persisting it. The caller writes the resulting changed value once.
-    static func ratingForAutomaticUpdate(url: URL) -> TrackRating? {
+    /// persisting it. An unrated file is kept distinct from an existing value
+    /// so its first automatic assessment can be based on listening progress.
+    static func ratingForAutomaticUpdate(url: URL) -> AutomaticRatingUpdateStart? {
         guard url.isFileURL, url.pathExtension.lowercased() == "mp3", !url.path.isEmpty else { return nil }
         let records = readRecords(url: url) ?? []
-        if let ours = records.first(where: { $0.identifier == identifier }) { return ours.value }
-        return averageRating(records.filter { $0.identifier != identifier }.map(\.value))
-            ?? TrackRating(rating: 128, counter: 0)
+        if let ours = records.first(where: { $0.identifier == identifier }) { return .existing(ours.value) }
+        if let otherRating = averageRating(records.filter { $0.identifier != identifier }.map(\.value)) {
+            return .existing(otherRating)
+        }
+        return .unrated
     }
 
     static func write(_ value: TrackRating, to url: URL) throws {

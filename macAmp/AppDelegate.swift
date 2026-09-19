@@ -3007,12 +3007,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let event = playbackRatingEvent, !event.invalidated,
               let playlist = playlistManager.playlist(id: event.playlistID), playlist.automaticRatingEnabled,
               let entry = playlist.entries.first(where: { $0.id == event.entryID }),
-              let old = TrackRatingStore.ratingForAutomaticUpdate(url: entry.url), old.rating > 0 else { return }
+              let updateStart = TrackRatingStore.ratingForAutomaticUpdate(url: entry.url) else { return }
         let fraction = completed ? 1.0 : min(1, max(0, playback.duration > 0 ? playback.position / playback.duration : 0))
-        let factor = fraction < 0.5 ? 1 - 2 * fraction : 2 * fraction - 1
-        let delta = max(1, Int((Double(RatingPreferences.shared.adaptationPeriod.rawValue) * factor / (Double(old.counter) + 1)).rounded()))
-        let signed = fraction < 0.5 ? -delta : delta
-        let next = TrackRating(rating: UInt8(min(255, max(1, Int(old.rating) + signed))), counter: old.counter == UInt32.max ? old.counter : old.counter + 1)
+        let next: TrackRating
+        switch updateStart {
+        case .unrated:
+            // The first automatic rating reflects this listen directly instead
+            // of beginning at a neutral rating and applying an adaptation.
+            let stars = min(5, max(1, Int((fraction * 5).rounded(.up))))
+            next = TrackRating(rating: UInt8(stars * 51), counter: 1)
+        case let .existing(old):
+            guard old.rating > 0 else { return }
+            let factor = fraction < 0.5 ? 1 - 2 * fraction : 2 * fraction - 1
+            let delta = max(1, Int((Double(RatingPreferences.shared.adaptationPeriod.rawValue) * factor / (Double(old.counter) + 1)).rounded()))
+            let signed = fraction < 0.5 ? -delta : delta
+            next = TrackRating(rating: UInt8(min(255, max(1, Int(old.rating) + signed))), counter: old.counter == UInt32.max ? old.counter : old.counter + 1)
+        }
         do {
             try TrackRatingStore.write(next, to: entry.url)
             updateRating(next.rating, for: entry.url)
