@@ -32,7 +32,7 @@ macAmp separates overall interface size from content text size. The skin-based U
 
 ## Skins
 
-Use your favorite classic Winamp `.wsz` skins as is. Get skins from [Winamp Skin Museum](https://skins.webamp.org/) or any aother source.
+Use your favorite classic Winamp `.wsz` skins as is. Get skins from [Winamp Skin Museum](https://skins.webamp.org/) or any other source.
 
 ---  
 
