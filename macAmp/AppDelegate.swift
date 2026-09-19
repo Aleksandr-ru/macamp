@@ -3101,12 +3101,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateRating(_ rating: UInt8, for url: URL) {
+        playlistManager.applyKnownRating(rating, for: url)
         let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
-        for list in playlistManager.playlists {
-            for item in list.entries where item.url.standardizedFileURL.resolvingSymlinksInPath() == canonical {
-                item.rating = rating
-            }
-        }
         if let infoURL = infoModel.content.url,
            infoURL.standardizedFileURL.resolvingSymlinksInPath() == canonical {
             infoModel.applyKnownRating(rating, for: infoURL)

@@ -571,6 +571,27 @@ final class PlaylistManager: ObservableObject {
     }
 
     var activePlaylist: PlaylistModel? { playlists.first { $0.id == activePlaylistID } ?? playlists.first }
+
+    /// Mirrors a rating that has already been written to its audio file into
+    /// every corresponding playlist row and persists the cached display
+    /// value.  This keeps restored rows independent of a later metadata scan.
+    func applyKnownRating(_ rating: UInt8, for url: URL) {
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        var changedPlaylists: [PlaylistModel] = []
+        for playlist in playlists {
+            var changed = false
+            for entry in playlist.entries where entry.url.standardizedFileURL.resolvingSymlinksInPath() == canonical {
+                guard entry.rating != rating else { continue }
+                entry.rating = rating
+                changed = true
+            }
+            if changed { changedPlaylists.append(playlist) }
+        }
+        guard !changedPlaylists.isEmpty else { return }
+        changedPlaylists.forEach { markEntriesDirty(in: $0) }
+        save()
+    }
+
     func setAutomaticRating(_ enabled: Bool, for playlist: PlaylistModel) {
         guard playlists.contains(where: { $0.id == playlist.id }) else { return }
         playlist.automaticRatingEnabled = enabled
