@@ -657,7 +657,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastDirectMediaKeyEvent = Date.distantPast
     private var mediaKeyMonitor: Any?
     private var keyboardShortcutMonitor: Any?
-    private weak var skinCursorOwnerWindow: NSWindow?
+    private var skinCursorRunLoopObserver: CFRunLoopObserver?
     private var jumpToFileController: JumpToFileController?
     private var controlsMenu: NSMenu?
     private weak var windowMenu: NSMenu?
@@ -851,6 +851,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         connectControlsMenu()
         statusBarPreferences.onChange = { [weak self] in self?.refreshStatusItem() }
         refreshStatusItem()
+        installSkinCursorRunLoopObserver()
         playback.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.updateStatusItemImage() }
         }.store(in: &persistenceCancellables)
@@ -880,12 +881,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trackNotifications.invalidate(removeDelivered: true)
         if let mediaKeyMonitor { NSEvent.removeMonitor(mediaKeyMonitor) }
         if let keyboardShortcutMonitor { NSEvent.removeMonitor(keyboardShortcutMonitor) }
+        if let skinCursorRunLoopObserver {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), skinCursorRunLoopObserver, .commonModes)
+            CFRunLoopObserverInvalidate(skinCursorRunLoopObserver)
+        }
         pendingPersistenceWorkItem?.cancel()
         playlistManager.cancelFolderScans()
         playlistManager.cancelAllSorting()
         playlistManager.flushSave()
         savePersistentState()
         playback.stop()
+    }
+
+    /// AppKit resolves cursor rectangles late in the main run loop. Resolve
+    /// the Winamp cursor once after that phase from the actual frontmost window
+    /// under the pointer, so updates from another skin window cannot win.
+    private func installSkinCursorRunLoopObserver() {
+        guard skinCursorRunLoopObserver == nil else { return }
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault,
+            CFRunLoopActivity.beforeWaiting.rawValue,
+            true,
+            CFIndex(NSApplication.resetCursorRectsRunLoopOrdering + 1)
+        ) { [weak self] _, _ in
+            self?.reassertFrontmostSkinCursor()
+        }
+        skinCursorRunLoopObserver = observer
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    }
+
+    private func reassertFrontmostSkinCursor() {
+        let screenPoint = NSEvent.mouseLocation
+        let windowNumber = NSWindow.windowNumber(
+            at: screenPoint,
+            belowWindowWithWindowNumber: 0
+        )
+        guard let sourceWindow = NSApp.window(withWindowNumber: windowNumber),
+              sourceWindow.isVisible,
+              isSkinnedPlayerWindow(sourceWindow),
+              let contentView = sourceWindow.contentView else { return }
+        let windowPoint = sourceWindow.convertPoint(fromScreen: screenPoint)
+        let contentPoint = contentView.convert(windowPoint, from: nil)
+        guard contentView.bounds.contains(contentPoint) else { return }
+        updateSkinCursor(in: sourceWindow, at: windowPoint, force: true)
     }
 
     private func installPlaybackShortcuts() {
@@ -910,26 +948,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// for their complete hit areas, so keep the same table at the window
     /// boundary and update it from the local mouse stream.
     func updateSkinCursor(_ event: NSEvent) {
-        guard let sourceWindow = event.window else {
-            relinquishSkinCursor(to: nil)
-            return
-        }
-        guard isSkinnedPlayerWindow(sourceWindow) else {
-            relinquishSkinCursor(to: sourceWindow)
-            return
-        }
+        guard let sourceWindow = event.window,
+              isSkinnedPlayerWindow(sourceWindow) else { return }
         updateSkinCursor(in: sourceWindow, at: event.locationInWindow)
-    }
-
-    private func relinquishSkinCursor(to destinationWindow: NSWindow?) {
-        guard skinCursorOwnerWindow != nil else { return }
-        skinCursorOwnerWindow = nil
-        NSCursor.arrow.set()
-        if let destinationWindow,
-           destinationWindow.areCursorRectsEnabled,
-           let contentView = destinationWindow.contentView {
-            destinationWindow.invalidateCursorRects(for: contentView)
-        }
     }
 
     /// Reconciles cursor state after an AppKit window update. Playback changes
@@ -940,29 +961,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard sourceWindow.isVisible,
               isSkinnedPlayerWindow(sourceWindow),
               let contentView = sourceWindow.contentView else { return }
-        let screenPoint = NSEvent.mouseLocation
-        let windowPoint = sourceWindow.convertPoint(fromScreen: screenPoint)
+        let windowPoint = sourceWindow.convertPoint(fromScreen: NSEvent.mouseLocation)
         let contentPoint = contentView.convert(windowPoint, from: nil)
         guard contentView.bounds.contains(contentPoint) else { return }
-        // Geometric containment is not enough: Settings, a menu, or a window
-        // from another application may cover this point. Only the frontmost
-        // window hit by an actual click is allowed to own the cursor.
-        let frontWindowNumber = NSWindow.windowNumber(
-            at: screenPoint,
-            belowWindowWithWindowNumber: 0
-        )
-        guard frontWindowNumber == sourceWindow.windowNumber else {
-            if skinCursorOwnerWindow === sourceWindow,
-               let destinationWindow = NSApp.window(withWindowNumber: frontWindowNumber),
-               !isSkinnedPlayerWindow(destinationWindow) {
-                relinquishSkinCursor(to: destinationWindow)
-            }
-            return
-        }
         updateSkinCursor(in: sourceWindow, at: windowPoint)
     }
 
-    private func updateSkinCursor(in sourceWindow: NSWindow, at windowPoint: NSPoint) {
+    private func updateSkinCursor(
+        in sourceWindow: NSWindow,
+        at windowPoint: NSPoint,
+        force: Bool = false
+    ) {
         let scale = max(CGFloat(interfaceScale.factor), 0.0001)
         let contentBounds = sourceWindow.contentView?.bounds
             ?? NSRect(origin: .zero, size: sourceWindow.frame.size)
@@ -988,8 +997,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             return
         }
-        skinCursorOwnerWindow = sourceWindow
-        if NSCursor.current !== cursor {
+        if force || NSCursor.current !== cursor {
             cursor.set()
         }
         // Info text has interactive links that are more specific than the
