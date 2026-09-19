@@ -851,8 +851,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     /// A tiny PCM snapshot from the live audio graph. This avoids repeatedly
     /// seeking and decoding the source file just to draw the visualizer.
     private let analysisSamplesLock = NSLock()
+    /// Audio-device render quanta are not guaranteed to match the tap's
+    /// requested buffer size. Keep a circular history so 256/512-frame USB,
+    /// Bluetooth and AirPlay callbacks still form one complete FFT window.
     private var liveAnalysisSamples = Array(repeating: Float(0), count: 1_024)
+    private var liveAnalysisMixScratch = Array(repeating: Float(0), count: 1_024)
     private var analysisSnapshot = Array(repeating: Float(0), count: 1_024)
+    private var liveAnalysisWriteIndex = 0
     private var liveAnalysisSampleCount = 0
     private var liveAnalysisSampleRate = 0.0
     private let streamingEqualizerSettingsLock = NSLock()
@@ -1434,20 +1439,24 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
         guard shouldInstall else { return }
+        resetLiveAnalysisSamples()
         engine.mainMixerNode.installTap(onBus: 0, bufferSize: self.visualAnalysisBufferSize, format: nil) { [weak self] buffer, _ in
             guard let self,
                   let channels = buffer.floatChannelData else { return }
-            let count = min(Int(buffer.frameLength), self.liveAnalysisSamples.count)
+            let count = min(Int(buffer.frameLength), self.liveAnalysisMixScratch.count)
             guard count > 0 else { return }
             let sourceOffset = max(0, Int(buffer.frameLength) - count)
-            self.analysisSamplesLock.lock()
+            // Audio rendering must never wait for the utility FFT queue. If a
+            // snapshot is being copied, dropping this cosmetic slice is safer
+            // than risking an audible output underrun.
+            guard self.analysisSamplesLock.try() else { return }
             let channelCount = Int(buffer.format.channelCount)
             if channelCount == 1 {
-                self.liveAnalysisSamples.withUnsafeMutableBufferPointer {
+                self.liveAnalysisMixScratch.withUnsafeMutableBufferPointer {
                     $0.baseAddress!.update(from: channels[0].advanced(by: sourceOffset), count: count)
                 }
             } else {
-                self.liveAnalysisSamples.withUnsafeMutableBufferPointer { destination in
+                self.liveAnalysisMixScratch.withUnsafeMutableBufferPointer { destination in
                     let output = destination.baseAddress!
                     output.update(from: channels[0].advanced(by: sourceOffset), count: count)
                     for channel in 1..<channelCount {
@@ -1458,11 +1467,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                     vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(count))
                 }
             }
-            self.liveAnalysisSampleCount = count
-            self.liveAnalysisSampleRate = buffer.format.sampleRate
-            self.liveAnalysisGeneration &+= 1
+            self.appendLiveAnalysisSamplesLocked(count: count, sampleRate: buffer.format.sampleRate)
             let shouldRequestSpectrum = self.requestsSpectrumOnNextBuffer
-                && count >= self.visualFFTSize
+                && self.liveAnalysisSampleCount >= self.visualFFTSize
             if shouldRequestSpectrum { self.requestsSpectrumOnNextBuffer = false }
             self.analysisSamplesLock.unlock()
             if shouldRequestSpectrum {
@@ -1477,6 +1484,41 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             }
         }
         isLiveAnalysisTapInstalled = true
+    }
+
+    /// Caller must own `analysisSamplesLock`. Samples in the scratch buffer
+    /// are appended in chronological order without allocating on the audio
+    /// render thread.
+    private func appendLiveAnalysisSamplesLocked(count: Int, sampleRate: Double) {
+        let capacity = liveAnalysisSamples.count
+        guard count > 0, capacity > 0 else { return }
+        let firstCount = min(count, capacity - liveAnalysisWriteIndex)
+        liveAnalysisSamples.withUnsafeMutableBufferPointer { destination in
+            liveAnalysisMixScratch.withUnsafeBufferPointer { source in
+                destination.baseAddress!.advanced(by: liveAnalysisWriteIndex)
+                    .update(from: source.baseAddress!, count: firstCount)
+                let remaining = count - firstCount
+                if remaining > 0 {
+                    destination.baseAddress!.update(
+                        from: source.baseAddress!.advanced(by: firstCount),
+                        count: remaining
+                    )
+                }
+            }
+        }
+        liveAnalysisWriteIndex = (liveAnalysisWriteIndex + count) % capacity
+        liveAnalysisSampleCount = min(capacity, liveAnalysisSampleCount + count)
+        liveAnalysisSampleRate = sampleRate
+        liveAnalysisGeneration &+= 1
+    }
+
+    private func resetLiveAnalysisSamples() {
+        analysisSamplesLock.lock()
+        liveAnalysisWriteIndex = 0
+        liveAnalysisSampleCount = 0
+        liveAnalysisSampleRate = 0
+        requestsSpectrumOnNextBuffer = false
+        analysisSamplesLock.unlock()
     }
 
     private func requestSpectrumFromNextPCMBuffer() {
@@ -1503,6 +1545,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             isStreamingAnalysisTapInstalled = false
             return
         }
+        if shouldInstall { resetLiveAnalysisSamples() }
         item.audioMix = shouldInstall
             ? streamingAudioTrack.flatMap { streamingAudioMix(for: $0) }
             : nil
@@ -1972,13 +2015,16 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
               format.mFormatID == kAudioFormatLinearPCM,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
               format.mBitsPerChannel == 32 else { return }
-        let sampleCount = min(frameCount, liveAnalysisSamples.count)
+        let sampleCount = min(frameCount, liveAnalysisMixScratch.count)
         let sourceOffset = frameCount - sampleCount
         let isInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-        analysisSamplesLock.lock()
-        liveAnalysisSamples.withUnsafeMutableBufferPointer { destination in
+        // MTAudioProcessingTap also runs on a real-time audio thread. Missing
+        // one visual slice is preferable to blocking playback behind the FFT
+        // snapshot reader.
+        guard analysisSamplesLock.try() else { return }
+        liveAnalysisMixScratch.withUnsafeMutableBufferPointer { destination in
             let output = destination.baseAddress!
-            output.initialize(repeating: 0, count: sampleCount)
+            vDSP_vclr(output, 1, vDSP_Length(sampleCount))
             var channelCount = 0
             if isInterleaved, let buffer = buffers.first, let data = buffer.mData {
                 let channels = max(1, Int(buffer.mNumberChannels))
@@ -2007,11 +2053,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(sampleCount))
             }
         }
-        liveAnalysisSampleCount = sampleCount
-        liveAnalysisSampleRate = format.mSampleRate
-        liveAnalysisGeneration &+= 1
+        appendLiveAnalysisSamplesLocked(count: sampleCount, sampleRate: format.mSampleRate)
         let shouldRequestSpectrum = requestsSpectrumOnNextBuffer
-            && sampleCount >= visualFFTSize
+            && liveAnalysisSampleCount >= visualFFTSize
         if shouldRequestSpectrum { requestsSpectrumOnNextBuffer = false }
         analysisSamplesLock.unlock()
         if shouldRequestSpectrum {
@@ -2237,7 +2281,20 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             if available > 0 {
                 self.analysisSnapshot.withUnsafeMutableBufferPointer { destination in
                     self.liveAnalysisSamples.withUnsafeBufferPointer { source in
-                        destination.baseAddress!.update(from: source.baseAddress!, count: available)
+                        let capacity = source.count
+                        let start = (self.liveAnalysisWriteIndex - available + capacity) % capacity
+                        let firstCount = min(available, capacity - start)
+                        destination.baseAddress!.update(
+                            from: source.baseAddress!.advanced(by: start),
+                            count: firstCount
+                        )
+                        let remaining = available - firstCount
+                        if remaining > 0 {
+                            destination.baseAddress!.advanced(by: firstCount).update(
+                                from: source.baseAddress!,
+                                count: remaining
+                            )
+                        }
                     }
                 }
             }
