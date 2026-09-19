@@ -34,6 +34,10 @@ macAmp separates overall interface size from content text size. The skin-based U
 
 Use your favorite classic Winamp `.wsz` skins as is. Get skins from [Winamp Skin Museum](https://skins.webamp.org/) or any other source.
 
+## System Requirements
+
+- macOS 11.0 (Big Sur) or later.
+
 ---  
 
 (C) 2026 [Aleksandr.ru](https://aleksandr.ru)
