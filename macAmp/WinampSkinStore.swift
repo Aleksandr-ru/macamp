@@ -129,7 +129,7 @@ final class WinampSkinStore: ObservableObject {
         }
     }
 
-    @Published private(set) var name = "CLASSIC"
+    @Published private(set) var name = "Winamp 2.9"
     @Published private(set) var status = "NO TRACK — LOAD A WINAMP .WSZ SKIN"
     @Published private(set) var visualizationPalette: [NSColor] = WinampSkinStore.defaultVisualizationPalette
     @Published private(set) var availableSkins: [SkinDescriptor] = []
@@ -374,7 +374,7 @@ final class WinampSkinStore: ObservableObject {
         // from retaining a path that has just been deleted and guarantees the
         // bundled skin is active when the current skin is removed.
         if activeSkinDirectoryName.caseInsensitiveCompare(selectedSkin.directoryName) == .orderedSame {
-            guard loadBundledDefaultSkin(loadStatus: "DEFAULT WINAMP 2.91 SKIN") else { return false }
+            guard loadBundledDefaultSkin(loadStatus: "DEFAULT WINAMP 2.9 SKIN") else { return false }
         }
 
         do {
@@ -398,7 +398,7 @@ final class WinampSkinStore: ObservableObject {
         let information: SkinInformation
         if skin.isBundled {
             information = SkinInformation(
-                name: "WINAMP CLASSIC 2.91",
+                name: "Winamp 2.9",
                 supportedWindows: supportedWindows(in: skin.directory),
                 author: "Steve Gedikian",
                 version: "2.0",
@@ -468,7 +468,7 @@ final class WinampSkinStore: ObservableObject {
         return region
     }
 
-    private func loadBundledDefaultSkin(loadStatus: String = "DEFAULT WINAMP 2.91 SKIN") -> Bool {
+    private func loadBundledDefaultSkin(loadStatus: String = "DEFAULT WINAMP 2.9 SKIN") -> Bool {
         guard let directory = Bundle.main.resourceURL?.appendingPathComponent(Self.bundledDefaultSkinDirectoryName, isDirectory: true),
               canLoadSkin(at: directory) else {
             status = "DEFAULT SKIN NOT FOUND"
@@ -477,7 +477,7 @@ final class WinampSkinStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.activeSkinDirectoryNameKey)
         activateSkin(at: directory,
                      directoryName: Self.bundledDefaultSkinDirectoryName,
-                     displayName: "WINAMP CLASSIC 2.91",
+                     displayName: "Winamp 2.9",
                      loadStatus: loadStatus)
         return true
     }
@@ -769,7 +769,7 @@ final class WinampSkinStore: ObservableObject {
     func refreshAvailableSkins() {
         var result = [SkinDescriptor(
             directoryName: Self.bundledDefaultSkinDirectoryName,
-            displayName: "WINAMP CLASSIC 2.91",
+            displayName: "Winamp 2.9",
             directory: Bundle.main.resourceURL?.appendingPathComponent(Self.bundledDefaultSkinDirectoryName, isDirectory: true)
                 ?? URL(fileURLWithPath: "/__missing_default_skin__", isDirectory: true),
             isBundled: true
