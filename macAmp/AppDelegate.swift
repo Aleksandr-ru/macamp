@@ -442,7 +442,10 @@ private final class PlaylistWindowContext {
         shade.isEnabled = model.isWindowShaded
         if let frame = model.windowFrame {
             layout.width = max(275, model.unshadedWindowWidth ?? frame.width / interfaceScale)
-            layout.height = max(116, model.unshadedWindowHeight ?? frame.height / interfaceScale)
+            layout.height = SkinWindowGeometry.snappedWindowHeight(
+                max(SkinWindowGeometry.fullWindowHeight,
+                    model.unshadedWindowHeight ?? frame.height / interfaceScale)
+            )
         }
     }
 }
@@ -749,8 +752,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var infoTargetURL: URL?
     private var tagEditorContext: (playlistID: UUID, entryID: UUID)?
     private var tagEditorStandaloneURL: URL?
-    private var infoLogicalSize = NSSize(width: 250, height: 300)
-    private var visualizationLogicalSize = NSSize(width: 250, height: 300)
+    // Keep the default auxiliary windows close to their original size while
+    // placing them on the common 29 px height grid from the first display.
+    private var infoLogicalSize = NSSize(width: 250, height: SkinWindowGeometry.verticalResizeStep * 11)
+    private var visualizationLogicalSize = NSSize(width: 250, height: SkinWindowGeometry.verticalResizeStep * 11)
     private var playlistWindows: [UUID: NSWindow] = [:]
     private var playlistWindowContexts: [UUID: PlaylistWindowContext] = [:]
     private weak var lastActivePlaylistWindow: NSWindow?
@@ -1983,19 +1988,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         infoState.isVisible = state.infoVisible ?? false
         visualizationState.isVisible = state.visualizationVisible ?? false
         playlistLayout.width = max(275, CGFloat(state.playlistWidth))
-        playlistLayout.height = max(116, CGFloat(state.playlistHeight))
+        playlistLayout.height = SkinWindowGeometry.snappedWindowHeight(
+            max(SkinWindowGeometry.fullWindowHeight, CGFloat(state.playlistHeight))
+        )
         restoredMainOrigin = NSPoint(x: state.mainOriginX, y: state.mainOriginY)
         hasRestoredMainOrigin = true
         if let x = state.equalizerOriginX, let y = state.equalizerOriginY { restoredEqualizerOrigin = NSPoint(x: x, y: y) }
         if let x = state.playlistOriginX, let y = state.playlistOriginY { restoredPlaylistOrigin = NSPoint(x: x, y: y) }
         shouldRestoreInfoWindow = state.infoVisible ?? false
         if let width = state.infoWidth, let height = state.infoHeight {
-            infoLogicalSize = NSSize(width: max(250, CGFloat(width)), height: max(116, CGFloat(height)))
+            infoLogicalSize = NSSize(
+                width: max(250, CGFloat(width)),
+                height: SkinWindowGeometry.snappedWindowHeight(
+                    max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
+                )
+            )
         }
         if let x = state.infoOriginX, let y = state.infoOriginY { restoredInfoOrigin = NSPoint(x: x, y: y) }
         shouldRestoreVisualizationWindow = state.visualizationVisible ?? false
         if let width = state.visualizationWidth, let height = state.visualizationHeight {
-            visualizationLogicalSize = NSSize(width: max(250, CGFloat(width)), height: max(116, CGFloat(height)))
+            visualizationLogicalSize = NSSize(
+                width: max(250, CGFloat(width)),
+                height: SkinWindowGeometry.snappedWindowHeight(
+                    max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
+                )
+            )
         }
         if let x = state.visualizationOriginX, let y = state.visualizationOriginY {
             restoredVisualizationOrigin = NSPoint(x: x, y: y)
@@ -2132,8 +2149,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 playlistDockOffset = NSPoint(x: playlistDockOffset.x * scaleRatio, y: playlistDockOffset.y * scaleRatio)
             }
         }
-        let baseHeight: CGFloat = windowShade.isEnabled ? 14 : 116
-        let size = NSSize(width: 275 * scale, height: baseHeight * scale)
+        let baseHeight = windowShade.isEnabled
+            ? SkinWindowGeometry.windowShadeHeight
+            : SkinWindowGeometry.fullWindowHeight
+        let size = NSSize(width: SkinWindowGeometry.mainWidth * scale, height: baseHeight * scale)
         let mainTop = window.frame.maxY
         window.setContentSize(size)
         window.setFrameOrigin(NSPoint(x: window.frame.minX, y: mainTop - window.frame.height))
@@ -2141,7 +2160,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.minSize = window.frame.size
         window.maxSize = window.frame.size
         if let equalizerWindow {
-            let equalizerSize = NSSize(width: 275 * scale, height: (equalizerShade.isEnabled ? 14 : 116) * scale)
+            let equalizerHeight = equalizerShade.isEnabled
+                ? SkinWindowGeometry.windowShadeHeight
+                : SkinWindowGeometry.fullWindowHeight
+            let equalizerSize = NSSize(width: SkinWindowGeometry.mainWidth * scale, height: equalizerHeight * scale)
             let equalizerTop = equalizerWindow.frame.maxY
             equalizerWindow.setContentSize(equalizerSize)
             equalizerWindow.setFrameOrigin(NSPoint(x: equalizerWindow.frame.minX, y: equalizerTop - equalizerWindow.frame.height))
@@ -2154,7 +2176,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             moveDockedEqualizer()
         }
         if let playlistWindow {
-            let playlistHeight: CGFloat = playlistShade.isEnabled ? 14 : playlistLayout.height
+            let playlistHeight = playlistShade.isEnabled
+                ? SkinWindowGeometry.windowShadeHeight
+                : playlistLayout.height
             let playlistSize = NSSize(width: playlistLayout.width * scale, height: playlistHeight * scale)
             let playlistTop = playlistWindow.frame.maxY
             // Lift the compact WindowShade size constraint before restoring the
@@ -2197,7 +2221,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let top = infoWindow.frame.maxY
             let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Info"))
             infoLogicalSize.width = max(minimumWidth, infoLogicalSize.width)
-            infoLogicalSize.height = max(116, infoLogicalSize.height)
+            infoLogicalSize.height = max(SkinWindowGeometry.fullWindowHeight, infoLogicalSize.height)
             infoWindow.setContentSize(NSSize(width: infoLogicalSize.width * scale, height: infoLogicalSize.height * scale))
             infoWindow.setFrameOrigin(NSPoint(x: infoWindow.frame.minX, y: top - infoWindow.frame.height))
             alignFrameToBackingPixels(infoWindow, preservingTop: true)
@@ -2208,7 +2232,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let top = visualizationWindow.frame.maxY
             let minimumWidth = CGFloat(WinampSkinStore.shared.genericMinimumWindowWidth(title: "Visualization"))
             visualizationLogicalSize.width = max(minimumWidth, visualizationLogicalSize.width)
-            visualizationLogicalSize.height = max(116, visualizationLogicalSize.height)
+            visualizationLogicalSize.height = max(SkinWindowGeometry.fullWindowHeight, visualizationLogicalSize.height)
             visualizationWindow.setContentSize(NSSize(width: visualizationLogicalSize.width * scale,
                                                        height: visualizationLogicalSize.height * scale))
             visualizationWindow.setFrameOrigin(NSPoint(x: visualizationWindow.frame.minX,
@@ -4424,9 +4448,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// A 29 px vertical grid divides the main player's 116 px height. Thus an
-    /// Info window can align exactly with both the top of the main window and
-    /// the bottom of any Playlist Editor placed below it.
+    /// The 29 px logical step is close to the 25 px horizontal grid and is an
+    /// exact divisor of the fixed 116 px Main Player and Equalizer heights.
+    /// Four vertical steps therefore land exactly on either fixed window,
+    /// while the intermediate steps keep resizable windows fine-grained.
     func resizePlaylist(toLogicalWidth width: CGFloat, height: CGFloat) {
         guard let playlistWindow else { return }
         let scale = CGFloat(interfaceScale.factor)
@@ -4459,16 +4484,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Docking is resolved only after a drag, never as a side effect here.
     }
 
-    /// Main and Equalizer use 275×116 logical pixels. Keep resize increments
-    /// no larger than the classic 25/29 px grid, but choose a smaller increment
-    /// when the current interface scale would turn it into a fractional device
-    /// pixel. This keeps successive resizable frames on one compositor grid.
+    /// Keep the horizontal resize grid close to the classic 25 logical px
+    /// increment, choosing a smaller step only when the current interface
+    /// scale would turn it into a fractional device pixel.
     private func horizontalResizeStep(for panel: NSWindow, scale: CGFloat) -> CGFloat {
-        resizeStep(maximum: 25, scale: scale, frame: panel.frame)
+        resizeStep(maximum: SkinWindowGeometry.horizontalResizeStep, scale: scale, frame: panel.frame)
     }
 
     private func verticalResizeStep(for panel: NSWindow, scale: CGFloat) -> CGFloat {
-        resizeStep(maximum: 29, scale: scale, frame: panel.frame)
+        // Keep the logical step fixed across interface scales. A scale-
+        // dependent device-pixel step would make the grid differ between
+        // windows and would break exact 116 px alignment at some scales.
+        SkinWindowGeometry.verticalResizeStep
     }
 
     private func resizeStep(maximum: CGFloat, scale: CGFloat, frame: NSRect) -> CGFloat {
