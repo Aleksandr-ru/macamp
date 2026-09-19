@@ -2609,23 +2609,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func makeOutputDeviceMenu() -> NSMenu {
         let menu = NSMenu(title: "Output device")
-        let selectedDeviceID = playback.outputDeviceManager.selectedDeviceID
-        if playback.outputDeviceManager.devices.isEmpty {
+        let outputDevices = playback.outputDeviceManager
+        let systemDefaultItem = NSMenuItem(title: "System Default",
+                                           action: #selector(selectSystemDefaultOutputDevice(_:)),
+                                           keyEquivalent: "")
+        systemDefaultItem.target = self
+        systemDefaultItem.state = outputDevices.usesSystemDefault ? .on : .off
+        menu.addItem(systemDefaultItem)
+        menu.addItem(.separator())
+
+        if outputDevices.devices.isEmpty {
             let item = NSMenuItem(title: "No output devices available", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         } else {
-            for device in playback.outputDeviceManager.devices {
+            for device in outputDevices.devices {
                 let item = NSMenuItem(title: device.name,
                                       action: #selector(selectOutputDevice(_:)),
                                       keyEquivalent: "")
                 item.target = self
                 item.representedObject = NSNumber(value: device.id)
-                item.state = device.id == selectedDeviceID ? .on : .off
+                item.state = device.id == outputDevices.selectionDeviceID ? .on : .off
                 menu.addItem(item)
             }
         }
         return menu
+    }
+
+    @objc private func selectSystemDefaultOutputDevice(_ sender: NSMenuItem) {
+        playback.outputDeviceManager.selectSystemDefault()
     }
 
     @objc private func selectOutputDevice(_ sender: NSMenuItem) {
@@ -4933,39 +4945,43 @@ private struct SettingsView: View {
             }
 
             SettingsGroup(title: "Output device") {
-                if outputDevices.devices.isEmpty {
-                    Text("No output devices available")
-                        .foregroundColor(.secondary)
-                } else {
-                    VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 10) {
+                        Text("Name")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text("Type")
+                            .frame(width: 110, alignment: .leading)
+                    }
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+
+                    List(selection: selectedOutputDevice) {
                         HStack(spacing: 10) {
-                            Text("Name")
+                            Text("System Default")
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                            Text("Type")
+                            Text("macOS")
+                                .foregroundColor(.secondary)
                                 .frame(width: 110, alignment: .leading)
                         }
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                        .tag(AudioOutputDeviceManager.systemDefaultSelectionID as AudioDeviceID?)
 
-                        List(selection: selectedOutputDevice) {
-                            ForEach(outputDevices.devices) { device in
-                                HStack(spacing: 10) {
-                                    Text(device.name)
-                                        .lineLimit(1)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    Text(device.type)
-                                        .foregroundColor(.secondary)
-                                        .frame(width: 110, alignment: .leading)
-                                }
-                                .tag(device.id as AudioDeviceID?)
+                        ForEach(outputDevices.devices) { device in
+                            HStack(spacing: 10) {
+                                Text(device.name)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(device.type)
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 110, alignment: .leading)
                             }
+                            .tag(device.id as AudioDeviceID?)
                         }
-                        .listStyle(.inset)
                     }
-                    .frame(minHeight: 96, maxHeight: 145)
+                    .listStyle(.inset)
                 }
+                .frame(minHeight: 220, maxHeight: 240)
 
             }
         }
@@ -5010,10 +5026,14 @@ private struct SettingsView: View {
 
     private var selectedOutputDevice: Binding<AudioDeviceID?> {
         Binding(
-            get: { outputDevices.selectedDeviceID },
+            get: { outputDevices.selectionDeviceID },
             set: { newValue in
                 guard let newValue else { return }
-                outputDevices.selectDevice(newValue)
+                if newValue == AudioOutputDeviceManager.systemDefaultSelectionID {
+                    outputDevices.selectSystemDefault()
+                } else {
+                    outputDevices.selectDevice(newValue)
+                }
             }
         )
     }

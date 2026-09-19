@@ -362,6 +362,24 @@ final class AudioOutputDeviceManager: ObservableObject {
     @Published private(set) var selectedDeviceID: AudioDeviceID?
     @Published private(set) var selectedDeviceUID: String?
     @Published private(set) var defaultDeviceID: AudioDeviceID?
+    @Published private(set) var usesSystemDefault = true
+
+    static let systemDefaultSelectionID = AudioDeviceID(kAudioObjectUnknown)
+
+    var selectionDeviceID: AudioDeviceID? {
+        if usesSystemDefault { return Self.systemDefaultSelectionID }
+        guard let preferredDeviceUID else { return nil }
+        return devices.first(where: { $0.uid == preferredDeviceUID })?.id
+    }
+
+    /// AVPlayer follows changes made in macOS only when this value is nil.
+    /// A concrete UID pins playback to that device independently of the
+    /// current system default.
+    var playbackDeviceUID: String? {
+        guard !usesSystemDefault, let preferredDeviceUID,
+              devices.contains(where: { $0.uid == preferredDeviceUID }) else { return nil }
+        return preferredDeviceUID
+    }
 
     var onDeviceSelected: ((AudioDeviceID) -> Void)?
     var onSelectedDeviceUnavailable: ((AudioDeviceID?) -> Void)?
@@ -378,6 +396,7 @@ final class AudioOutputDeviceManager: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         preferredDeviceUID = defaults.string(forKey: Self.preferredDeviceUIDKey)
+        usesSystemDefault = preferredDeviceUID == nil
         refreshDevices()
         installListeners()
     }
@@ -395,12 +414,26 @@ final class AudioOutputDeviceManager: ObservableObject {
 
     func selectDevice(_ deviceID: AudioDeviceID) {
         guard let device = devices.first(where: { $0.id == deviceID }) else { return }
+        let selectionChanged = usesSystemDefault || preferredDeviceUID != device.uid
+        let routeChanged = selectedDeviceID != device.id
+        usesSystemDefault = false
         preferredDeviceUID = device.uid
         defaults.set(device.uid, forKey: Self.preferredDeviceUIDKey)
-        guard selectedDeviceID != device.id else { return }
-        selectedDeviceID = device.id
-        selectedDeviceUID = device.uid
-        onDeviceSelected?(device.id)
+        setCurrentDevice(device)
+        if selectionChanged || routeChanged { onDeviceSelected?(device.id) }
+    }
+
+    func selectSystemDefault() {
+        let selectionChanged = !usesSystemDefault
+        usesSystemDefault = true
+        preferredDeviceUID = nil
+        defaults.removeObject(forKey: Self.preferredDeviceUIDKey)
+        let systemDevice = devices.first(where: { $0.id == defaultDeviceID }) ?? devices.first
+        let routeChanged = selectedDeviceID != systemDevice?.id
+        setCurrentDevice(systemDevice)
+        if selectionChanged || routeChanged, let systemDevice {
+            onDeviceSelected?(systemDevice.id)
+        }
     }
 
     func refreshDevices() {
@@ -408,38 +441,47 @@ final class AudioOutputDeviceManager: ObservableObject {
         let refreshedDevices = Self.availableOutputDevices(defaultID: defaultID)
         let oldSelectedID = selectedDeviceID
         let oldSelectedUID = selectedDeviceUID
+        let oldDefaultID = defaultDeviceID
 
         devices = refreshedDevices
         defaultDeviceID = defaultID
 
-        if !hasResolvedInitialSelection {
-            let initialDevice = preferredDeviceUID.flatMap { uid in
-                refreshedDevices.first(where: { $0.uid == uid })
-            } ?? refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
-            setCurrentDevice(initialDevice)
+        let fallback = refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
+        if usesSystemDefault {
+            setCurrentDevice(fallback)
+            if hasResolvedInitialSelection, oldSelectedID != fallback?.id, let fallback {
+                onDeviceSelected?(fallback.id)
+            }
             hasResolvedInitialSelection = true
             return
         }
 
-        if let oldSelectedUID,
-           let stillAvailable = refreshedDevices.first(where: { $0.uid == oldSelectedUID }) {
+        if let preferredDeviceUID,
+           let preferredDevice = refreshedDevices.first(where: { $0.uid == preferredDeviceUID }) {
             // A reconnect can expose a new AudioDeviceID for the same device.
-            // Keep the route selected without treating it as a new user choice.
-            let deviceIDChanged = selectedDeviceID != stillAvailable.id
-            setCurrentDevice(stillAvailable)
-            if deviceIDChanged { onDeviceSelected?(stillAvailable.id) }
+            // A system-default change can also move the live Core Audio route,
+            // so reassert the fixed choice even when its ID did not change.
+            let shouldApply = oldSelectedID != preferredDevice.id
+                || oldSelectedUID != preferredDevice.uid
+                || oldDefaultID != defaultID
+            setCurrentDevice(preferredDevice)
+            if hasResolvedInitialSelection, shouldApply {
+                onDeviceSelected?(preferredDevice.id)
+            }
+            hasResolvedInitialSelection = true
             return
         }
 
-        if oldSelectedID != nil {
-            let fallback = refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
-            setCurrentDevice(fallback)
+        // Keep preferredDeviceUID intact while the fixed device is absent.
+        // Playback temporarily falls back to the system route, then returns to
+        // the preferred device when a later refresh sees it again.
+        let preferredRouteWasAvailable = oldSelectedUID == preferredDeviceUID
+        setCurrentDevice(fallback)
+        if hasResolvedInitialSelection,
+           preferredRouteWasAvailable || oldSelectedID != fallback?.id {
             onSelectedDeviceUnavailable?(fallback?.id)
-        } else {
-            let fallback = refreshedDevices.first(where: { $0.id == defaultID }) ?? refreshedDevices.first
-            setCurrentDevice(fallback)
-            if let fallback { onDeviceSelected?(fallback.id) }
         }
+        hasResolvedInitialSelection = true
     }
 
     private func setCurrentDevice(_ device: AudioOutputDevice?) {
@@ -1149,15 +1191,16 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         applyEqualizer()
     }
 
-    private func applyOutputDevice(_ deviceID: AudioDeviceID?) {
-        guard let deviceID else { return }
+    @discardableResult
+    private func applyOutputDevice(_ deviceID: AudioDeviceID?) -> Bool {
+        guard let deviceID else { return false }
         if let streamingPlayer {
-            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.selectedDeviceUID
-            return
+            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.playbackDeviceUID
+            return true
         }
-        guard let outputUnit = engine.outputNode.audioUnit else { return }
+        guard let outputUnit = engine.outputNode.audioUnit else { return false }
         var currentDeviceID = deviceID
-        _ = AudioUnitSetProperty(
+        let setStatus = AudioUnitSetProperty(
             outputUnit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
@@ -1165,11 +1208,33 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             &currentDeviceID,
             UInt32(MemoryLayout<AudioDeviceID>.size)
         )
+        guard setStatus == noErr else { return false }
+
+        var appliedDeviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let getStatus = AudioUnitGetProperty(
+            outputUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &appliedDeviceID,
+            &size
+        )
+        return getStatus == noErr && appliedDeviceID == deviceID
+    }
+
+    /// `AVAudioEngine.reset()` resets every node, including the output node.
+    /// Reapply the persistent route before reconnecting the graph; otherwise a
+    /// cold launch can display the saved device while rendering through the
+    /// system default that was active when the output node was recreated.
+    private func resetAudioEnginePreservingOutputDevice() {
+        engine.reset()
+        applyOutputDevice(outputDeviceManager.selectedDeviceID)
     }
 
     private func switchOutputDevice(to deviceID: AudioDeviceID) {
         if let streamingPlayer {
-            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.selectedDeviceUID
+            streamingPlayer.audioOutputDeviceUniqueID = outputDeviceManager.playbackDeviceUID
             return
         }
 
@@ -1187,8 +1252,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         timer?.invalidate()
         timer = nil
         engine.stop()
-        engine.reset()
-        applyOutputDevice(deviceID)
+        resetAudioEnginePreservingOutputDevice()
         connectAudioGraph(for: file.processingFormat)
         if wasPlaying {
             engine.prepare()
@@ -1269,7 +1333,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         playbackGeneration += 1
         playerNode.stop()
         engine.stop()
-        engine.reset()
+        resetAudioEnginePreservingOutputDevice()
         connectAudioGraph(for: file.processingFormat)
         engine.prepare()
         do {
@@ -1491,7 +1555,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             // before reconnecting it so a previous scheduled segment cannot keep
             // the engine in a reconfiguration state after a second Open.
             self.engine.stop()
-            self.engine.reset()
+            self.resetAudioEnginePreservingOutputDevice()
             self.engine.disconnectNodeOutput(self.playerNode)
             self.engine.disconnectNodeOutput(self.equalizerNode)
             self.sourceFile = file
@@ -1570,7 +1634,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 }
                 let player = AVPlayer(playerItem: item)
                 player.volume = Float(self.volume)
-                player.audioOutputDeviceUniqueID = self.outputDeviceManager.selectedDeviceUID
+                player.audioOutputDeviceUniqueID = self.outputDeviceManager.playbackDeviceUID
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
                 self.streamingMetadataOutput = metadataOutput
@@ -1643,7 +1707,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             do {
                 self.playerNode.stop()
                 self.engine.stop()
-                self.engine.reset()
+                self.resetAudioEnginePreservingOutputDevice()
                 self.engine.disconnectNodeOutput(self.playerNode)
                 self.engine.disconnectNodeOutput(self.equalizerNode)
                 self.decodedHTTPFormat = format
