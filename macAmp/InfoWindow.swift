@@ -721,6 +721,7 @@ final class InfoPanelView: NSView {
     /// when this non-activating panel is not key. AppDelegate forwards those
     /// events here so interactive text remains discoverable in every state.
     func updateHoverCursor(at windowPoint: NSPoint) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         let point = convert(windowPoint, from: nil)
         guard contentRect.contains(point) else { return }
         let documentPoint = documentView.convert(point, from: self)
@@ -901,10 +902,12 @@ private final class InfoWrappedTextView: NSView, InfoCursorTarget {
     }
 
     override func cursorUpdate(with event: NSEvent) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         updateCursor(atWindowPoint: event.locationInWindow)
     }
 
     func updateCursor(atWindowPoint windowPoint: NSPoint) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         let point = convert(windowPoint, from: nil)
         if onClick != nil || link(at: point) != nil {
             NSCursor.pointingHand.set()

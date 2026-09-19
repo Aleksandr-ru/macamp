@@ -142,11 +142,13 @@ class SkinnedTitleDragNSView: NSView {
     }
 
     override func cursorUpdate(with event: NSEvent) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         effectiveCursor.set()
     }
 
     override func mouseEntered(with event: NSEvent) {
         isCursorInside = true
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         effectiveCursor.set()
     }
 
@@ -155,9 +157,9 @@ class SkinnedTitleDragNSView: NSView {
     }
 
     func refreshCursorIfInside() {
-        if isCursorInside {
-            effectiveCursor.set()
-        }
+        guard isCursorInside,
+              AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
+        effectiveCursor.set()
     }
 }
 
@@ -658,6 +660,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mediaKeyMonitor: Any?
     private var keyboardShortcutMonitor: Any?
     private var skinCursorRunLoopObserver: CFRunLoopObserver?
+    private var wasSkinCursorHandlingSuspended = false
     private var jumpToFileController: JumpToFileController?
     private var controlsMenu: NSMenu?
     private weak var windowMenu: NSMenu?
@@ -911,6 +914,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func reassertFrontmostSkinCursor() {
+        guard isSkinCursorHandlingEnabled else {
+            if !wasSkinCursorHandlingSuspended {
+                wasSkinCursorHandlingSuspended = true
+                NSCursor.arrow.set()
+                if let keyWindow = NSApp.keyWindow,
+                   keyWindow.areCursorRectsEnabled,
+                   let contentView = keyWindow.contentView {
+                    keyWindow.invalidateCursorRects(for: contentView)
+                }
+            }
+            return
+        }
+        wasSkinCursorHandlingSuspended = false
+
         let screenPoint = NSEvent.mouseLocation
         let windowNumber = NSWindow.windowNumber(
             at: screenPoint,
@@ -943,12 +960,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.updateHoverCursor(at: windowPoint)
     }
 
+    /// Native Settings, metadata editors and system panels must retain their
+    /// own AppKit cursors while focused. A nil key window is a transient state
+    /// during activation and must not disable the player surface.
+    var isSkinCursorHandlingEnabled: Bool {
+        guard let keyWindow = NSApp.keyWindow else { return true }
+        return isSkinnedPlayerWindow(keyWindow)
+    }
+
     /// Winamp selects a cursor from a coordinate table for every classic
     /// player window. SwiftUI controls do not expose AppKit cursor rectangles
     /// for their complete hit areas, so keep the same table at the window
     /// boundary and update it from the local mouse stream.
     func updateSkinCursor(_ event: NSEvent) {
-        guard let sourceWindow = event.window,
+        guard isSkinCursorHandlingEnabled,
+              let sourceWindow = event.window,
               isSkinnedPlayerWindow(sourceWindow) else { return }
         updateSkinCursor(in: sourceWindow, at: event.locationInWindow)
     }
@@ -958,7 +984,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// so event-only cursor ownership leaves the default arrow visible until
     /// the pointer moves again.
     func refreshSkinCursorIfNeeded(in sourceWindow: NSWindow) {
-        guard sourceWindow.isVisible,
+        guard isSkinCursorHandlingEnabled,
+              sourceWindow.isVisible,
               isSkinnedPlayerWindow(sourceWindow),
               let contentView = sourceWindow.contentView else { return }
         let windowPoint = sourceWindow.convertPoint(fromScreen: NSEvent.mouseLocation)
@@ -6549,15 +6576,18 @@ private final class PlaylistLoadingCursorNSView: NSView {
     }
 
     override func cursorUpdate(with event: NSEvent) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         if isLoading { SkinCursors.wait.set() }
         else { NSCursor.arrow.set() }
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         if isLoading { SkinCursors.wait.set() }
     }
 
     override func mouseExited(with event: NSEvent) {
+        guard AppDelegate.shared?.isSkinCursorHandlingEnabled != false else { return }
         NSCursor.arrow.set()
     }
 
