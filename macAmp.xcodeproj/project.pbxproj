@@ -361,8 +361,8 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				// Local builds are ad-hoc signed and therefore cannot create
-				// persistent app-scoped bookmarks. Keep Debug unsandboxed;
-				// Release retains the sandbox entitlements below.
+				// persistent app-scoped bookmarks. Keep both configurations
+				// unsandboxed so system integrations behave consistently.
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -385,7 +385,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = macAmp/macAmp.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_ASSET_PATHS = "\"macAmp/Preview Content\"";

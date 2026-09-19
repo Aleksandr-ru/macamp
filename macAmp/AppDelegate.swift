@@ -583,7 +583,6 @@ private final class FileAssociationPreferences: ObservableObject {
     func setAssociated(_ shouldAssociate: Bool, fileExtension: String) {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
         let key = Key.previousHandlerPrefix + fileExtension
-        let handlerToRestore: String?
 
         if shouldAssociate {
             if UserDefaults.standard.object(forKey: key) == nil,
@@ -591,11 +590,33 @@ private final class FileAssociationPreferences: ObservableObject {
                currentHandler != bundleIdentifier {
                 UserDefaults.standard.set(currentHandler, forKey: key)
             }
-            handlerToRestore = bundleIdentifier
-        } else {
-            handlerToRestore = UserDefaults.standard.string(forKey: key)
+
+            if #available(macOS 12.0, *),
+               let contentType = UTType(filenameExtension: fileExtension) {
+                // NSWorkspace is the current user-consent-aware API. Unlike
+                // the deprecated LaunchServices call, it can present macOS's
+                // confirmation when changing a protected association.
+                NSWorkspace.shared.setDefaultApplication(
+                    at: Bundle.main.bundleURL,
+                    toOpen: contentType
+                ) { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if let error {
+                            self.statusMessage = "macOS could not update .\(fileExtension): \(error.localizedDescription)"
+                        } else {
+                            self.statusMessage = nil
+                        }
+                        self.changeRevision &+= 1
+                    }
+                }
+                return
+            }
         }
 
+        let handlerToRestore = shouldAssociate
+            ? bundleIdentifier
+            : UserDefaults.standard.string(forKey: key)
         // The C API accepts a null handler to restore LaunchServices' normal
         // resolution. Swift imports that parameter as non-optional, so retain
         // the native ABI here rather than substituting an unrelated app.
@@ -605,7 +626,7 @@ private final class FileAssociationPreferences: ObservableObject {
             handlerToRestore as CFString?
         )
         guard status == noErr else {
-            statusMessage = "macOS could not update the default application for .\(fileExtension)."
+            statusMessage = "macOS could not update .\(fileExtension) (LaunchServices error \(status))."
             changeRevision &+= 1
             return
         }
