@@ -4133,11 +4133,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             step: verticalResizeStep(for: panel, scale: scale),
             alignment: 116
         )
+        let left = panel.frame.minX
         let top = panel.frame.maxY
-        infoLogicalSize = NSSize(width: logicalWidth, height: logicalHeight)
-        panel.setContentSize(NSSize(width: logicalWidth * scale, height: logicalHeight * scale))
-        panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
-        repairWindowSeams(for: panel)
+        let requestedFrame = NSRect(x: left,
+                                    y: top - logicalHeight * scale,
+                                    width: logicalWidth * scale,
+                                    height: logicalHeight * scale)
+        let frame = magnetizedResizeFrame(requestedFrame, for: panel, fixedLeft: left, verticalAnchor: .top(top))
+        infoLogicalSize = NSSize(width: frame.width / scale, height: frame.height / scale)
+        panel.setFrame(frame, display: true)
         schedulePersistentStateSave()
     }
 
@@ -4219,11 +4223,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             step: verticalResizeStep(for: panel, scale: scale),
             alignment: 116
         )
+        let left = panel.frame.minX
         let top = panel.frame.maxY
-        visualizationLogicalSize = NSSize(width: logicalWidth, height: logicalHeight)
-        panel.setContentSize(NSSize(width: logicalWidth * scale, height: logicalHeight * scale))
-        panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
-        repairWindowSeams(for: panel)
+        let requestedFrame = NSRect(x: left,
+                                    y: top - logicalHeight * scale,
+                                    width: logicalWidth * scale,
+                                    height: logicalHeight * scale)
+        let frame = magnetizedResizeFrame(requestedFrame, for: panel, fixedLeft: left, verticalAnchor: .top(top))
+        visualizationLogicalSize = NSSize(width: frame.width / scale, height: frame.height / scale)
+        panel.setFrame(frame, display: true)
         schedulePersistentStateSave()
     }
 
@@ -4374,12 +4382,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 alignment: 116
             )
         let displayedHeight = context.shade.isEnabled ? 14 : logicalHeight
-        let top = panel.frame.maxY
-        context.layout.width = logicalWidth; context.layout.height = logicalHeight
-        context.model.unshadedWindowWidth = logicalWidth; context.model.unshadedWindowHeight = logicalHeight
-        panel.setContentSize(NSSize(width: logicalWidth * scale, height: displayedHeight * scale))
-        panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
-        repairWindowSeams(for: panel)
+        let left = panel.frame.minX
+        let verticalAnchor: ResizeVerticalAnchor = context.shade.isEnabled
+            ? .bottom(panel.frame.minY)
+            : .top(panel.frame.maxY)
+        let requestedFrame: NSRect
+        switch verticalAnchor {
+        case .top(let top):
+            requestedFrame = NSRect(x: left,
+                                    y: top - displayedHeight * scale,
+                                    width: logicalWidth * scale,
+                                    height: displayedHeight * scale)
+        case .bottom(let bottom):
+            requestedFrame = NSRect(x: left,
+                                    y: bottom,
+                                    width: logicalWidth * scale,
+                                    height: displayedHeight * scale)
+        }
+        let frame = magnetizedResizeFrame(requestedFrame,
+                                          for: panel,
+                                          fixedLeft: left,
+                                          verticalAnchor: verticalAnchor)
+        let actualWidth = frame.width / scale
+        let actualHeight = frame.height / scale
+        context.layout.width = actualWidth
+        if !context.shade.isEnabled { context.layout.height = actualHeight }
+        context.model.unshadedWindowWidth = actualWidth
+        context.model.unshadedWindowHeight = context.layout.height
+        panel.setFrame(frame, display: true)
         context.model.windowFrame = panel.frame; playlistManager.save()
     }
 
@@ -4467,16 +4497,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             step: verticalResizeStep(for: playlistWindow, scale: scale),
             alignment: 116
         )
-        let size = NSSize(width: snappedWidth * scale, height: snappedHeight * scale)
-        let frame = NSRect(x: playlistWindow.frame.minX,
-                           y: playlistWindow.frame.maxY - size.height,
-                           width: size.width,
-                           height: size.height)
+        let left = playlistWindow.frame.minX
+        let top = playlistWindow.frame.maxY
+        let requestedFrame = NSRect(x: left,
+                                    y: top - snappedHeight * scale,
+                                    width: snappedWidth * scale,
+                                    height: snappedHeight * scale)
+        let frame = magnetizedResizeFrame(requestedFrame,
+                                          for: playlistWindow,
+                                          fixedLeft: left,
+                                          verticalAnchor: .top(top))
         isRepositioningPlaylist = true
-        playlistLayout.width = snappedWidth
-        playlistLayout.height = snappedHeight
+        playlistLayout.width = frame.width / scale
+        playlistLayout.height = frame.height / scale
         playlistWindow.setFrame(frame, display: true)
-        repairWindowSeams(for: playlistWindow)
         playlistWindow.minSize = NSSize(width: 275 * scale, height: 116 * scale)
         isRepositioningPlaylist = false
         playlistWasMoved = true
@@ -4496,6 +4530,97 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // dependent device-pixel step would make the grid differ between
         // windows and would break exact 116 px alignment at some scales.
         SkinWindowGeometry.verticalResizeStep
+    }
+
+    private enum ResizeVerticalAnchor {
+        case top(CGFloat)
+        case bottom(CGFloat)
+    }
+
+    /// Magnetizes only the edges that are being dragged during a resize.
+    /// The opposite horizontal edge and the selected vertical anchor remain
+    /// untouched, so a window attached on its left or top side cannot move as
+    /// a side effect of another window edge becoming nearby.
+    private func magnetizedResizeFrame(
+        _ proposedFrame: NSRect,
+        for panel: NSWindow,
+        fixedLeft: CGFloat,
+        verticalAnchor: ResizeVerticalAnchor
+    ) -> NSRect {
+        var frame = proposedFrame
+        frame.origin.x = fixedLeft
+        let movesBottomEdge: Bool
+        let fixedTop: CGFloat?
+        switch verticalAnchor {
+        case .top(let top):
+            frame.origin.y = top - frame.height
+            movesBottomEdge = true
+            fixedTop = top
+        case .bottom(let bottom):
+            frame.origin.y = bottom
+            movesBottomEdge = false
+            fixedTop = nil
+        }
+
+        let threshold: CGFloat = 12
+        let visibleFrame = visibleSkinFrame(for: panel, frame: frame)
+        let rightRatio = (visibleFrame.maxX - frame.minX) / max(1, frame.width)
+        let bottomInsetRatio = (visibleFrame.minY - frame.minY) / max(1, frame.height)
+        let heightRatio = 1 - bottomInsetRatio
+        var rightTarget: CGFloat?
+        var rightDistance = threshold + 1
+        var bottomTarget: CGFloat?
+        var bottomDistance = threshold + 1
+
+        func considerRight(_ target: CGFloat) {
+            guard rightRatio > 0 else { return }
+            let distance = abs(visibleFrame.maxX - target)
+            guard distance <= threshold, distance < rightDistance else { return }
+            rightDistance = distance
+            rightTarget = fixedLeft + (target - fixedLeft) / rightRatio
+        }
+
+        func considerBottom(_ target: CGFloat) {
+            guard movesBottomEdge, heightRatio > 0, let fixedTop else { return }
+            let distance = abs(visibleFrame.minY - target)
+            guard distance <= threshold, distance < bottomDistance else { return }
+            bottomDistance = distance
+            let targetHeight = (fixedTop - target) / heightRatio
+            bottomTarget = fixedTop - targetHeight
+        }
+
+        let neighbours = [window, equalizerWindow, infoWindow, visualizationWindow].compactMap { $0 }
+            + playlistWindows.values
+        for neighbour in neighbours where neighbour !== panel && neighbour.isVisible {
+            let other = neighbour.frame
+            let otherVisibleFrame = visibleSkinFrame(for: neighbour, frame: other)
+            let verticallyClose = visibleFrame.maxY >= otherVisibleFrame.minY - threshold
+                && visibleFrame.minY <= otherVisibleFrame.maxY + threshold
+            let horizontallyClose = visibleFrame.maxX >= otherVisibleFrame.minX - threshold
+                && visibleFrame.minX <= otherVisibleFrame.maxX + threshold
+            if verticallyClose {
+                considerRight(otherVisibleFrame.minX)
+                considerRight(otherVisibleFrame.maxX)
+            }
+            if horizontallyClose {
+                considerBottom(otherVisibleFrame.minY)
+                considerBottom(otherVisibleFrame.maxY)
+            }
+        }
+
+        if let screen = screenFrame(containing: frame) ?? NSScreen.main?.visibleFrame {
+            considerRight(screen.maxX)
+            considerBottom(screen.minY)
+        }
+
+        if let rightTarget {
+            frame.size.width = max(1, rightTarget - fixedLeft)
+        }
+        if let bottomTarget, case .top(let top) = verticalAnchor {
+            frame.size.height = max(1, top - bottomTarget)
+            frame.origin.y = top - frame.height
+        }
+        return frame
     }
 
     private func resizeStep(maximum: CGFloat, scale: CGFloat, frame: NSRect) -> CGFloat {
@@ -4547,12 +4672,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alignment: 275
         )
         playlistLayout.width = snappedWidth
-        let frame = NSRect(x: playlistWindow.frame.minX,
-                           y: playlistWindow.frame.minY,
-                           width: snappedWidth * scale,
-                           height: 14 * scale)
+        let left = playlistWindow.frame.minX
+        let frame = magnetizedResizeFrame(
+            NSRect(x: left,
+                   y: playlistWindow.frame.minY,
+                   width: snappedWidth * scale,
+                   height: 14 * scale),
+            for: playlistWindow,
+            fixedLeft: left,
+            verticalAnchor: .bottom(playlistWindow.frame.minY)
+        )
+        playlistLayout.width = frame.width / scale
         playlistWindow.setFrame(frame, display: true)
-        repairWindowSeams(for: playlistWindow)
         playlistWindow.minSize = NSSize(width: 275 * scale, height: 14 * scale)
         playlistWindow.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: 14 * scale)
         playlistWasMoved = true
