@@ -5010,12 +5010,12 @@ private struct PlaylistStatusField: View {
             guard manager.activePlaylistID == playlist.id else { return "" }
             if playback.isPlaying { return "▶" }
             if playback.isPaused { return "⏸" }
-            return manager.playingEntryID == nil ? "" : "■"
+            return "■"
         }()
         let textColor = skin.textForegroundColor()
         let color = textColor.usingColorSpace(.deviceRGB) ?? textColor
         return HStack(spacing: 2) {
-            if playlist.scannerState == .idle, playlist.sortingProgress == nil, !indicator.isEmpty { Text(indicator) }
+            if !indicator.isEmpty { Text(indicator) }
             Text(verbatim: manager.statusText(for: playlist, playbackIndicator: nil).uppercased())
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
@@ -5929,7 +5929,7 @@ private struct PlaylistView: View {
         guard manager.activePlaylistID == playlist.id else { return "" }
         if playback.isPlaying { return "▶" }
         if playback.isPaused { return "⏸" }
-        return manager.playingEntryID == nil ? "" : "■"
+        return "■"
     }
 
     private var playlistEntries: some View {
@@ -5938,6 +5938,17 @@ private struct PlaylistView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 playlistRows(entryHeight: entryHeight)
+                    .background(
+                        PlaylistViewportObserver { offset in
+                            manager.visibleRangeChanged(
+                                for: playlist,
+                                firstEntry: Int(max(0, (offset / entryHeight).rounded(.down))),
+                                visibleCount: visiblePlaylistEntryCount
+                            )
+                        }
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                    )
             }
             .coordinateSpace(name: "playlistEntries")
             .background(playlistColor(colors.background))
@@ -6209,6 +6220,96 @@ private struct PlaylistScrollOffsetKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
+}
+
+/// SwiftUI's geometry preference does not consistently update for every
+/// AppKit-backed scroll gesture. Observe the enclosing NSScrollView's clip
+/// view instead, so metadata prioritization always receives the actual first
+/// visible row.
+private struct PlaylistViewportObserver: NSViewRepresentable {
+    let onOffsetChanged: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> PlaylistViewportObserverNSView {
+        let view = PlaylistViewportObserverNSView()
+        view.onOffsetChanged = onOffsetChanged
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaylistViewportObserverNSView, context: Context) {
+        nsView.onOffsetChanged = onOffsetChanged
+        nsView.startObservingScrollView()
+    }
+
+    static func dismantleNSView(_ nsView: PlaylistViewportObserverNSView, coordinator: ()) {
+        nsView.stopObservingScrollView()
+    }
+}
+
+private final class PlaylistViewportObserverNSView: NSView {
+    var onOffsetChanged: ((CGFloat) -> Void)?
+
+    private weak var observedScrollView: NSScrollView?
+    private var boundsObserver: NSObjectProtocol?
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        startObservingScrollView()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in self?.startObservingScrollView() }
+    }
+
+    func startObservingScrollView() {
+        guard let scrollView = enclosingScrollView() else { return }
+        guard observedScrollView !== scrollView else {
+            publishOffset()
+            return
+        }
+
+        stopObservingScrollView()
+        observedScrollView = scrollView
+        let clipView = scrollView.contentView
+        clipView.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.publishOffset()
+        }
+        publishOffset()
+    }
+
+    func stopObservingScrollView() {
+        if let boundsObserver {
+            NotificationCenter.default.removeObserver(boundsObserver)
+            self.boundsObserver = nil
+        }
+        observedScrollView = nil
+    }
+
+    private func enclosingScrollView() -> NSScrollView? {
+        var view = superview
+        while let candidate = view {
+            if let scrollView = candidate as? NSScrollView { return scrollView }
+            view = candidate.superview
+        }
+        return nil
+    }
+
+    private func publishOffset() {
+        guard let scrollView = observedScrollView,
+              let documentView = scrollView.documentView else { return }
+        let clipBounds = scrollView.contentView.bounds
+        let offset = documentView.isFlipped
+            ? clipBounds.minY
+            : documentView.bounds.maxY - clipBounds.maxY
+        onOffsetChanged?(max(0, offset))
+    }
+
+    deinit { stopObservingScrollView() }
 }
 
 /// Receives a drop in the unoccupied part of the playlist, including an empty
