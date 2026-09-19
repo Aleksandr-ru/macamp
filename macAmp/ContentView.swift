@@ -635,7 +635,15 @@ extension ContentView {
             playerControlButton(.previous, x: 16, width: 23, action: { AppDelegate.shared?.playlistTransportAction(0) })
             playerControlButton(.play, x: 39, width: 23, action: { AppDelegate.shared?.playFromActivePlaylist() })
             playerControlButton(.pause, x: 62, width: 23, action: playback.pause)
-            playerControlButton(.stop, x: 85, width: 23, action: playback.stop)
+            playerControlButton(
+                .stop,
+                x: 85,
+                width: 23,
+                action: { AppDelegate.shared?.stopPlayback() },
+                rightClick: { event, view in
+                    AppDelegate.shared?.showStopMenu(for: view, with: event)
+                }
+            )
             playerControlButton(.next, x: 108, width: 22, action: { AppDelegate.shared?.playlistTransportAction(4) })
             playerControlButton(.eject, x: 136, y: 89, width: 22, height: 16, action: { AppDelegate.shared?.chooseTracksForPlaybackPlaylist() })
         }
@@ -647,26 +655,26 @@ extension ContentView {
         y: CGFloat = 88,
         width: CGFloat,
         height: CGFloat = 18,
-        action: @escaping () -> Void
+        action: @escaping () -> Void,
+        rightClick: ((NSEvent, NSView) -> Void)? = nil
     ) -> some View {
-        Group {
+        ZStack {
             if let image = skin.playerControlImage(control, pressed: pressedPlayerControl == control) {
                 Image(nsImage: image)
                     .interpolation(.none)
             } else {
                 Color.clear
             }
+            PlayerControlHotspot(
+                onPressed: { isPressed in
+                    pressedPlayerControl = isPressed ? control : nil
+                },
+                action: action,
+                rightClick: rightClick
+            )
         }
         .frame(width: width, height: height)
         .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in pressedPlayerControl = control }
-                .onEnded { _ in
-                    pressedPlayerControl = nil
-                    action()
-                }
-        )
         .position(x: x + width / 2, y: y + height / 2)
     }
 
@@ -871,6 +879,53 @@ private struct PlaybackToggleHotspot: NSViewRepresentable {
 }
 
 private final class PlaybackToggleHotspotNSView: NSView {
+    var onPressed: ((Bool) -> Void)?
+    var action: (() -> Void)?
+    var rightClick: ((NSEvent, NSView) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        onPressed?(true)
+        var releasedInside = false
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp {
+                releasedInside = bounds.contains(convert(next.locationInWindow, from: nil))
+                break
+            }
+        }
+        onPressed?(false)
+        if releasedInside { action?() }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        rightClick?(event, self)
+    }
+}
+
+/// Uses one AppKit hit target for the player controls, so Stop's right-click
+/// menu cannot intercept or change its normal left-click behaviour.
+private struct PlayerControlHotspot: NSViewRepresentable {
+    let onPressed: (Bool) -> Void
+    let action: () -> Void
+    let rightClick: ((NSEvent, NSView) -> Void)?
+
+    func makeNSView(context: Context) -> PlayerControlHotspotNSView {
+        let view = PlayerControlHotspotNSView()
+        view.onPressed = onPressed
+        view.action = action
+        view.rightClick = rightClick
+        return view
+    }
+
+    func updateNSView(_ nsView: PlayerControlHotspotNSView, context: Context) {
+        nsView.onPressed = onPressed
+        nsView.action = action
+        nsView.rightClick = rightClick
+    }
+}
+
+private final class PlayerControlHotspotNSView: NSView {
     var onPressed: ((Bool) -> Void)?
     var action: (() -> Void)?
     var rightClick: ((NSEvent, NSView) -> Void)?

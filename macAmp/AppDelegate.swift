@@ -710,6 +710,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// playlist. Keep its source separate so reaching the end does not
     /// accidentally advance the active playlist.
     private var standalonePlaybackURL: URL?
+    /// Winamp's Stop after Current mode: let the current source finish, then
+    /// suppress the usual playlist advance exactly once.
+    private var stopsAfterCurrentTrack = false
     private let playlistManager = PlaylistManager()
     private var preferencesWindow: NSWindow?
     private var equalizerWindow: NSWindow?
@@ -817,7 +820,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playback.onTrackFinished = { [weak self] in
             guard let self else { return }
             self.evaluateAutomaticRating(completed: true)
-            if self.standalonePlaybackURL != nil {
+            if self.stopsAfterCurrentTrack {
+                self.stopsAfterCurrentTrack = false
+                self.stopPlayback()
+            } else if self.standalonePlaybackURL != nil {
                 self.standalonePlaybackURL = nil
                 self.stopPlayback()
             } else {
@@ -826,6 +832,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         playback.onPlaybackError = { [weak self] url in
             guard let self else { return }
+            if self.stopsAfterCurrentTrack {
+                self.stopsAfterCurrentTrack = false
+                self.stopPlayback()
+                return
+            }
             if self.standalonePlaybackURL == url {
                 self.standalonePlaybackURL = nil
                 self.pendingTrackNotification = nil
@@ -1325,6 +1336,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if handlePlaylistTitleRebuildShortcut(event, modifiers: modifiers) { return true }
         if handleContextualScaleShortcut(event, modifiers: modifiers) { return true }
         if handleWindowToggleShortcut(event, modifiers: modifiers) { return true }
+        if modifiers.intersection([.command, .option, .control, .shift]) == [.shift], event.keyCode == 9 {
+            stopPlaybackWithFadeout()
+            return true
+        }
+        if modifiers.intersection([.command, .option, .control, .shift]) == [.option], event.keyCode == 9 {
+            toggleStopAfterCurrentPlayback()
+            return true
+        }
         // Arrow keys may carry AppKit's `.function` or `.numericPad` flag.
         // Those identify the hardware key; only real shortcut modifiers
         // should bypass context-sensitive Winamp bindings.
@@ -1409,9 +1428,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case [.command]:
             // Windowshade and player-surface zoom.
             return keyCode == 13 || keyCode == 24 || keyCode == 27
+        case [.shift]:
+            return keyCode == 9
         case [.option]:
             // Always-on-top, close, metadata editor and player-window toggles.
-            return [0, 5, 13, 14, 20, 34].contains(keyCode)
+            return [0, 5, 9, 13, 14, 20, 34].contains(keyCode)
         case [.command, .option]:
             // Playlist title rebuild.
             return keyCode == 14
@@ -2364,6 +2385,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addControlMenuItem("Play", action: #selector(playTrack(_:)), key: "x", to: controlsMenu)
         addControlMenuItem("Pause", action: #selector(pauseTrack(_:)), key: "c", to: controlsMenu)
         addControlMenuItem("Stop", action: #selector(stopTrack(_:)), key: "v", to: controlsMenu)
+        addControlMenuItem("Stop with Fadeout", action: #selector(stopWithFadeout(_:)), key: "v", modifiers: [.shift], to: controlsMenu)
+        addControlMenuItem("Stop after Current", action: #selector(toggleStopAfterCurrent(_:)), key: "v", modifiers: [.option], to: controlsMenu)
         addControlMenuItem("Next", action: #selector(nextTrack(_:)), key: "b", to: controlsMenu)
         controlsMenu.addItem(.separator())
         addControlMenuItem("Jump to File…", action: #selector(jumpToFile(_:)), key: "j", to: controlsMenu)
@@ -2501,10 +2524,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = adjustInterfaceScale(for: keyWindow, by: -10)
     }
 
-    private func addControlMenuItem(_ title: String, action: Selector, key: String, to menu: NSMenu) {
+    private func addControlMenuItem(
+        _ title: String,
+        action: Selector,
+        key: String,
+        modifiers: NSEvent.ModifierFlags = [],
+        to menu: NSMenu
+    ) {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
-        item.keyEquivalentModifierMask = []
+        item.keyEquivalentModifierMask = modifiers
         menu.addItem(item)
     }
 
@@ -2606,6 +2635,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateControlsMenuState() {
+        if let item = controlsMenu?.item(withTitle: "Stop after Current") {
+            item.state = stopsAfterCurrentTrack ? .on : .off
+            item.isEnabled = true
+        }
         if let menu = controlsMenu?.item(withTitle: "Shuffle")?.submenu {
             updateModeMenuState(menu, selectedRawValue: playback.shuffleMode.rawValue, toggleKey: "s")
         }
@@ -2631,16 +2664,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func playTrack(_ sender: Any?) { playFromActivePlaylist() }
     @objc private func pauseTrack(_ sender: Any?) { pausePlayback() }
     @objc private func stopTrack(_ sender: Any?) { stopPlayback() }
+    @objc private func stopWithFadeout(_ sender: Any?) { stopPlaybackWithFadeout() }
+    @objc private func toggleStopAfterCurrent(_ sender: Any?) { toggleStopAfterCurrentPlayback() }
 
     func pausePlayback() { resetInfoTarget(); playback.pause() }
     func stopPlayback() {
+        stopsAfterCurrentTrack = false
         invalidateAutomaticRatingEvent()
         standalonePlaybackURL = nil
         resetInfoTarget()
         pendingTrackNotification = nil
         trackNotifications.invalidate(removeDelivered: true)
         playback.stop()
+        updateControlsMenuState()
     }
+    func stopPlaybackWithFadeout() {
+        playback.stopWithFadeout { [weak self] in self?.stopPlayback() }
+    }
+    func toggleStopAfterCurrentPlayback() {
+        setStopAfterCurrentPlayback(!stopsAfterCurrentTrack)
+    }
+    func setStopAfterCurrentPlayback(_ enabled: Bool) {
+        guard playback.isPlaying || playback.isPaused,
+              stopsAfterCurrentTrack != enabled else { return }
+        if enabled { playback.cancelPendingStopFadeout() }
+        stopsAfterCurrentTrack = enabled
+        updateControlsMenuState()
+    }
+    var isStopAfterCurrentTrackEnabled: Bool { stopsAfterCurrentTrack }
     @objc private func nextTrack(_ sender: Any?) { playlistTransportAction(4) }
     @objc private func jumpToFile(_ sender: Any?) { showJumpToFile(from: NSApp.keyWindow) }
 
@@ -2744,6 +2795,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showRepeatMenu(for view: NSView, with event: NSEvent) {
         let location = view.convert(event.locationInWindow, from: nil)
         let menu = makeRepeatMenu()
+        PopupMenuCoordinator.shared.present(menu, in: view, at: location)
+    }
+
+    func showStopMenu(for view: NSView, with event: NSEvent) {
+        let menu = NSMenu(title: "Stop")
+        let fadeout = NSMenuItem(title: "Stop with Fadeout",
+                                 action: #selector(stopWithFadeout(_:)),
+                                 keyEquivalent: "")
+        fadeout.target = self
+        menu.addItem(fadeout)
+
+        let afterCurrent = NSMenuItem(title: "Stop after Current",
+                                      action: #selector(toggleStopAfterCurrent(_:)),
+                                      keyEquivalent: "")
+        afterCurrent.target = self
+        afterCurrent.state = stopsAfterCurrentTrack ? .on : .off
+        menu.addItem(afterCurrent)
+
+        let location = view.convert(event.locationInWindow, from: nil)
         PopupMenuCoordinator.shared.present(menu, in: view, at: location)
     }
 
@@ -2955,6 +3025,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func playOpenedMusicFile(_ url: URL) {
+        stopsAfterCurrentTrack = false
         let entry = PlaylistEntry(url: url)
         standalonePlaybackURL = url
         resetInfoTarget()
@@ -3079,7 +3150,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Error-marked rows are retried only through a direct double-click in
         // the Playlist Editor (playPlaylistEntryFromSelection below).
         guard !entry.hasPlaybackError else { return }
-        if !automatic { evaluateAutomaticRating(completed: false) }
+        if !automatic {
+            stopsAfterCurrentTrack = false
+            evaluateAutomaticRating(completed: false)
+        }
         standalonePlaybackURL = nil
         // Transport commands must not disturb a list the user is already
         // reading. Centre only when the newly playing row is outside its
@@ -3101,6 +3175,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         revealIfNotVisible: Bool = false
     ) {
         resetInfoTarget()
+        stopsAfterCurrentTrack = false
         // A direct row activation is the sole retry route for a failed item.
         // Keep its marker until PlaybackController confirms it opened.
         standalonePlaybackURL = nil
@@ -3147,6 +3222,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func seekPlayback(to position: TimeInterval) {
         resetInfoTarget()
         invalidateAutomaticRatingEvent()
+        playback.cancelPendingStopFadeout()
         playback.seek(to: position)
     }
 
@@ -3237,6 +3313,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// source: resume its last cursor, otherwise use selection, then entry 1.
     func playFromActivePlaylist() {
         resetInfoTarget()
+        stopsAfterCurrentTrack = false
         standalonePlaybackURL = nil
         guard let playlist = playlistManager.activePlaylist,
               let entry = playlistManager.preferredEntryToPlay(in: playlist) else { return }

@@ -778,6 +778,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     let visualizationPreferences = VisualizationPreferences()
     @Published var volume: Double = 0.8 {
         didSet {
+            if !isApplyingStopFade { cancelStopFadeout() }
             playerNode.volume = Float(volume)
             streamingPlayer?.volume = Float(volume)
         }
@@ -923,6 +924,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private static let repeatModePreferenceKey = "macAmp.playback.repeatMode"
     private static let legacyShufflePreferenceKey = "macAmp.playback.shuffleEnabled"
     private static let legacyRepeatPreferenceKey = "macAmp.playback.repeatEnabled"
+    private var stopFadeGeneration = 0
+    private var stopFadeRestoreVolume: Double?
+    private var isApplyingStopFade = false
 
     override init() {
         super.init()
@@ -1002,6 +1006,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     func pause() {
+        cancelStopFadeout()
         if let decodedHTTPStream {
             decodedHTTPStream.suspend()
             playerNode.pause()
@@ -1024,7 +1029,59 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         isPaused = true
     }
 
+    /// Mirrors Winamp's Stop with Fadeout command without sleeping the main
+    /// thread. The user's volume is restored immediately before the caller
+    /// performs the final stop, just as Winamp restored its configured volume.
+    func stopWithFadeout(duration: TimeInterval = 2, completion: @escaping () -> Void) {
+        cancelStopFadeout()
+        guard isPlaying, volume > 0 else {
+            completion()
+            return
+        }
+
+        let initialVolume = volume
+        let stepCount = 30
+        let generation = stopFadeGeneration
+        stopFadeRestoreVolume = initialVolume
+
+        func schedule(step: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration / Double(stepCount)) { [weak self] in
+                guard let self, self.stopFadeGeneration == generation else { return }
+                if step >= stepCount {
+                    self.setVolumeForStopFade(initialVolume)
+                    self.stopFadeRestoreVolume = nil
+                    completion()
+                    return
+                }
+                self.setVolumeForStopFade(initialVolume * (1 - Double(step) / Double(stepCount)))
+                schedule(step: step + 1)
+            }
+        }
+
+        schedule(step: 1)
+    }
+
+    private func cancelStopFadeout() {
+        stopFadeGeneration &+= 1
+        if let restoreVolume = stopFadeRestoreVolume {
+            stopFadeRestoreVolume = nil
+            setVolumeForStopFade(restoreVolume)
+        }
+    }
+
+    /// Cancels only a pending Stop with Fadeout, preserving the current track.
+    func cancelPendingStopFadeout() {
+        cancelStopFadeout()
+    }
+
+    private func setVolumeForStopFade(_ value: Double) {
+        isApplyingStopFade = true
+        volume = value
+        isApplyingStopFade = false
+    }
+
     func stop() {
+        cancelStopFadeout()
         playbackGeneration += 1
         if decodedHTTPStream != nil {
             stopDecodedHTTPPlayback()
@@ -1454,6 +1511,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     /// PlaylistManager owns selection; the audio engine only opens the chosen URL.
     func open(_ requestedURL: URL, bookmarkData: Data? = nil, displayTitle: String? = nil) {
+        cancelStopFadeout()
         let url: URL
         if let bookmarkData {
             var isStale = false
