@@ -1,4 +1,8 @@
-# macAmp
+<p align="center">
+  <img src="macAmp/Assets.xcassets/AppIcon.appiconset/AppIcon-128.png" alt="macAmp app icon">
+</p>
+
+<h1 align="center">macAmp</h1>
 
 > True vibe coded winamp for macos
 
