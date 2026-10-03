@@ -378,8 +378,8 @@ private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
     }
 }
 
-/// Single authority for opening, saving and scanning playlists.  Its queues are
-/// serial by design: network folders cannot create an unbounded number of jobs.
+/// Each playlist owns serial file, metadata and sorting queues. Slow volumes
+/// in one editor never occupy another editor's worker slot.
 final class PlaylistManager: ObservableObject {
     enum SortOption: CaseIterable, Identifiable {
         case title
@@ -436,9 +436,36 @@ final class PlaylistManager: ObservableObject {
     private var keyboardSelectionRevealRevision: UInt = 0
     @Published private(set) var recentPlaylistURLs: [URL] = []
 
-    private let folderQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.folder", qos: .utility)
-    private let sortingQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.sorting", qos: .utility)
-    private let metadataQueue = DispatchQueue(label: "ru.aleksandr.macAmp.playlist.metadata", qos: .background, attributes: .concurrent)
+    /// Scheduler state is owned by the main queue; only cancellation tokens
+    /// and registered AVFoundation assets cross worker boundaries.
+    private final class PlaylistWorkers {
+        let files: DispatchQueue
+        let metadata: DispatchQueue
+        let sorting: DispatchQueue
+        let fileCancellation = SortingCancellationToken()
+        var loadingOperations = 0
+        var metadataRunning = false
+        var pumpGeneration: UInt64 = 0
+        var pendingPump: UInt64?
+        var priorityRevision = 0
+        var currentEntryID: UUID?
+        var reprioritization: DispatchWorkItem?
+
+        init(id: UUID) {
+            let prefix = "ru.aleksandr.macAmp.playlist.\(id.uuidString)"
+            files = DispatchQueue(label: prefix + ".files", qos: .utility)
+            metadata = DispatchQueue(label: prefix + ".metadata", qos: .background)
+            sorting = DispatchQueue(label: prefix + ".sorting", qos: .utility)
+        }
+    }
+    private var playlistWorkers: [UUID: PlaylistWorkers] = [:]
+
+    private func workers(for playlist: PlaylistModel) -> PlaylistWorkers {
+        if let existing = playlistWorkers[playlist.id] { return existing }
+        let created = PlaylistWorkers(id: playlist.id)
+        playlistWorkers[playlist.id] = created
+        return created
+    }
     private let persistenceURL: URL
     private let playlistEntriesDirectoryURL: URL
     /// Only playlists whose elements changed are re-encoded. Window state,
@@ -446,49 +473,21 @@ final class PlaylistManager: ObservableObject {
     private var dirtyPlaylistEntryIDs = Set<UUID>()
     private var mainSnapshotNeedsRewrite = false
     private var pausedPlaylistIDs = Set<UUID>()
-    private var cancelledFolderPlaylistIDs = Set<UUID>()
-    private let scannerLock = NSLock()
-    // AVFoundation's duration scan can decode/index aggressively (and more
-    // than one such scan easily consumes a full CPU core). One background
-    // worker keeps playback responsive; priority still puts the current and
-    // visible rows ahead of the rest of the playlist.
-    private let maximumMetadataOperations = 1
-    private var metadataWorkersRunning = 0
     private var metadataProgress: [UUID: (processed: Int, total: Int)] = [:]
-    /// The metadata scanner is intentionally serialized. This identifies the
-    /// one playlist whose entry is being read right now; other playlists may
-    /// have pending metadata work but must keep showing their own name.
-    @Published private(set) var metadataActivePlaylistID: UUID?
+    @Published private(set) var metadataActivePlaylistIDs = Set<UUID>()
     /// Accessed only on the main queue. The request token makes a completion
     /// single-use: only the currently registered request may mutate its row.
     private var metadataInFlightRequests: [UUID: UInt64] = [:]
     private var nextMetadataRequestID: UInt64 = 1
-    /// AVFoundation loads can otherwise occupy both workers long after the
+    /// AVFoundation loads can otherwise occupy a worker long after the
     /// user scrolls to another part of a large playlist.  This lock protects
     /// the assets while they are owned by metadata worker threads.
     private let metadataAssetLock = NSLock()
     private var loadingMetadataAssets: [UUID: AVURLAsset] = [:]
     private var cancelledMetadataEntryIDs = Set<UUID>()
-    private var pendingMetadataReprioritization: DispatchWorkItem?
-    /// The next metadata pump can be waiting in the pacing interval. A
-    /// generation lets a viewport change invalidate that delayed pump without
-    /// ever starting a second worker for the same serial scanner.
-    private let metadataPumpLock = NSLock()
-    private var metadataPumpGeneration: UInt64 = 0
-    private var pendingMetadataPumpGeneration: UInt64?
-    /// Playback can reveal an off-screen current row by scrolling the editor.
-    /// That programmatic viewport change must not be treated like a user
-    /// scroll: a user scroll may cancel obsolete metadata work, whereas a
-    /// track change must let the current read finish and retain its counter.
+    /// Playback reveals must preserve the current read; user scrolling may
+    /// cancel work outside this playlist's newly visible area.
     private var metadataReprioritizationSuppressedForPlaylistIDs = Set<UUID>()
-    /// Main-thread generation of the visible metadata work set. A worker that
-    /// finishes after scrolling skips its normal pacing delay and immediately
-    /// chooses again from the new viewport.
-    private var metadataPriorityRevision = 0
-    /// A changed viewport gets one selection turn ahead of other visible
-    /// playlists. The currently playing entry remains the global first
-    /// priority and is handled separately in processNextMetadata().
-    private var metadataPriorityPlaylistID: UUID?
     /// Keeps parsing off-main while pacing visual insertion.  Enqueuing all
     /// parsed chunks at once starves a run-loop frame and makes the Loading
     /// counter appear to jump from zero to a large number.
@@ -514,13 +513,22 @@ final class PlaylistManager: ObservableObject {
         }
     }
 
-    private typealias MetadataWork = (
-        playlist: PlaylistModel,
-        entry: PlaylistEntry,
-        total: Int,
-        priorityRevision: Int,
-        requestID: UInt64
-    )
+    /// Capture mutable row fields on main before a worker reads them. Tag
+    /// editing, transfers and rebuilding titles can occur during AV loading.
+    private struct MetadataWork {
+        let playlist: PlaylistModel
+        let entry: PlaylistEntry
+        let total: Int
+        let priorityRevision: Int
+        let requestID: UInt64
+        let url: URL
+        let cue: CueSegment?
+        let duration: TimeInterval?
+        let artist: String?
+        let title: String?
+        let rating: UInt8
+        let metadataIsAvailable: Bool
+    }
 
     private final class SortingCancellationToken {
         private let lock = NSLock()
@@ -758,15 +766,19 @@ final class PlaylistManager: ObservableObject {
         playlists.append(playlist); focusedPlaylistID = playlist.id; recentPlaylistURLs.removeAll { $0 == canonical }
         markEntriesDirty(in: playlist); save()
         beginWaitingCursor(for: playlist)
-        folderQueue.async { [weak self, weak playlist] in
+        workers(for: playlist).loadingOperations += 1
+        let cancellation = workers(for: playlist).fileCancellation
+        workers(for: playlist).files.async { [weak self, weak playlist] in
             guard let self, let playlist else { return }
-            guard let content = try? String(contentsOf: canonical, encoding: .utf8) else {
+            guard !cancellation.isCancelled,
+                  let content = try? String(contentsOf: canonical, encoding: .utf8) else {
                 DispatchQueue.main.async { self.finishLoadingPlaylist(playlist) }
                 return
             }
             var title: String?; var duration: TimeInterval?; var batch: [PlaylistEntry] = []
             batch.reserveCapacity(128)
             for line in content.split(whereSeparator: \.isNewline) {
+                if cancellation.isCancelled { break }
                 let value = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
                 if value.uppercased().hasPrefix("#EXTINF:") {
                     let parts = value.dropFirst(8).split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
@@ -868,9 +880,27 @@ final class PlaylistManager: ObservableObject {
 
     func close(_ playlist: PlaylistModel) {
         cancelSorting(for: playlist)
-        guard playlists.count > 1 else { playlist.isVisible = false; save(); return }
+        guard playlists.count > 1 else { setVisible(false, for: playlist); return }
         if let url = playlist.fileURL { addRecent(url) }
         let wasActive = activePlaylistID == playlist.id
+        if let state = playlistWorkers[playlist.id] {
+            state.fileCancellation.cancel()
+            state.reprioritization?.cancel()
+            state.reprioritization = nil
+            if let entryID = state.currentEntryID {
+                metadataAssetLock.lock()
+                cancelledMetadataEntryIDs.insert(entryID)
+                loadingMetadataAssets[entryID]?.cancelLoading()
+                metadataAssetLock.unlock()
+            }
+        }
+        playlistWorkers.removeValue(forKey: playlist.id)
+        pausedPlaylistIDs.remove(playlist.id)
+        metadataReprioritizationSuppressedForPlaylistIDs.remove(playlist.id)
+        metadataActivePlaylistIDs.remove(playlist.id)
+        metadataProgress.removeValue(forKey: playlist.id)
+        pendingPlaylistLoads.removeValue(forKey: playlist.id)
+        endWaitingCursor(for: playlist)
         playlists.removeAll { $0.id == playlist.id }
         removeShuffleHistory(for: playlist.id)
         dirtyPlaylistEntryIDs.remove(playlist.id)
@@ -889,15 +919,13 @@ final class PlaylistManager: ObservableObject {
         playlist.isVisible = visible
         if visible {
             pausedPlaylistIDs.remove(playlist.id)
-            metadataPriorityPlaylistID = playlist.id
             scheduleMetadata(for: playlist)
         }
         else {
             pausedPlaylistIDs.insert(playlist.id)
-            if metadataPriorityPlaylistID == playlist.id { metadataPriorityPlaylistID = nil }
         }
-        metadataPriorityRevision &+= 1
-        requestMetadataReprioritization()
+        workers(for: playlist).priorityRevision &+= 1
+        requestMetadataReprioritization(for: playlist)
         save()
     }
 
@@ -973,9 +1001,9 @@ final class PlaylistManager: ObservableObject {
         playlist.scannerState = .readingMetadata(processed: 0, total: pendingCount)
         playlist.isDirty = true
         markEntriesDirty(in: playlist)
-        metadataPriorityRevision &+= 1
+        workers(for: playlist).priorityRevision &+= 1
         scheduleMetadata(for: playlist)
-        requestMetadataReprioritization()
+        requestMetadataReprioritization(for: playlist)
         save()
     }
 
@@ -1043,7 +1071,7 @@ final class PlaylistManager: ObservableObject {
             self.finishSorting(sortedEntries, playlist: playlist, task: task)
         }
         sortingWorkItems[playlistID] = workItem
-        sortingQueue.async(execute: workItem)
+        workers(for: playlist).sorting.async(execute: workItem)
     }
 
     private func startArtistAlbumTrackSort(
@@ -1107,7 +1135,7 @@ final class PlaylistManager: ObservableObject {
             self.finishSorting(sortedEntries, playlist: playlist, task: task)
         }
         sortingWorkItems[playlistID] = workItem
-        sortingQueue.async(execute: workItem)
+        workers(for: playlist).sorting.async(execute: workItem)
     }
 
     private func reportSortingProgress(
@@ -1306,43 +1334,62 @@ final class PlaylistManager: ObservableObject {
         return source.map(\.entry)
     }
 
-    func addFiles(_ urls: [URL], to playlist: PlaylistModel, at insertionIndex: Int? = nil) {
+    func addFiles(_ urls: [URL], to playlist: PlaylistModel, at insertionIndex: Int? = nil,
+                  completion: (() -> Void)? = nil) {
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
         let audio = urls.filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
-        guard !audio.isEmpty else { return }
-        let entries = audio.map { PlaylistEntry(url: $0, bookmarkData: securityScopedBookmark(for: $0)) }
-        propagateBookmarks(from: entries)
-        let index = min(max(0, insertionIndex ?? playlist.entries.count), playlist.entries.count)
-        playlist.entries.insert(contentsOf: entries, at: index)
-        playlist.structureRevision &+= 1
-        playlist.appendToTotalDuration(entries)
-        markEntriesDirty(in: playlist)
-        playlist.isDirty = true; playlist.scannerState = .adding(playlist.entries.count); save(); finishEntryLoading(playlist)
+        guard !audio.isEmpty else { completion?(); return }
+        let state = workers(for: playlist)
+        state.loadingOperations += 1
+        playlist.scannerState = .adding(playlist.entries.count)
+        state.files.async { [weak self, weak playlist] in
+            guard let self, let playlist else { return }
+            var nextIndex = insertionIndex
+            for start in stride(from: 0, to: audio.count, by: 32) {
+                guard !state.fileCancellation.isCancelled else { break }
+                let end = min(audio.count, start + 32)
+                nextIndex = self.appendBatch(Array(audio[start..<end]), to: playlist,
+                                            at: nextIndex, cancellation: state.fileCancellation,
+                                            addingFiles: true)
+            }
+            DispatchQueue.main.async {
+                guard self.playlists.contains(where: { $0.id == playlist.id }) else { return }
+                self.finishEntryLoading(playlist)
+                completion?()
+            }
+        }
     }
 
     func addFolder(_ folder: URL, to playlist: PlaylistModel, at insertionIndex: Int? = nil) {
-        cancelledFolderPlaylistIDs.remove(playlist.id)
-        folderQueue.async { [weak self, weak playlist] in
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
+        workers(for: playlist).loadingOperations += 1
+        playlist.scannerState = .scanningFolder(playlist.entries.count)
+        let cancellation = workers(for: playlist).fileCancellation
+        workers(for: playlist).files.async { [weak self, weak playlist] in
             guard let self, let playlist else { return }
+            defer { DispatchQueue.main.async { self.finishEntryLoading(playlist) } }
+            guard !cancellation.isCancelled else { return }
+            let scoped = folder.startAccessingSecurityScopedResource()
+            defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
             let deadline = Date().addingTimeInterval(30)
             let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
             guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]) else { return }
             var batch: [URL] = []
             var nextInsertionIndex = insertionIndex
             for case let url as URL in enumerator {
-                if Date() >= deadline || self.cancelledFolderPlaylistIDs.contains(playlist.id) { break }
+                if Date() >= deadline || cancellation.isCancelled { break }
                 guard Self.supportedExtensions.contains(url.pathExtension.lowercased()) else { continue }
                 batch.append(url)
                 if batch.count == 32 {
-                    nextInsertionIndex = self.appendBatch(batch, to: playlist, at: nextInsertionIndex)
+                    nextInsertionIndex = self.appendBatch(batch, to: playlist, at: nextInsertionIndex, cancellation: cancellation)
                     batch.removeAll()
                 }
             }
-            _ = self.appendBatch(batch, to: playlist, at: nextInsertionIndex)
-            DispatchQueue.main.async { self.finishEntryLoading(playlist) }
+            _ = self.appendBatch(batch, to: playlist, at: nextInsertionIndex, cancellation: cancellation)
         }
     }
 
-    func cancelFolderScans() { cancelledFolderPlaylistIDs.formUnion(playlists.map(\.id)) }
+    func cancelFolderScans() { playlistWorkers.values.forEach { $0.fileCancellation.cancel() } }
 
     func play(_ entry: PlaylistEntry, in playlist: PlaylistModel, revealIfNeeded: Bool = true) {
         // If an entry has no persistent access yet and the current process can
@@ -1374,7 +1421,7 @@ final class PlaylistManager: ObservableObject {
                     maximumFirst,
                     max(0, index - playlist.visibleEntryCount / 2)
                 )
-                metadataPriorityRevision &+= 1
+                workers(for: playlist).priorityRevision &+= 1
                 metadataReprioritizationSuppressedForPlaylistIDs.insert(playlist.id)
             }
             playbackRevealRevision &+= 1
@@ -1430,12 +1477,14 @@ final class PlaylistManager: ObservableObject {
         }
 
         playlist.scannerState = .adding(playlist.entries.count)
+        workers(for: playlist).loadingOperations += 1
         let token = UUID()
         // A few playlist-generator services expose the actual playlist URL in
         // a `u=` query item and redirect the visible page to HTML. Probe the
         // embedded playlist directly when its type is explicit; this keeps
         // the generator page itself out of the playlist while preserving
         // support for ordinary remote stream URLs.
+        let fileQueue = workers(for: playlist).files
         let sourceURL = Self.playlistGeneratorSourceURL(from: url) ?? url
         let probe = RemoteURLProbe(url: sourceURL) { [weak self, weak playlist] result in
             guard let self else { return }
@@ -1459,7 +1508,7 @@ final class PlaylistManager: ObservableObject {
                     )
                 }
             case .success(.playlist(let data, let baseURL)):
-                self.folderQueue.async { [weak self, weak playlist] in
+                fileQueue.async { [weak self, weak playlist] in
                     guard let self else { return }
                     let result: Result<[ImportedPlaylistItem], Error>
                     if let items = Self.parseRemotePlaylist(data: data, baseURL: baseURL), !items.isEmpty {
@@ -1876,8 +1925,7 @@ final class PlaylistManager: ObservableObject {
         guard playlist.scrollPosition != position || playlist.visibleEntryCount != count else { return }
         playlist.scrollPosition = position
         playlist.visibleEntryCount = count
-        metadataPriorityPlaylistID = playlist.id
-        metadataPriorityRevision &+= 1
+        workers(for: playlist).priorityRevision &+= 1
         if metadataReprioritizationSuppressedForPlaylistIDs.remove(playlist.id) != nil {
             // This range change is the delayed ScrollView reveal issued by
             // play(_:in:). The worker will use the new viewport after its
@@ -1885,10 +1933,10 @@ final class PlaylistManager: ObservableObject {
             // It may have gone idle while the view was animating, so ensure
             // the new visible range still has a worker to consume it.
             scheduleMetadata(for: playlist)
-            wakePendingMetadataPump()
+            wakePendingMetadataPump(for: playlist)
             return
         }
-        requestMetadataReprioritization()
+        requestMetadataReprioritization(for: playlist)
     }
 
     /// The editor publishes a coalesced viewport range. It is sufficient for
@@ -1901,13 +1949,16 @@ final class PlaylistManager: ObservableObject {
         return index >= first && index < end
     }
 
-    private func requestMetadataReprioritization() {
-        pendingMetadataReprioritization?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.pendingMetadataReprioritization = nil
-            self?.reprioritizeMetadataReading()
+    private func requestMetadataReprioritization(for playlist: PlaylistModel) {
+        let state = workers(for: playlist)
+        state.reprioritization?.cancel()
+        let work = DispatchWorkItem { [weak self, weak playlist] in
+            guard let self, let playlist,
+                  self.playlistWorkers[playlist.id] === state else { return }
+            state.reprioritization = nil
+            self.reprioritizeMetadataReading(for: playlist)
         }
-        pendingMetadataReprioritization = work
+        state.reprioritization = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: work)
     }
 
@@ -2048,10 +2099,12 @@ final class PlaylistManager: ObservableObject {
         repairTrackReferences(in: source)
         markEntriesDirty(in: source)
         markEntriesDirty(in: destination)
-        metadataPriorityRevision &+= 1
+        workers(for: source).priorityRevision &+= 1
+        workers(for: destination).priorityRevision &+= 1
         scheduleMetadata(for: source)
         scheduleMetadata(for: destination)
-        requestMetadataReprioritization()
+        requestMetadataReprioritization(for: source)
+        requestMetadataReprioritization(for: destination)
         save()
         return true
     }
@@ -2159,7 +2212,7 @@ final class PlaylistManager: ObservableObject {
         case .scanningFolder: return "Loading"
         case .idle, .readingMetadata, .paused: break
         }
-        if metadataActivePlaylistID == playlist.id {
+        if metadataActivePlaylistIDs.contains(playlist.id) {
             return "Reading"
         }
         return (activePlaylistID == playlist.id ? "\(playbackIndicator ?? "")\(playlist.name)" : playlist.name)
@@ -2174,24 +2227,27 @@ final class PlaylistManager: ObservableObject {
             return String(count)
         case .idle, .readingMetadata, .paused: break
         }
-        guard metadataActivePlaylistID == playlist.id else { return nil }
+        guard metadataActivePlaylistIDs.contains(playlist.id) else { return nil }
         let progress = metadataProgress[playlist.id] ?? (0, playlist.entries.count)
         return "\(progress.processed)/\(progress.total)"
     }
 
-    private func appendBatch(_ batch: [URL], to playlist: PlaylistModel, at insertionIndex: Int?) -> Int? {
-        guard !batch.isEmpty else { return insertionIndex }
-        var followingIndex: Int?
+    private func appendBatch(_ batch: [URL], to playlist: PlaylistModel, at insertionIndex: Int?,
+                             cancellation: SortingCancellationToken, addingFiles: Bool = false) -> Int? {
+        guard !batch.isEmpty, !cancellation.isCancelled else { return insertionIndex }
+        let entries = batch.map { PlaylistEntry(url: $0, bookmarkData: securityScopedBookmark(for: $0)) }
+        var followingIndex = insertionIndex
         DispatchQueue.main.sync {
-            let entries = batch.map { PlaylistEntry(url: $0, bookmarkData: self.securityScopedBookmark(for: $0)) }
-            self.propagateBookmarks(from: entries)
+            guard !cancellation.isCancelled, playlists.contains(where: { $0.id == playlist.id }) else { return }
+            self.propagateBookmarks(from: entries, in: playlist)
             let index = min(max(0, insertionIndex ?? playlist.entries.count), playlist.entries.count)
             playlist.entries.insert(contentsOf: entries, at: index)
             followingIndex = index + entries.count
             playlist.structureRevision &+= 1
             playlist.appendToTotalDuration(entries)
             self.markEntriesDirty(in: playlist)
-            playlist.isDirty = true; playlist.scannerState = .scanningFolder(playlist.entries.count)
+            playlist.isDirty = true
+            playlist.scannerState = addingFiles ? .adding(playlist.entries.count) : .scanningFolder(playlist.entries.count)
             self.scheduleMetadata(for: playlist)
             self.save()
         }
@@ -2199,7 +2255,10 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func finishEntryLoading(_ playlist: PlaylistModel) {
-        guard playlists.contains(where: { $0.id == playlist.id }), playlist.scannerState != .paused else { return }
+        guard playlists.contains(where: { $0.id == playlist.id }) else { return }
+        let state = workers(for: playlist)
+        state.loadingOperations = max(0, state.loadingOperations - 1)
+        guard state.loadingOperations == 0, playlist.scannerState != .paused else { return }
         if let progress = metadataProgress[playlist.id], progress.processed > 0 {
             playlist.scannerState = .readingMetadata(processed: progress.processed, total: progress.total)
         } else {
@@ -2216,44 +2275,36 @@ final class PlaylistManager: ObservableObject {
     }
 
     private func scheduleMetadata(for playlist: PlaylistModel) {
-        guard !pausedPlaylistIDs.contains(playlist.id), playlist.sortingProgress == nil else { return }
-        scannerLock.lock()
-        let newWorkers = maximumMetadataOperations - metadataWorkersRunning
-        metadataWorkersRunning += max(0, newWorkers)
-        scannerLock.unlock()
-        guard newWorkers > 0 else { return }
-        for _ in 0..<newWorkers {
-            metadataQueue.async { [weak self] in self?.processNextMetadata() }
+        guard playlists.contains(where: { $0.id == playlist.id }), playlist.isVisible,
+              !pausedPlaylistIDs.contains(playlist.id), playlist.sortingProgress == nil else { return }
+        let state = workers(for: playlist)
+        guard !state.metadataRunning else { return }
+        state.metadataRunning = true
+        state.metadata.async { [weak self] in
+            self?.processNextMetadata(for: playlist, state: state)
         }
     }
 
-    /// Rebuilds the foreground work set immediately.  Reads outside this set
-    /// are cancelled instead of making a newly visible row wait for AVFoundation
-    /// to finish an obsolete request (which may take several seconds on a slow
-    /// volume or a remote URL).
-    private func reprioritizeMetadataReading() {
+    private func reprioritizeMetadataReading(for playlist: PlaylistModel) {
+        guard let state = playlistWorkers[playlist.id] else { return }
         var preferredEntryIDs = Set<UUID>()
-        if playlists.contains(where: { $0.id == activePlaylistID }),
-           let playingEntryID {
-            preferredEntryIDs.insert(playingEntryID)
-        }
-        for playlist in playlists where playlist.isVisible && !pausedPlaylistIDs.contains(playlist.id) {
+        if playlist.isVisible && !pausedPlaylistIDs.contains(playlist.id) {
+            if activePlaylistID == playlist.id, let playingEntryID {
+                preferredEntryIDs.insert(playingEntryID)
+            }
             preferredEntryIDs.formUnion(playlist.selectedIDs)
             let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
             let end = min(playlist.entries.count, start + playlist.visibleEntryCount)
             preferredEntryIDs.formUnion(playlist.entries[start..<end].map(\.id))
         }
-
-        metadataAssetLock.lock()
-        for (entryID, asset) in loadingMetadataAssets where !preferredEntryIDs.contains(entryID) {
+        if let entryID = state.currentEntryID, !preferredEntryIDs.contains(entryID) {
+            metadataAssetLock.lock()
             cancelledMetadataEntryIDs.insert(entryID)
-            asset.cancelLoading()
+            loadingMetadataAssets[entryID]?.cancelLoading()
+            metadataAssetLock.unlock()
         }
-        metadataAssetLock.unlock()
-
-        playlists.filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) && $0.sortingProgress == nil }
-            .forEach { scheduleMetadata(for: $0) }
-        wakePendingMetadataPump()
+        scheduleMetadata(for: playlist)
+        wakePendingMetadataPump(for: playlist)
     }
 
     private func metadataRequestWasCancelled(_ entryID: UUID) -> Bool {
@@ -2262,7 +2313,7 @@ final class PlaylistManager: ObservableObject {
         return cancelledMetadataEntryIDs.contains(entryID)
     }
 
-    /// Reserves the single metadata slot and publishes its owner before any
+    /// Reserves this playlist's metadata slot and publishes its owner before any
     /// background AVFoundation work begins. The progress remains per playlist
     /// so the active status field can keep an accurate counter.
     private func reserveMetadataWork(
@@ -2278,118 +2329,92 @@ final class PlaylistManager: ObservableObject {
         let total = max(previous?.total ?? 0, playlist.entries.count)
         let processed = min(previous?.processed ?? 0, total)
         metadataProgress[playlist.id] = (processed, total)
-        metadataActivePlaylistID = playlist.id
+        if !metadataActivePlaylistIDs.contains(playlist.id) { metadataActivePlaylistIDs.insert(playlist.id) }
+        workers(for: playlist).currentEntryID = entry.id
 
-        return (playlist, entry, total, priorityRevision, requestID)
+        return MetadataWork(playlist: playlist, entry: entry, total: total,
+                            priorityRevision: priorityRevision, requestID: requestID,
+                            url: entry.url, cue: entry.cue, duration: entry.duration,
+                            artist: entry.artist, title: entry.trackTitle, rating: entry.rating,
+                            metadataIsAvailable: entry.metadataIsAvailable)
     }
 
-    /// Queues the next turn of the single metadata worker. The generation is
-    /// checked when the delayed block runs because DispatchWorkItem
-    /// cancellation alone is cooperative and can still invoke a queued block.
-    private func enqueueMetadataPump(after delay: TimeInterval, priorityRevision: Int) {
-        let currentRevision = DispatchQueue.main.sync { metadataPriorityRevision }
-        let effectiveDelay = currentRevision == priorityRevision ? delay : 0
-
-        metadataPumpLock.lock()
-        metadataPumpGeneration &+= 1
-        let generation = metadataPumpGeneration
-        pendingMetadataPumpGeneration = generation
-        metadataPumpLock.unlock()
-
-        metadataQueue.asyncAfter(deadline: .now() + effectiveDelay) { [weak self] in
-            guard let self else { return }
-            self.metadataPumpLock.lock()
-            let shouldRun = self.pendingMetadataPumpGeneration == generation
-            if shouldRun { self.pendingMetadataPumpGeneration = nil }
-            self.metadataPumpLock.unlock()
-            guard shouldRun else { return }
-            self.processNextMetadata()
+    /// Main-queue generations make delayed and awakened pumps mutually
+    /// exclusive. Each playlist retains exactly one metadata worker slot.
+    private func enqueueMetadataPump(for playlist: PlaylistModel, state: PlaylistWorkers,
+                                     after delay: TimeInterval, priorityRevision: Int) {
+        guard playlistWorkers[playlist.id] === state else { return }
+        state.pumpGeneration &+= 1
+        let generation = state.pumpGeneration
+        state.pendingPump = generation
+        let effectiveDelay = state.priorityRevision == priorityRevision ? delay : 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay) { [weak self] in
+            guard let self, self.playlistWorkers[playlist.id] === state,
+                  state.pendingPump == generation else { return }
+            state.pendingPump = nil
+            state.metadata.async { [weak self] in
+                self?.processNextMetadata(for: playlist, state: state)
+            }
         }
     }
 
-    /// Wakes a worker that is only waiting for the normal inter-file pacing
-    /// interval. If an AVFoundation read is still in progress there is no
-    /// pending pump, so reprioritization only cancels that read and its normal
-    /// completion path will enqueue the next turn.
-    private func wakePendingMetadataPump() {
-        metadataPumpLock.lock()
-        let hasPendingPump = pendingMetadataPumpGeneration != nil
-        if hasPendingPump {
-            metadataPumpGeneration &+= 1
-            pendingMetadataPumpGeneration = nil
+    private func wakePendingMetadataPump(for playlist: PlaylistModel) {
+        guard let state = playlistWorkers[playlist.id], state.pendingPump != nil else { return }
+        state.pendingPump = nil
+        state.pumpGeneration &+= 1
+        state.metadata.async { [weak self] in
+            self?.processNextMetadata(for: playlist, state: state)
         }
-        metadataPumpLock.unlock()
-        guard hasPendingPump else { return }
-        metadataQueue.async { [weak self] in self?.processNextMetadata() }
     }
 
-    private func processNextMetadata() {
+    private func processNextMetadata(for playlist: PlaylistModel, state: PlaylistWorkers) {
         var work: MetadataWork?
         DispatchQueue.main.sync {
-            let viewportPriorityPlaylistID = metadataPriorityPlaylistID
-            metadataPriorityPlaylistID = nil
-            let eligible = playlists
-                .filter { $0.isVisible && !pausedPlaylistIDs.contains($0.id) && $0.sortingProgress == nil }
-                .sorted { lhs, rhs in
-                    let lhsPriority = lhs.id == viewportPriorityPlaylistID ? 0 : (lhs.id == focusedPlaylistID ? 1 : (lhs.id == activePlaylistID ? 2 : 3))
-                    let rhsPriority = rhs.id == viewportPriorityPlaylistID ? 0 : (rhs.id == focusedPlaylistID ? 1 : (rhs.id == activePlaylistID ? 2 : 3))
-                    return lhsPriority < rhsPriority
-                }
-            // Global order: the playing entry, then every visible range, then
-            // all remaining entries.  Exactly one item is read per pump turn,
-            // so a changed track or scroll position takes effect immediately.
-            if let active = eligible.first(where: { $0.id == activePlaylistID }),
-               let playingID = playingEntryID,
-               let entry = active.entries.first(where: { $0.id == playingID && $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
-                work = reserveMetadataWork(
-                    for: active,
-                    entry: entry,
-                    priorityRevision: metadataPriorityRevision
-                )
-                return
+            defer {
+                if work == nil { finishMetadataWorker(for: playlist, state: state) }
             }
-            for playlist in eligible {
+            guard playlistWorkers[playlist.id] === state,
+                  playlists.contains(where: { $0.id == playlist.id }), playlist.isVisible,
+                  !pausedPlaylistIDs.contains(playlist.id), playlist.sortingProgress == nil else { return }
+            // Preserve playback > visible rows > remaining rows independently
+            // in every editor. Re-evaluate after every completion or scroll.
+            let entry: PlaylistEntry?
+            if activePlaylistID == playlist.id, let playingEntryID,
+               let playing = playlist.entries.first(where: {
+                   $0.id == playingEntryID && $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil
+               }) {
+                entry = playing
+            } else {
                 let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
                 let end = min(playlist.entries.count, start + playlist.visibleEntryCount)
-                if let entry = playlist.entries[start..<end].first(where: { $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
-                    work = reserveMetadataWork(
-                        for: playlist,
-                        entry: entry,
-                        priorityRevision: metadataPriorityRevision
-                    )
-                    return
+                entry = playlist.entries[start..<end].first {
+                    $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil
+                } ?? playlist.entries.first {
+                    $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil
                 }
             }
-            for playlist in eligible {
-                if let entry = playlist.entries.first(where: { $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
-                    work = reserveMetadataWork(
-                        for: playlist,
-                        entry: entry,
-                        priorityRevision: metadataPriorityRevision
-                    )
-                    return
-                }
+            if let entry {
+                work = reserveMetadataWork(for: playlist, entry: entry, priorityRevision: state.priorityRevision)
             }
         }
-        guard let work else {
-            finishMetadataWorker()
-            return
-        }
+        guard let work else { return }
 
-        let cueTracks = work.entry.url.isFileURL ? CueSheet.tracks(for: work.entry.url) : nil
+        let cueTracks = work.url.isFileURL ? CueSheet.tracks(for: work.url) : nil
         let result: (duration: TimeInterval?, artist: String?, title: String?, rating: UInt8, available: Bool) = autoreleasepool {
             // A sheet has no final end offset. Load the backing file's duration
             // once during expansion, while titles and artists still come from CUE.
-            let needsCueDuration = cueTracks != nil || (work.entry.isCue && work.entry.cue?.end == nil)
-            if !needsCueDuration && (work.entry.isCue || work.entry.metadataIsAvailable) {
-                return (work.entry.duration, work.entry.artist, work.entry.trackTitle, work.entry.rating, true)
+            let needsCueDuration = cueTracks != nil || ((work.cue != nil) && work.cue?.end == nil)
+            if !needsCueDuration && ((work.cue != nil) || work.metadataIsAvailable) {
+                return (work.duration, work.artist, work.title, work.rating, true)
             }
-            let scoped = work.entry.url.isFileURL && work.entry.url.startAccessingSecurityScopedResource()
-            defer { if scoped { work.entry.url.stopAccessingSecurityScopedResource() } }
-            let asset = AVURLAsset(url: work.entry.url)
+            let scoped = work.url.isFileURL && work.url.startAccessingSecurityScopedResource()
+            defer { if scoped { work.url.stopAccessingSecurityScopedResource() } }
+            let asset = AVURLAsset(url: work.url)
             metadataAssetLock.lock()
             loadingMetadataAssets[work.entry.id] = asset
             metadataAssetLock.unlock()
+            defer { asset.cancelLoading() }
+            if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, nil, 0, false) }
             let semaphore = DispatchSemaphore(value: 0)
             let keys = needsCueDuration ? ["duration"] : ["duration", "commonMetadata"]
             asset.loadValuesAsynchronously(forKeys: keys) { semaphore.signal() }
@@ -2417,7 +2442,7 @@ final class PlaylistManager: ObservableObject {
             // Metadata scans must be strictly read-only. If another player
             // supplied POPM values, TrackRatingStore averages them for
             // display; an absent rating remains zero and shows no stars.
-            let rating = TrackRatingStore.read(url: work.entry.url)?.rating ?? 0
+            let rating = TrackRatingStore.read(url: work.url)?.rating ?? 0
             return (duration.isFinite && duration > 0 ? duration : nil, artist, title, rating, true)
         }
         let applyResult = DispatchWorkItem { [self] in
@@ -2425,12 +2450,17 @@ final class PlaylistManager: ObservableObject {
             loadingMetadataAssets.removeValue(forKey: work.entry.id)
             let wasCancelled = cancelledMetadataEntryIDs.remove(work.entry.id) != nil
             metadataAssetLock.unlock()
+            state.currentEntryID = nil
             guard metadataInFlightRequests[work.entry.id] == work.requestID else { return }
             metadataInFlightRequests.removeValue(forKey: work.entry.id)
             guard let owner = playlists.first(where: { playlist in
                 playlist.entries.contains { $0.id == work.entry.id }
             }) else { return }
-            guard !wasCancelled, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, work.entry.needsMetadataRead else { return }
+            defer {
+                // A moved in-flight row may have made its new scanner go idle.
+                if owner.id != playlist.id { scheduleMetadata(for: owner) }
+            }
+            guard !wasCancelled, owner.isVisible, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, work.entry.needsMetadataRead else { return }
             var completedCount = 1
             if let cueTracks {
                 if let segment = work.entry.cue {
@@ -2510,12 +2540,12 @@ final class PlaylistManager: ObservableObject {
                 owner.scannerState = .readingMetadata(processed: progress.0, total: progress.1)
             }
         }
-        DispatchQueue.main.async(execute: applyResult)
-        let priorityChanged = DispatchQueue.main.sync {
-            metadataPriorityRevision != work.priorityRevision
+        DispatchQueue.main.async { [weak self] in
+            applyResult.perform()
+            self?.enqueueMetadataPump(for: playlist, state: state,
+                                      after: self?.metadataWorkInterval ?? 0.25,
+                                      priorityRevision: work.priorityRevision)
         }
-        let nextDelay = priorityChanged ? 0 : metadataWorkInterval
-        enqueueMetadataPump(after: nextDelay, priorityRevision: work.priorityRevision)
     }
 
     private func resolvedCueSegment(_ segment: CueSegment, fileDuration: TimeInterval?) -> CueSegment {
@@ -2536,20 +2566,15 @@ final class PlaylistManager: ObservableObject {
         entry.cueCheckPending = false
     }
 
-    private func finishMetadataWorker() {
-        scannerLock.lock()
-        metadataWorkersRunning = max(0, metadataWorkersRunning - 1)
-        let isIdle = metadataWorkersRunning == 0
-        scannerLock.unlock()
-        guard isIdle else { return }
-        DispatchQueue.main.async {
-            self.metadataProgress.removeAll()
-            self.playlists.forEach {
-                if case .readingMetadata = $0.scannerState { $0.scannerState = .idle }
-            }
-            self.metadataActivePlaylistID = nil
-            self.save()
-        }
+    private func finishMetadataWorker(for playlist: PlaylistModel, state: PlaylistWorkers) {
+        guard playlistWorkers[playlist.id] === state, state.metadataRunning else { return }
+        state.metadataRunning = false
+        state.currentEntryID = nil
+        state.pendingPump = nil
+        metadataProgress.removeValue(forKey: playlist.id)
+        metadataActivePlaylistIDs.remove(playlist.id)
+        if case .readingMetadata = playlist.scannerState { playlist.scannerState = .idle }
+        save()
     }
 
     private func prioritize(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
@@ -2826,23 +2851,42 @@ final class PlaylistManager: ObservableObject {
     /// Older snapshots contain paths only. When the user subsequently adds a
     /// file through the system picker, reuse its newly granted bookmark for
     /// every matching existing row instead of requiring a rebuilt playlist.
-    private func propagateBookmarks(from entries: [PlaylistEntry]) {
-        var bookmarksByPath: [String: Data] = [:]
-        for entry in entries {
-            if let bookmark = entry.bookmarkData {
-                bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path] = bookmark
-            }
+    private func propagateBookmarks(from entries: [PlaylistEntry], in source: PlaylistModel) {
+        let newBookmarks = entries.compactMap { entry -> (URL, Data)? in
+            entry.bookmarkData.map { (entry.url, $0) }
         }
-        guard !bookmarksByPath.isEmpty else { return }
-        for playlist in playlists {
-            var entriesChanged = false
-            for entry in playlist.entries where entry.bookmarkData == nil {
-                if let bookmark = bookmarksByPath[entry.url.resolvingSymlinksInPath().standardizedFileURL.path] {
-                    entry.bookmarkData = bookmark
-                    entriesChanged = true
+        guard !newBookmarks.isEmpty else { return }
+        // Snapshot URLs on main, then resolve symlinks on this editor's file
+        // queue. Slow path resolution must not block any playlist's UI.
+        let candidates = playlists.flatMap { playlist in
+            playlist.entries.filter { $0.bookmarkData == nil }.map { (playlist, $0, $0.url) }
+        }
+        guard !candidates.isEmpty else { return }
+        let state = workers(for: source)
+        state.files.async { [weak self] in
+            guard let self, !state.fileCancellation.isCancelled else { return }
+            var bookmarksByPath: [String: Data] = [:]
+            for (url, data) in newBookmarks {
+                bookmarksByPath[url.resolvingSymlinksInPath().standardizedFileURL.path] = data
+            }
+            var matches: [(PlaylistModel, PlaylistEntry, URL, Data)] = []
+            for (playlist, entry, url) in candidates {
+                guard !state.fileCancellation.isCancelled else { return }
+                if let bookmark = bookmarksByPath[url.resolvingSymlinksInPath().standardizedFileURL.path] {
+                    matches.append((playlist, entry, url, bookmark))
                 }
             }
-            if entriesChanged { markEntriesDirty(in: playlist) }
+            guard !matches.isEmpty else { return }
+            DispatchQueue.main.async {
+                for (playlist, entry, url, bookmark) in matches {
+                    guard self.playlists.contains(where: { $0.id == playlist.id }),
+                          entry.bookmarkData == nil, entry.url == url,
+                          playlist.entries.contains(where: { $0.id == entry.id }) else { continue }
+                    entry.bookmarkData = bookmark
+                    self.markEntriesDirty(in: playlist)
+                }
+                self.save()
+            }
         }
     }
 }

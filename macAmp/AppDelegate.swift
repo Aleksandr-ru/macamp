@@ -3464,9 +3464,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
         guard panel.runModal() == .OK else { return }
         let firstNew = panel.urls.first { url in !playlist.entries.contains(where: { $0.url == url }) }
-        playlistManager.addFiles(panel.urls, to: playlist)
-        if let url = firstNew, let entry = playlist.entries.first(where: { $0.url == url }) {
-            playPlaylistEntry(entry, in: playlist)
+        playlistManager.addFiles(panel.urls, to: playlist) { [weak self, weak playlist] in
+            guard let self, let playlist,
+                  let url = firstNew, let entry = playlist.entries.first(where: { $0.url == url }) else { return }
+            self.playPlaylistEntry(entry, in: playlist)
         }
     }
 
@@ -6575,7 +6576,7 @@ private class PlaylistDropTargetNSView: NSView {
         guard !urls.isEmpty else { return false }
         let audioURLs = urls.filter { PlaylistManager.supportedExtensions.contains($0.pathExtension.lowercased()) }
         manager.addFiles(audioURLs, to: playlist, at: index)
-        let nextIndex = min(index + audioURLs.count, playlist.entries.count)
+        let nextIndex = index + audioURLs.count
         for url in urls where !audioURLs.contains(url) {
             if ["m3u", "m3u8"].contains(url.pathExtension.lowercased()) {
                 AppDelegate.shared?.openPlaylistURL(url)
