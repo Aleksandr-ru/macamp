@@ -1972,6 +1972,28 @@ final class PlaylistManager: ObservableObject {
         markEntriesDirty(in: playlist); save()
     }
 
+    /// Apply only successful filesystem changes, once per operation. Matching
+    /// live rows also catches CUE expansion completed while files were handled.
+    func removeFileEntries(from playlist: PlaylistModel, audioPaths: Set<String>, sheetPaths: Set<String>) {
+        guard !audioPaths.isEmpty || !sheetPaths.isEmpty,
+              playlists.contains(where: { $0 === playlist }) else { return }
+        let previousCount = playlist.entries.count
+        playlist.entries.removeAll { entry in
+            guard entry.url.isFileURL else { return false }
+            return audioPaths.contains(entry.url.standardizedFileURL.path)
+                || entry.cue.map { sheetPaths.contains($0.sheetURL.standardizedFileURL.path) } == true
+        }
+        guard playlist.entries.count != previousCount else { return }
+        playlist.structureRevision &+= 1
+        playlist.recalculateTotalDuration()
+        repairTrackReferences(in: playlist)
+        if let anchor = playlist.selectionAnchorID, !playlist.selectedIDs.contains(anchor) {
+            playlist.selectionAnchorID = nil
+        }
+        playlist.isDirty = true
+        markEntriesDirty(in: playlist); save()
+    }
+
     /// Error markers themselves are transient, but removing their rows is a
     /// normal playlist edit and therefore must be persisted.
     func removePlaybackErrorEntries(from playlist: PlaylistModel) {

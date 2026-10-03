@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		E1A0003226A0000100000001 /* PlaylistFileRemoval.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0003326A0000100000001 /* PlaylistFileRemoval.swift */; };
 		E1A0003026A0000100000001 /* CueSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0003126A0000100000001 /* CueSheet.swift */; };
 		E1A0001126A0000100000001 /* TrackNotificationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001226A0000100000001 /* TrackNotificationController.swift */; };
 		E1A0001526A0000100000001 /* JumpToFileController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0001426A0000100000001 /* JumpToFileController.swift */; };
@@ -31,6 +32,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		E1A0003326A0000100000001 /* PlaylistFileRemoval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistFileRemoval.swift; sourceTree = "<group>"; };
 		E1A0003126A0000100000001 /* CueSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CueSheet.swift; sourceTree = "<group>"; };
 		E1A0001226A0000100000001 /* TrackNotificationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackNotificationController.swift; sourceTree = "<group>"; };
 		E1A0001426A0000100000001 /* JumpToFileController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JumpToFileController.swift; sourceTree = "<group>"; };
@@ -100,6 +102,7 @@
 				E1A0000C26A0000100000001 /* EqualizerController.swift */,
 				E1A0000E26A0000100000001 /* PlaylistManager.swift */,
 				E1A0003126A0000100000001 /* CueSheet.swift */,
+				E1A0003326A0000100000001 /* PlaylistFileRemoval.swift */,
 				E1A0001026A0000100000001 /* InfoWindow.swift */,
 				E1A0002226A0000100000001 /* TagEditor.swift */,
 				E1A0001826A0000100000001 /* MilkDropRenderer.swift */,
@@ -217,6 +220,7 @@
 				E1A0000B26A0000100000001 /* EqualizerController.swift in Sources */,
 				E1A0000D26A0000100000001 /* PlaylistManager.swift in Sources */,
 				E1A0003026A0000100000001 /* CueSheet.swift in Sources */,
+				E1A0003226A0000100000001 /* PlaylistFileRemoval.swift in Sources */,
 				E1A0000F26A0000100000001 /* InfoWindow.swift in Sources */,
 				E1A0002126A0000100000001 /* TagEditor.swift in Sources */,
 				E1A0001726A0000100000001 /* MilkDropRenderer.swift in Sources */,

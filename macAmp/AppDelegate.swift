@@ -785,6 +785,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isExplicitTerminationRequested = false
     private var persistenceCancellables = Set<AnyCancellable>()
     private var playingEntryTitleCancellable: AnyCancellable?
+    private(set) var isRemovingPlaylistFiles = false
+    private let playlistFileRemovalQueue = DispatchQueue(label: "macAmp.playlist.file-removal", qos: .userInitiated)
     private var pendingPersistenceWorkItem: DispatchWorkItem?
     private var pendingSkinRegionUpdate: DispatchWorkItem?
     private var lastNowPlayingUpdate = Date.distantPast
@@ -3490,6 +3492,72 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let playlist = playlistManager.editingPlaylist { playlistManager.removeSelected(from: playlist) }
     }
 
+    func moveSelectedFilesToTrash(in playlist: PlaylistModel) {
+        guard !isRemovingPlaylistFiles, playlist.sortingProgress == nil,
+              !playlist.selectedIDs.isEmpty else { return }
+        // Read observable models only on main. Freeze selection before any
+        // background work or modal run loop can change it.
+        let entries = playlist.entries.map {
+            PlaylistFileRemoval.Entry(url: $0.url, sheetURL: $0.cue?.sheetURL,
+                                      selected: playlist.selectedIDs.contains($0.id))
+        }
+        isRemovingPlaylistFiles = true
+        playlistFileRemovalQueue.async { [weak self, weak playlist] in
+            let result = Result { try PlaylistFileRemoval.prepare(entries) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let playlist, self.playlistManager.playlists.contains(where: { $0 === playlist }) else {
+                    self.isRemovingPlaylistFiles = false
+                    return
+                }
+                switch result {
+                case .failure(let error):
+                    self.isRemovingPlaylistFiles = false
+                    self.showPlaylistFileRemovalError(error, completed: 0)
+                case .success(let plan):
+                    guard !plan.files.isEmpty else {
+                        self.isRemovingPlaylistFiles = false
+                        let alert = NSAlert()
+                        alert.messageText = "No files to move to Trash"
+                        alert.informativeText = "The selection contains only URLs. They were skipped and remain in the playlist."
+                        alert.runModal()
+                        return
+                    }
+                    guard PlaylistFileRemoval.confirmation(for: plan).runModal() == .alertSecondButtonReturn,
+                          self.playlistManager.playlists.contains(where: { $0 === playlist }) else {
+                        self.isRemovingPlaylistFiles = false
+                        return
+                    }
+                    // Release the decoder before touching its source file.
+                    if let current = self.playback.currentURL, current.isFileURL,
+                       plan.files.contains(where: { $0.audioPaths.contains(current.standardizedFileURL.path) }) {
+                        self.stopPlayback()
+                    }
+                    self.playlistFileRemovalQueue.async {
+                        let outcome = PlaylistFileRemoval.execute(plan)
+                        DispatchQueue.main.async {
+                            self.playlistManager.removeFileEntries(from: playlist,
+                                audioPaths: outcome.audioPaths, sheetPaths: outcome.sheetPaths)
+                            self.isRemovingPlaylistFiles = false
+                            if let error = outcome.error {
+                                self.showPlaylistFileRemovalError(error, completed: outcome.completed)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func showPlaylistFileRemovalError(_ error: Error, completed: Int) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "File operation stopped"
+        alert.informativeText = "\(error.localizedDescription)\n\nFiles successfully processed: \(completed). No further files were processed. Completed changes were not rolled back."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     func removePlaybackErrorEntriesFromActivePlaylist() {
         if let playlist = playlistManager.editingPlaylist {
             playlistManager.removePlaybackErrorEntries(from: playlist)
@@ -6001,11 +6069,12 @@ private struct PlaylistView: View {
             PlaylistMenuButtonDefinition(
                 index: 1,
                 centerX: 54,
-                titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove with Error"],
+                titles: ["Remove Selected", "Crop", "Clear Playlist", "Remove with Error", "Move Selected Files to Trash…"],
                 shortcuts: [
                     "Remove Selected": .delete,
                     "Remove with Error": .optionDelete
                 ],
+                separatorsBefore: ["Move Selected Files to Trash…"],
                 pressedImage: skin.playlistMenuButtonPressedImage(index: 1)
             ),
             PlaylistMenuButtonDefinition(
@@ -6948,6 +7017,9 @@ private final class PlaylistMenuHotspotNSView: NSView {
             if let playlist {
                 if playlist.sortingProgress != nil {
                     item.isEnabled = false
+                } else if title == "Move Selected Files to Trash…" {
+                    item.isEnabled = !playlist.selectedIDs.isEmpty
+                        && AppDelegate.shared?.isRemovingPlaylistFiles == false
                 } else if title == "Automatic rating" {
                     if let appDelegate = AppDelegate.shared {
                         item.isEnabled = appDelegate.canUseAutomaticRating(for: playlist)
@@ -6994,6 +7066,8 @@ private final class PlaylistMenuHotspotNSView: NSView {
             if let playlist { AppDelegate.shared?.toggleAutomaticRating(for: playlist) }
         case "Add Folder…": AppDelegate.shared?.addFolderToActivePlaylist()
         case "Remove Selected": AppDelegate.shared?.removeSelectedFromActivePlaylist()
+        case "Move Selected Files to Trash…":
+            if let playlist { AppDelegate.shared?.moveSelectedFilesToTrash(in: playlist) }
         case "Remove with Error": AppDelegate.shared?.removePlaybackErrorEntriesFromActivePlaylist()
         case "Clear Playlist": AppDelegate.shared?.clearActivePlaylist()
         case "Crop": AppDelegate.shared?.cropActivePlaylist()
