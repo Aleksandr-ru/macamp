@@ -15,7 +15,7 @@ fi
 # even a build from a checkout without a Day-* commit should have the current
 # copyright year.
 build_year="$(date +%Y)"
-copyright="Copyright © 2020-${build_year} Aleksandr.ru. All rights reserved."
+copyright="Copyright © 2020-${build_year} Aleksandr.ru."
 /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $copyright" "$product_info_plist"
 
 if ! git -C "$project_root" rev-parse --show-toplevel >/dev/null 2>&1; then

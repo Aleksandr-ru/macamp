@@ -78,7 +78,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2020 Aleksandr.ru. All rights reserved.</string>
+	<string>Copyright © 2020 Aleksandr.ru.</string>
 	<!-- Internet radio stations commonly still expose Shoutcast/Icecast over
 	     HTTP. User-supplied URLs must work for both AVPlayer and the ICY
 	     metadata URLSession, regardless of the station's domain. -->
