@@ -742,6 +742,12 @@ final class AudioOutputDeviceManager: ObservableObject {
     }
 }
 
+/// A source-file interval; public transport time is relative to its start.
+struct AudioPlaybackRange {
+    let start: TimeInterval
+    let end: TimeInterval?
+}
+
 final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadataOutputPushDelegate {
     var onTrackFinished: (() -> Void)?
     /// These callbacks identify the source rather than relying on a global UI
@@ -829,6 +835,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var streamingStatusObservation: NSKeyValueObservation?
     private var streamingMetadataOutput: AVPlayerItemMetadataOutput?
     private var streamingHasReportedReady = false
+    private var streamingIsPreparingRange = false
+    private var streamingDidFinish = false
     private var streamingEndObserver: Any?
     private var streamingTimeObserver: Any?
     private var streamingOpenGeneration: Int?
@@ -874,6 +882,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var preferredDisplayTitle = ""
     private var hasSecurityScope = false
     private var scheduledStartFrame: AVAudioFramePosition = 0
+    private var playbackRange: AudioPlaybackRange?
+    /// Resolved on the file-opening queue, including EOF and sample-rate rounding.
+    private var sourceFrameRange: Range<AVAudioFramePosition>?
     /// Invalidates completion handlers from segments replaced by seek/restart.
     private var playbackGeneration = 0
     private var isSpectrumAnalysisScheduled = false
@@ -995,6 +1006,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             return
         }
         if let streamingPlayer {
+            guard streamingHasReportedReady else { isPaused = false; return }
             if streamingTimeObserver == nil { installStreamingTimeObserver(on: streamingPlayer) }
             streamingPlayer.play(); isPlaying = true; isPaused = false
             sourceStatus = ""
@@ -1004,7 +1016,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             // Stop releases a network AVPlayer completely so its decoder and
             // buffering work cannot delay input. Re-open the retained URL on
             // the next Play rather than showing a file picker.
-            if let scopedURL { open(scopedURL) } else { chooseTrack() }
+            if let scopedURL { open(scopedURL, displayTitle: preferredDisplayTitle, range: playbackRange) } else { chooseTrack() }
             return
         }
         start(at: isPaused ? scheduledStartFrame : scheduledStartFrame + currentPlayedFrames())
@@ -1087,6 +1099,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     func stop() {
         cancelStopFadeout()
+        // Stop during a background open must invalidate its pending result
+        // and fallback; otherwise a late CUE seek could restart playback.
+        if sourceFile == nil { fileOpenGeneration &+= 1 }
         playbackGeneration += 1
         if decodedHTTPStream != nil {
             stopDecodedHTTPPlayback()
@@ -1129,7 +1144,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
         engine.pause()
-        scheduledStartFrame = 0
+        scheduledStartFrame = sourceFrameRange?.lowerBound ?? 0
         position = 0
         pendingSeekPosition = nil
         isPlaying = false
@@ -1214,19 +1229,27 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         // Refresh the static position immediately; the next regular tick
         // restores spectrum/waveform animation without a burst of work.
         if let streamingPlayer {
-            position = max(0, streamingPlayer.currentTime().seconds)
+            position = relativePosition(streamingPlayer.currentTime().seconds)
         } else if sourceFile != nil, isPlaying {
             startTimer()
         }
     }
 
     func seek(to value: Double) {
+        guard value.isFinite else { return }
         if let streamingPlayer {
+            guard streamingHasReportedReady else { return }
             let target = min(max(0, value), duration)
             pendingSeekPosition = target
             position = target
-            streamingPlayer.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
-                DispatchQueue.main.async { self?.pendingSeekPosition = nil }
+            let generation = fileOpenGeneration
+            streamingPlayer.seek(to: CMTime(seconds: target + (playbackRange?.start ?? 0), preferredTimescale: 600),
+                                 toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak streamingPlayer] finished in
+                DispatchQueue.main.async {
+                    guard let self, self.fileOpenGeneration == generation,
+                          self.streamingPlayer === streamingPlayer, finished else { return }
+                    self.pendingSeekPosition = nil
+                }
             }
             return
         }
@@ -1236,7 +1259,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         // not briefly fall back to its previous playback position on mouse-up.
         pendingSeekPosition = target
         position = target
-        start(at: AVAudioFramePosition(target * sourceFile.processingFormat.sampleRate))
+        start(at: (sourceFrameRange?.lowerBound ?? 0) + AVAudioFramePosition(target * sourceFile.processingFormat.sampleRate))
     }
 
     private func configureAudioGraph() {
@@ -1553,7 +1576,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     /// PlaylistManager owns selection; the audio engine only opens the chosen URL.
-    func open(_ requestedURL: URL, bookmarkData: Data? = nil, displayTitle: String? = nil) {
+    func open(_ requestedURL: URL, bookmarkData: Data? = nil, displayTitle: String? = nil, range: AudioPlaybackRange? = nil) {
         cancelStopFadeout()
         let url: URL
         if let bookmarkData {
@@ -1592,6 +1615,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         playerNode.stop()
         timer?.invalidate(); timer = nil
         sourceFile = nil
+        sourceFrameRange = nil
+        playbackRange = url.isFileURL ? range : nil
         if hasSecurityScope { scopedURL?.stopAccessingSecurityScopedResource() }
         scopedURL = nil; hasSecurityScope = false
         isPlaying = false; isPaused = false
@@ -1600,7 +1625,18 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         streamBufferPercent = nil
         title = "OPENING…"
         duration = 0
+        position = 0
+        pendingSeekPosition = nil
+        scheduledStartFrame = 0
         bitrateKbps = nil
+        if let playbackRange {
+            guard playbackRange.start.isFinite, playbackRange.start >= 0,
+                  playbackRange.end.map({ $0.isFinite && $0 > playbackRange.start }) ?? true else {
+                reportPlaybackError(for: url, title: "INVALID AUDIO RANGE")
+                return
+            }
+        }
+        let openingRange = playbackRange
         if isHTTPURL(url) {
             startDecodedHTTPStream(for: url, generation: generation)
             return
@@ -1628,7 +1664,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 }
                 return
             }
-            let result = Result { try AVAudioFile(forReading: url) }
+            let result = Result {
+                let file = try AVAudioFile(forReading: url)
+                let frames = try openingRange.map { try Self.resolveFrameRange($0, file: file) }
+                return (file: file, frames: frames)
+            }
             DispatchQueue.main.async { [self] in
                 guard let self else {
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
@@ -1644,9 +1684,17 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
                     return
                 }
-                guard case let .success(file) = result else {
+                guard case let .success(opened) = result else {
                     self.reportPlaybackError(for: url, title: "UNSUPPORTED AUDIO FILE")
                     if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
+                    return
+                }
+                let file = opened.file
+                // AVAudioPlayerNode's segment count is UInt32. Very long CUE
+                // ranges use AVPlayer rather than overflowing that count.
+                if let frames = opened.frames, frames.upperBound - frames.lowerBound > Int64(UInt32.max) {
+                    if obtainedSecurityScope { url.stopAccessingSecurityScopedResource() }
+                    self.startStreamingFallback(for: url, generation: generation)
                     return
                 }
                 if self.hasSecurityScope { self.scopedURL?.stopAccessingSecurityScopedResource() }
@@ -1660,13 +1708,17 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             self.engine.disconnectNodeOutput(self.playerNode)
             self.engine.disconnectNodeOutput(self.equalizerNode)
             self.sourceFile = file
+            self.sourceFrameRange = opened.frames
+            if let frames = opened.frames {
+                self.duration = Double(frames.upperBound - frames.lowerBound) / file.processingFormat.sampleRate
+            }
             self.connectAudioGraph(for: file.processingFormat)
             self.engine.prepare()
             try self.engine.start()
             self.scopedURL = url
             self.hasSecurityScope = obtainedSecurityScope
             self.position = 0
-            self.scheduledStartFrame = 0
+            self.scheduledStartFrame = opened.frames?.lowerBound ?? 0
             self.title = self.preferredDisplayTitle
             // Reading AVAudioFile.length can make AVFoundation scan a large
             // VBR file end-to-end, particularly on a network volume. Start
@@ -1747,7 +1799,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                     forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
                 ) { [weak self] _ in
                     guard let self, self.fileOpenGeneration == generation,
-                          self.streamingOpenGeneration == generation else { return }
+                          self.streamingOpenGeneration == generation, !self.streamingDidFinish else { return }
+                    self.streamingDidFinish = true
+                    self.isPlaying = false
+                    self.isPaused = false
+                    self.position = self.duration
                     self.onTrackFinished?()
                 }
                 self.streamingStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -1763,9 +1819,23 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                             }
                             return
                         }
+                        guard !self.streamingHasReportedReady, !self.streamingIsPreparingRange else { return }
+                        let fullDuration = item.duration.seconds
+                        if let range = self.playbackRange, fullDuration.isFinite, fullDuration > 0,
+                           range.start >= fullDuration {
+                            self.stopStreamingPlayback()
+                            self.reportPlaybackError(for: url, title: "INVALID AUDIO RANGE")
+                            return
+                        }
+                        self.streamingIsPreparingRange = true
                         self.playerNode.stop()
                         self.timer?.invalidate(); self.timer = nil
-                        self.duration = item.duration.seconds.isFinite ? max(0, item.duration.seconds) : 0
+                        self.duration = self.relativeDuration(fullDuration)
+                        if let range = self.playbackRange {
+                            let end = fullDuration.isFinite && fullDuration > 0
+                                ? min(range.end ?? fullDuration, fullDuration) : range.end
+                            if let end { item.forwardPlaybackEndTime = CMTime(seconds: end, preferredTimescale: 600) }
+                        }
                         self.position = 0
                         self.title = self.preferredDisplayTitle
                         self.sourceStatus = ""
@@ -1777,13 +1847,33 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                             .compactMap(\.assetTrack)
                             .first(where: { $0.mediaType == .audio }) ?? self.streamingAudioTrack
                         self.updateStreamingAnalysisTap()
-                        self.installStreamingTimeObserver(on: player)
-                        self.requestSpectrumFromNextPCMBuffer()
-                        player.play()
-                        self.isPlaying = true; self.isPaused = false
-                        if !self.streamingHasReportedReady {
-                            self.streamingHasReportedReady = true
-                            self.onPlaybackReady?(url)
+                        let beginPlayback: (Bool) -> Void = { [weak self, weak player] finished in
+                            DispatchQueue.main.async {
+                                guard let self, let player,
+                                      self.fileOpenGeneration == generation,
+                                      self.streamingPlayer === player else { return }
+                                guard finished else {
+                                    self.stopStreamingPlayback()
+                                    self.reportPlaybackError(for: url, title: "SOURCE UNAVAILABLE")
+                                    return
+                                }
+                                self.streamingIsPreparingRange = false
+                                self.streamingHasReportedReady = true
+                                if !self.isPaused {
+                                    player.play()
+                                    self.isPlaying = true
+                                }
+                                self.installStreamingTimeObserver(on: player)
+                                self.requestSpectrumFromNextPCMBuffer()
+                                self.onPlaybackReady?(url)
+                            }
+                        }
+                        if let range = self.playbackRange {
+                            player.seek(to: CMTime(seconds: range.start, preferredTimescale: 600),
+                                        toleranceBefore: .zero, toleranceAfter: .zero,
+                                        completionHandler: beginPlayback)
+                        } else {
+                            beginPlayback(true)
                         }
                     }
                 }
@@ -1906,6 +1996,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     private func installStreamingTimeObserver(on player: AVPlayer) {
+        // Until the initial CUE seek completes, rate == 0 means opening,
+        // rather than a user pause. Do not let that observer suppress start.
+        guard streamingHasReportedReady else { return }
         if let streamingTimeObserver { player.removeTimeObserver(streamingTimeObserver) }
         streamingTimeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: liveAnalysisInterval, preferredTimescale: 600), queue: .main
@@ -1914,7 +2007,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             guard !self.isVisualUpdatesSuspended else { return }
             let now = Date()
             if now.timeIntervalSince(self.lastPublishedPosition) >= self.positionPublishInterval {
-                self.position = max(0, time.seconds)
+                self.position = self.relativePosition(time.seconds)
                 self.lastPublishedPosition = now
             }
             let playerIsPlaying = player.rate > 0
@@ -1943,6 +2036,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         isStreamingAnalysisTapInstalled = false
         streamingOpenGeneration = nil
         streamingHasReportedReady = false
+        streamingIsPreparingRange = false
+        streamingDidFinish = false
         sourceStatus = ""
         streamBufferPercent = nil
     }
@@ -2088,6 +2183,33 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         return url.deletingLastPathComponent().path
     }
 
+    private static func resolveFrameRange(_ range: AudioPlaybackRange, file: AVAudioFile) throws -> Range<AVAudioFramePosition> {
+        let sampleRate = file.processingFormat.sampleRate
+        let length = file.length
+        guard sampleRate.isFinite, sampleRate > 0, length > 0 else { throw CocoaError(.fileReadCorruptFile) }
+        func frame(_ seconds: TimeInterval) -> AVAudioFramePosition {
+            if seconds >= Double(length) / sampleRate { return length }
+            return AVAudioFramePosition((seconds * sampleRate).rounded(.down))
+        }
+        let start = frame(range.start)
+        let end = range.end.map(frame) ?? length
+        guard start < end else { throw CocoaError(.fileReadCorruptFile) }
+        return start..<end
+    }
+
+    private func relativeDuration(_ fileDuration: TimeInterval) -> TimeInterval {
+        let knownDuration = fileDuration.isFinite && fileDuration > 0 ? fileDuration : nil
+        guard let range = playbackRange else { return knownDuration ?? 0 }
+        let end = knownDuration.map { min(range.end ?? $0, $0) } ?? range.end ?? range.start
+        return max(0, end - range.start)
+    }
+
+    private func relativePosition(_ sourcePosition: TimeInterval) -> TimeInterval {
+        guard sourcePosition.isFinite else { return 0 }
+        let value = max(0, sourcePosition - (playbackRange?.start ?? 0))
+        return duration > 0 ? min(duration, value) : value
+    }
+
     private func start(at requestedFrame: AVAudioFramePosition? = nil) {
         guard let file = sourceFile else { return }
         playbackGeneration += 1
@@ -2097,18 +2219,27 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         let finished: AVAudioPlayerNodeCompletionHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self, self.playbackGeneration == generation else { return }
+                self.timer?.invalidate(); self.timer = nil
+                self.position = self.duration
+                self.pendingSeekPosition = nil
+                self.isPlaying = false; self.isPaused = false
                 self.onTrackFinished?()
             }
         }
-        if let requestedFrame {
-            // Seeking is an explicit user action. Only this slower path needs
-            // the file's total frame count in order to clamp and schedule a
-            // finite segment.
-            let frame = min(max(0, requestedFrame), file.length)
-            guard frame < file.length else { stop(); return }
+        if requestedFrame != nil || sourceFrameRange != nil {
+            // CUE bounds were resolved off-main. Ordinary seeks retain their
+            // existing file-length clamp; scheduling never crosses the CUE end.
+            let lower = sourceFrameRange?.lowerBound ?? 0
+            let upper = sourceFrameRange?.upperBound ?? file.length
+            let frame = min(max(lower, requestedFrame ?? lower), upper)
+            guard frame < upper else { finished(.dataPlayedBack); return }
+            guard let frameCount = AVAudioFrameCount(exactly: upper - frame) else {
+                reportPlaybackError(for: scopedURL, title: "AUDIO SEGMENT TOO LONG")
+                return
+            }
             scheduledStartFrame = frame
             playerNode.scheduleSegment(file, startingFrame: frame,
-                                       frameCount: AVAudioFrameCount(file.length - frame),
+                                       frameCount: frameCount,
                                        at: nil, completionCallbackType: completion,
                                        completionHandler: finished)
         } else {
@@ -2170,7 +2301,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             else if let format = self.decodedHTTPFormat { sampleRate = format.sampleRate }
             else { return }
             guard !self.isVisualUpdatesSuspended else { return }
-            let rawPosition = Double(self.scheduledStartFrame + self.currentPlayedFrames()) / sampleRate
+            let startFrame = self.sourceFrameRange?.lowerBound ?? 0
+            let rawPosition = max(0, Double(self.scheduledStartFrame + self.currentPlayedFrames() - startFrame) / sampleRate)
             let currentPosition = self.duration > 0 ? min(self.duration, rawPosition) : rawPosition
             // The time digits and progress thumb cannot display sub-quarter-
             // second changes.  Publishing them at the analyser cadence makes
@@ -2219,7 +2351,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.channelCount = channels
                 self.publishBitrate(bitrate, for: url)
                 if trackDuration.isFinite, trackDuration > 0 {
-                    self.duration = trackDuration
+                    if let frames = self.sourceFrameRange {
+                        self.duration = Double(frames.upperBound - frames.lowerBound) / file.processingFormat.sampleRate
+                    } else {
+                        self.duration = trackDuration
+                    }
                 }
             }
         }
@@ -2252,7 +2388,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                       self.streamingOpenGeneration == generation else { return }
                 self.publishBitrate(bitrate, for: url)
                 if duration.isFinite, duration > 0 {
-                    self.duration = duration
+                    self.duration = self.relativeDuration(duration)
                 }
             }
         }

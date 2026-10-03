@@ -19,6 +19,12 @@ final class PlaylistEntry: ObservableObject, Identifiable {
     @Published var trackTitle: String?
     @Published var duration: TimeInterval?
     @Published var metadataIsAvailable = false
+    @Published var cue: CueSegment?
+    var isCue: Bool { cue != nil }
+    /// M3U labels never bypass the sidecar check. Persist pending work so a
+    /// relaunch during scanning does not skip entries with cached M3U labels.
+    var cueCheckPending: Bool
+    var needsMetadataRead: Bool { !metadataIsAvailable || cueCheckPending }
     /// Numeric POPM value, not the five-star presentation value. Zero means no
     /// usable POPM rating is available for this file.
     @Published var rating: UInt8 = 0
@@ -28,8 +34,12 @@ final class PlaylistEntry: ObservableObject, Identifiable {
 
     init(id: UUID = UUID(), url: URL, bookmarkData: Data? = nil, title: String? = nil,
          artist: String? = nil, trackTitle: String? = nil, duration: TimeInterval? = nil, metadataIsAvailable: Bool = false,
-         rating: UInt8 = 0) {
+         rating: UInt8 = 0, cue: CueSegment? = nil, cueCheckPending: Bool? = nil) {
         self.id = id; self.url = url; self.title = title ?? url.deletingPathExtension().lastPathComponent
+        self.cue = cue
+        self.cueCheckPending = cueCheckPending ?? (url.isFileURL && cue == nil)
+        // Repair last-track durations cached before CUE file-length discovery.
+        if let cue, cue.end == nil, duration == nil { self.cueCheckPending = true }
         self.artist = artist
         self.trackTitle = trackTitle
         self.bookmarkData = bookmarkData
@@ -408,11 +418,9 @@ final class PlaylistManager: ObservableObject {
     }
     static let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus"]
     /// Bump when stored display metadata needs one background refresh. Version
-    /// 3 re-reads POPM values using the current read-only policy: older
-    /// snapshots may cache a zero rating even when the file has a rating that
-    /// Info now correctly displays.
+    /// 4 discovers CUE sidecars for entries cached by previous versions.
     private static let displayMetadataFormatVersionKey = "macAmp.playlist.displayMetadataFormatVersion"
-    private static let displayMetadataFormatVersion = 3
+    private static let displayMetadataFormatVersion = 4
     @Published private(set) var playlists: [PlaylistModel] = []
     @Published private(set) var activePlaylistID: UUID?
     @Published private(set) var focusedPlaylistID: UUID?
@@ -899,7 +907,7 @@ final class PlaylistManager: ObservableObject {
               sortingTasks[playlist.id] == nil,
               !isLoadingEntries(playlist) else { return false }
         if option == .title {
-            return playlist.entries.allSatisfy(\.metadataIsAvailable)
+            return playlist.entries.allSatisfy { !$0.needsMetadataRead }
         }
         return true
     }
@@ -948,6 +956,9 @@ final class PlaylistManager: ObservableObject {
 
         for entry in selectedEntries {
             entry.metadataIsAvailable = false
+            entry.cueCheckPending = entry.url.isFileURL
+            // Keep the last CUE values if the sidecar is temporarily unavailable.
+            if entry.isCue { continue }
             entry.artist = nil
             entry.trackTitle = nil
             entry.title = entry.url.deletingPathExtension().lastPathComponent
@@ -956,7 +967,7 @@ final class PlaylistManager: ObservableObject {
         playlist.recalculateTotalDuration()
 
         let pendingCount = playlist.entries.reduce(into: 0) { count, entry in
-            if !entry.metadataIsAvailable { count += 1 }
+            if entry.needsMetadataRead { count += 1 }
         }
         metadataProgress[playlist.id] = (0, pendingCount)
         playlist.scannerState = .readingMetadata(processed: 0, total: pendingCount)
@@ -974,7 +985,8 @@ final class PlaylistManager: ObservableObject {
     /// later metadata scan.
     func applyEditedMetadata(_ fields: TagEditorFields, to entry: PlaylistEntry, in playlist: PlaylistModel) {
         guard playlists.contains(where: { $0.id == playlist.id }),
-              let liveEntry = playlist.entries.first(where: { $0.id == entry.id }) else { return }
+              let liveEntry = playlist.entries.first(where: { $0.id == entry.id }),
+              !liveEntry.isCue else { return }
         let artist = fields.artist.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = fields.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -2090,7 +2102,14 @@ final class PlaylistManager: ObservableObject {
     /// path/URL per entry.  Unknown durations use the conventional -1 value.
     private func extendedM3UContents(for playlist: PlaylistModel) -> String {
         var lines = ["#EXTM3U"]
+        var savedCueFiles = Set<URL>()
         for entry in playlist.entries {
+            if entry.isCue {
+                guard savedCueFiles.insert(entry.url.standardizedFileURL).inserted else { continue }
+                // M3U cannot represent a segment. Store the backing file once.
+                lines.append(entry.url.path)
+                continue
+            }
             let seconds = entry.duration.map { Int($0.rounded()) } ?? -1
             let title = entry.title.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
             lines.append("#EXTINF:\(seconds),\(title)")
@@ -2321,7 +2340,7 @@ final class PlaylistManager: ObservableObject {
             // so a changed track or scroll position takes effect immediately.
             if let active = eligible.first(where: { $0.id == activePlaylistID }),
                let playingID = playingEntryID,
-               let entry = active.entries.first(where: { $0.id == playingID && !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+               let entry = active.entries.first(where: { $0.id == playingID && $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
                 work = reserveMetadataWork(
                     for: active,
                     entry: entry,
@@ -2332,7 +2351,7 @@ final class PlaylistManager: ObservableObject {
             for playlist in eligible {
                 let start = min(max(0, playlist.scrollPosition), playlist.entries.count)
                 let end = min(playlist.entries.count, start + playlist.visibleEntryCount)
-                if let entry = playlist.entries[start..<end].first(where: { !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+                if let entry = playlist.entries[start..<end].first(where: { $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
                     work = reserveMetadataWork(
                         for: playlist,
                         entry: entry,
@@ -2342,7 +2361,7 @@ final class PlaylistManager: ObservableObject {
                 }
             }
             for playlist in eligible {
-                if let entry = playlist.entries.first(where: { !$0.metadataIsAvailable && metadataInFlightRequests[$0.id] == nil }) {
+                if let entry = playlist.entries.first(where: { $0.needsMetadataRead && metadataInFlightRequests[$0.id] == nil }) {
                     work = reserveMetadataWork(
                         for: playlist,
                         entry: entry,
@@ -2357,13 +2376,23 @@ final class PlaylistManager: ObservableObject {
             return
         }
 
+        let cueTracks = work.entry.url.isFileURL ? CueSheet.tracks(for: work.entry.url) : nil
         let result: (duration: TimeInterval?, artist: String?, title: String?, rating: UInt8, available: Bool) = autoreleasepool {
+            // A sheet has no final end offset. Load the backing file's duration
+            // once during expansion, while titles and artists still come from CUE.
+            let needsCueDuration = cueTracks != nil || (work.entry.isCue && work.entry.cue?.end == nil)
+            if !needsCueDuration && (work.entry.isCue || work.entry.metadataIsAvailable) {
+                return (work.entry.duration, work.entry.artist, work.entry.trackTitle, work.entry.rating, true)
+            }
+            let scoped = work.entry.url.isFileURL && work.entry.url.startAccessingSecurityScopedResource()
+            defer { if scoped { work.entry.url.stopAccessingSecurityScopedResource() } }
             let asset = AVURLAsset(url: work.entry.url)
             metadataAssetLock.lock()
             loadingMetadataAssets[work.entry.id] = asset
             metadataAssetLock.unlock()
             let semaphore = DispatchSemaphore(value: 0)
-            asset.loadValuesAsynchronously(forKeys: ["duration", "commonMetadata"]) { semaphore.signal() }
+            let keys = needsCueDuration ? ["duration"] : ["duration", "commonMetadata"]
+            asset.loadValuesAsynchronously(forKeys: keys) { semaphore.signal() }
             // cancelLoading() does not reliably invoke the completion handler
             // on every remote/server format. Polling the semaphore gives a
             // changed visible range or a newly playing track the worker within
@@ -2380,6 +2409,9 @@ final class PlaylistManager: ObservableObject {
             var error: NSError?
             guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, 0, false) }
             let duration = asset.duration.seconds
+            if needsCueDuration {
+                return (duration.isFinite && duration > 0 ? duration : nil, nil, nil, 0, true)
+            }
             let artist = asset.commonMetadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
             let title = asset.commonMetadata.first(where: { $0.commonKey?.rawValue == "title" })?.stringValue
             // Metadata scans must be strictly read-only. If another player
@@ -2398,37 +2430,69 @@ final class PlaylistManager: ObservableObject {
             guard let owner = playlists.first(where: { playlist in
                 playlist.entries.contains { $0.id == work.entry.id }
             }) else { return }
-            guard !wasCancelled, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, !work.entry.metadataIsAvailable else { return }
-            let previousDuration = work.entry.duration
-            work.entry.duration = result.duration
-            work.entry.rating = result.rating
-            owner.replaceTotalDuration(previousDuration, with: result.duration)
-            let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-            switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
-            case let (.some(artist), .some(title)):
-                work.entry.artist = artist
-                work.entry.trackTitle = title
-                work.entry.title = "\(artist) - \(title)"
-            case let (.some(artist), nil):
-                work.entry.artist = artist
-                work.entry.trackTitle = nil
-                work.entry.title = artist
-            case let (nil, .some(title)):
-                work.entry.artist = nil
-                work.entry.trackTitle = title
-                work.entry.title = title
-            case (nil, nil):
-                work.entry.artist = nil
-                work.entry.trackTitle = nil
-                break
+            guard !wasCancelled, !pausedPlaylistIDs.contains(owner.id), owner.sortingProgress == nil, work.entry.needsMetadataRead else { return }
+            var completedCount = 1
+            if let cueTracks {
+                if let segment = work.entry.cue {
+                    // Refresh one virtual track without expanding it a second time.
+                    if let track = cueTracks.first(where: { $0.segment.trackNumber == segment.trackNumber }) {
+                        let previous = work.entry.duration
+                        applyCueTrack(track, to: work.entry, fileDuration: result.duration)
+                        owner.replaceTotalDuration(previous, with: work.entry.duration)
+                    }
+                } else if let index = owner.entries.firstIndex(where: { $0.id == work.entry.id }) {
+                    let previous = work.entry.duration
+                    let expanded = cueTracks.enumerated().map { offset, track in
+                        let entry = offset == 0 ? work.entry : PlaylistEntry(url: work.entry.url, bookmarkData: work.entry.bookmarkData)
+                        applyCueTrack(track, to: entry, fileDuration: result.duration)
+                        return entry
+                    }
+                    owner.entries.replaceSubrange(index...index, with: expanded)
+                    owner.structureRevision &+= 1
+                    owner.replaceTotalDuration(previous, with: nil)
+                    owner.appendToTotalDuration(expanded)
+                    if owner.selectedIDs.contains(work.entry.id) { owner.selectedIDs.formUnion(expanded.map(\.id)) }
+                    completedCount = expanded.count
+                }
+            } else if let segment = work.entry.cue {
+                // Keep CUE labels even if the sidecar is temporarily unavailable.
+                let previous = work.entry.duration
+                work.entry.cue = resolvedCueSegment(segment, fileDuration: result.duration)
+                work.entry.duration = work.entry.cue?.end.map { $0 - segment.start }
+                owner.replaceTotalDuration(previous, with: work.entry.duration)
+            } else {
+                let previousDuration = work.entry.duration
+                work.entry.duration = result.duration
+                work.entry.rating = result.rating
+                owner.replaceTotalDuration(previousDuration, with: result.duration)
+                let artist = result.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = result.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+                switch (artist?.isEmpty == false ? artist : nil, title?.isEmpty == false ? title : nil) {
+                case let (.some(artist), .some(title)):
+                    work.entry.artist = artist
+                    work.entry.trackTitle = title
+                    work.entry.title = "\(artist) - \(title)"
+                case let (.some(artist), nil):
+                    work.entry.artist = artist
+                    work.entry.trackTitle = nil
+                    work.entry.title = artist
+                case let (nil, .some(title)):
+                    work.entry.artist = nil
+                    work.entry.trackTitle = title
+                    work.entry.title = title
+                case (nil, nil):
+                    work.entry.artist = nil
+                    work.entry.trackTitle = nil
+                    break
+                }
             }
+            work.entry.cueCheckPending = false
             // A timeout/error is still a completed attempt; retrying it forever
             // would prevent lower-priority entries from ever being scanned.
             work.entry.metadataIsAvailable = true
             markEntriesDirty(in: owner)
             let previous = metadataProgress[owner.id] ?? (0, owner.entries.count)
-            let progress = (previous.processed + 1, max(previous.total, owner.entries.count))
+            let progress = (previous.processed + completedCount, max(previous.total + completedCount - 1, owner.entries.count))
             metadataProgress[owner.id] = progress
             // Each visible row observes its own PlaylistEntry, so applying this
             // result refreshes only that row. The scanner status still follows
@@ -2454,6 +2518,24 @@ final class PlaylistManager: ObservableObject {
         enqueueMetadataPump(after: nextDelay, priorityRevision: work.priorityRevision)
     }
 
+    private func resolvedCueSegment(_ segment: CueSegment, fileDuration: TimeInterval?) -> CueSegment {
+        guard segment.end == nil, let fileDuration, fileDuration.isFinite, fileDuration > segment.start else { return segment }
+        return CueSegment(sheetURL: segment.sheetURL, trackNumber: segment.trackNumber,
+                          start: segment.start, end: fileDuration)
+    }
+
+    private func applyCueTrack(_ track: CueTrack, to entry: PlaylistEntry, fileDuration: TimeInterval?) {
+        let segment = resolvedCueSegment(track.segment, fileDuration: fileDuration)
+        entry.cue = segment
+        entry.artist = track.artist
+        entry.trackTitle = track.title
+        entry.title = track.artist.map { "\($0) - \(track.title)" } ?? track.title
+        entry.duration = segment.end.map { $0 - segment.start }
+        entry.rating = 0
+        entry.metadataIsAvailable = true
+        entry.cueCheckPending = false
+    }
+
     private func finishMetadataWorker() {
         scannerLock.lock()
         metadataWorkersRunning = max(0, metadataWorkersRunning - 1)
@@ -2473,7 +2555,7 @@ final class PlaylistManager: ObservableObject {
     private func prioritize(_ entry: PlaylistEntry, in playlist: PlaylistModel) {
         // The scanner is serial; marking the playing entry unresolved causes its
         // metadata work to be scheduled before subsequent idle entries.
-        if !entry.metadataIsAvailable { scheduleMetadata(for: playlist) }
+        if entry.needsMetadataRead { scheduleMetadata(for: playlist) }
     }
     private func addRecent(_ url: URL) { recentPlaylistURLs.removeAll { $0 == url }; recentPlaylistURLs.insert(url, at: 0); recentPlaylistURLs = Array(recentPlaylistURLs.prefix(10)) }
 
@@ -2507,6 +2589,8 @@ final class PlaylistManager: ObservableObject {
         var id: UUID; var url: URL; var bookmark: Data?; var title: String
         var artist: String?; var trackTitle: String?
         var duration: TimeInterval?; var metadata: Bool; var rating: UInt8?
+        var cue: CueSegment?
+        var cueCheckPending: Bool?
     }
 
     private func markEntriesDirty(in playlist: PlaylistModel) {
@@ -2653,7 +2737,9 @@ final class PlaylistManager: ObservableObject {
                     trackTitle: storedEntry.trackTitle,
                     duration: storedEntry.duration,
                     metadataIsAvailable: invalidateMetadata ? false : storedEntry.metadata,
-                    rating: storedEntry.rating ?? 0
+                    rating: storedEntry.rating ?? 0,
+                    cue: storedEntry.cue,
+                    cueCheckPending: invalidateMetadata || (storedEntry.cueCheckPending ?? false)
                 )
             }
             let model = PlaylistModel(id: playlist.id, name: playlist.name, entries: entries, fileURL: playlist.fileURL,
@@ -2693,7 +2779,8 @@ final class PlaylistManager: ObservableObject {
             artist: entry.artist,
             trackTitle: entry.trackTitle,
             duration: entry.duration,
-            metadata: entry.metadataIsAvailable, rating: entry.rating
+            metadata: entry.metadataIsAvailable, rating: entry.rating,
+            cue: entry.cue, cueCheckPending: entry.cueCheckPending
         )
     }
 

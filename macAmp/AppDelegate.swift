@@ -3206,7 +3206,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let shouldReveal = !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry)
-        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title,
+                      range: entry.cue.map { AudioPlaybackRange(start: $0.start, end: $0.end) })
         playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
@@ -3228,7 +3229,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let shouldReveal = revealIfNotVisible && !playlistManager.isVisibleInEditor(entry, in: playlist)
         playlistManager.play(entry, in: playlist, revealIfNeeded: shouldReveal)
         prepareTrackNotification(for: entry)
-        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title)
+        playback.open(entry.url, bookmarkData: entry.bookmarkData, displayTitle: entry.title,
+                      range: entry.cue.map { AudioPlaybackRange(start: $0.start, end: $0.end) })
         playbackRatingEvent = PlaybackRatingEvent(playlistID: playlist.id, entryID: entry.id)
         observePlayingEntryTitle(entry)
         infoModel.showForPlayback(entry.url)
@@ -3362,7 +3364,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         standalonePlaybackURL = nil
         guard let playlist = playlistManager.activePlaylist,
               let entry = playlistManager.preferredEntryToPlay(in: playlist) else { return }
-        if playback.currentURL == entry.url {
+        if playback.currentURL == entry.url, playlistManager.playingEntryID == entry.id {
             observePlayingEntryTitle(entry)
             if !playback.isPlaying { playback.play() }
         } else {
@@ -3373,6 +3375,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func advancePlaylistAfterTrackFinished() {
         resetInfoTarget()
         guard let playlist = playlistManager.activePlaylist else { stopPlayback(); return }
+        if playback.repeatMode == .currentTrack {
+            if let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
+                playPlaylistEntry(current, in: playlist, automatic: true)
+            } else {
+                stopPlayback()
+            }
+            return
+        }
         if playback.shuffleMode != .off {
             if let next = playlistManager.shuffledEntry(for: playback.shuffleMode, step: 1) {
                 playPlaylistEntry(next.entry, in: next.playlist, automatic: true)
@@ -3388,19 +3398,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         switch playback.repeatMode {
-        case .currentTrack:
-            if let current = playlist.entries.first(where: { $0.id == playlistManager.playingEntryID && !$0.hasPlaybackError }) {
-                playPlaylistEntry(current, in: playlist, automatic: true)
-            } else {
-                stopPlayback()
-            }
         case .currentPlaylist:
             if let first = playlistManager.firstPlayableEntry(in: playlist) {
                 playPlaylistEntry(first, in: playlist, automatic: true)
             } else {
                 stopPlayback()
             }
-        case .off:
+        case .currentTrack, .off:
             stopPlayback()
         }
     }
@@ -6208,6 +6212,8 @@ private struct PlaylistView: View {
                 font: Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor))),
                 foregroundColor: playlistColor(isPlayingEntry ? colors.currentText : colors.normalText),
                 backgroundColor: playlistColor(isSelected ? colors.selectedBackground : colors.background),
+                cueTagTextColor: playlistColor(colors.background),
+                cueTagFont: Font(skin.resolvedFont(ofSize: CGFloat(5 * fontScale.factor))),
                 showsRating: ratingPreferences.showsStars,
                 ratingFont: Font(skin.resolvedFont(ofSize: CGFloat(8 * fontScale.factor)))
             )
@@ -6313,6 +6319,8 @@ private struct PlaylistEntryContent: View {
     let font: Font
     let foregroundColor: Color
     let backgroundColor: Color
+    let cueTagTextColor: Color
+    let cueTagFont: Font
     let showsRating: Bool
     let ratingFont: Font
 
@@ -6321,7 +6329,18 @@ private struct PlaylistEntryContent: View {
             ? entry.duration.map(Self.formattedTime) ?? "--:--"
             : "◉"
         HStack(alignment: .center, spacing: 3) {
-            Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
+            if entry.isCue {
+                Text(verbatim: "\(rowLabel).").fixedSize()
+                Text("CUE")
+                    .font(cueTagFont)
+                    .foregroundColor(cueTagTextColor)
+                    .padding(.horizontal, 1)
+                    .background(RoundedRectangle(cornerRadius: 1).fill(foregroundColor))
+                    .fixedSize()
+                Text(verbatim: entry.title).lineLimit(1)
+            } else {
+                Text(verbatim: "\(rowLabel). \(entry.title)").lineLimit(1)
+            }
             Spacer(minLength: 2)
             if showsRating, entry.rating > 0 {
                 Text(String(repeating: "★", count: TrackRating.stars(for: entry.rating)))
