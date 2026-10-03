@@ -2401,14 +2401,18 @@ final class PlaylistManager: ObservableObject {
 
         let cueTracks = work.url.isFileURL ? CueSheet.tracks(for: work.url) : nil
         let result: (duration: TimeInterval?, artist: String?, title: String?, rating: UInt8, available: Bool) = autoreleasepool {
+            let scoped = work.url.isFileURL && work.url.startAccessingSecurityScopedResource()
+            defer { if scoped { work.url.stopAccessingSecurityScopedResource() } }
+            // Every virtual track shares the backing file's POPM. Read once
+            // per expansion, even if loading the audio duration later fails.
+            let isCueRead = cueTracks != nil || work.cue != nil
+            let cueRating = isCueRead ? TrackRatingStore.read(url: work.url)?.rating ?? 0 : 0
             // A sheet has no final end offset. Load the backing file's duration
             // once during expansion, while titles and artists still come from CUE.
             let needsCueDuration = cueTracks != nil || ((work.cue != nil) && work.cue?.end == nil)
             if !needsCueDuration && ((work.cue != nil) || work.metadataIsAvailable) {
-                return (work.duration, work.artist, work.title, work.rating, true)
+                return (work.duration, work.artist, work.title, isCueRead ? cueRating : work.rating, true)
             }
-            let scoped = work.url.isFileURL && work.url.startAccessingSecurityScopedResource()
-            defer { if scoped { work.url.stopAccessingSecurityScopedResource() } }
             let asset = AVURLAsset(url: work.url)
             metadataAssetLock.lock()
             loadingMetadataAssets[work.entry.id] = asset
@@ -2430,12 +2434,12 @@ final class PlaylistManager: ObservableObject {
                 }
                 if metadataRequestWasCancelled(work.entry.id) { return (nil, nil, nil, 0, false) }
             }
-            guard didLoad else { return (nil, nil, nil, 0, false) }
+            guard didLoad else { return (nil, nil, nil, cueRating, false) }
             var error: NSError?
-            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, 0, false) }
+            guard asset.statusOfValue(forKey: "duration", error: &error) == .loaded else { return (nil, nil, nil, cueRating, false) }
             let duration = asset.duration.seconds
             if needsCueDuration {
-                return (duration.isFinite && duration > 0 ? duration : nil, nil, nil, 0, true)
+                return (duration.isFinite && duration > 0 ? duration : nil, nil, nil, cueRating, true)
             }
             let artist = asset.commonMetadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
             let title = asset.commonMetadata.first(where: { $0.commonKey?.rawValue == "title" })?.stringValue
@@ -2467,14 +2471,14 @@ final class PlaylistManager: ObservableObject {
                     // Refresh one virtual track without expanding it a second time.
                     if let track = cueTracks.first(where: { $0.segment.trackNumber == segment.trackNumber }) {
                         let previous = work.entry.duration
-                        applyCueTrack(track, to: work.entry, fileDuration: result.duration)
+                        applyCueTrack(track, to: work.entry, fileDuration: result.duration, rating: result.rating)
                         owner.replaceTotalDuration(previous, with: work.entry.duration)
                     }
                 } else if let index = owner.entries.firstIndex(where: { $0.id == work.entry.id }) {
                     let previous = work.entry.duration
                     let expanded = cueTracks.enumerated().map { offset, track in
                         let entry = offset == 0 ? work.entry : PlaylistEntry(url: work.entry.url, bookmarkData: work.entry.bookmarkData)
-                        applyCueTrack(track, to: entry, fileDuration: result.duration)
+                        applyCueTrack(track, to: entry, fileDuration: result.duration, rating: result.rating)
                         return entry
                     }
                     owner.entries.replaceSubrange(index...index, with: expanded)
@@ -2486,6 +2490,7 @@ final class PlaylistManager: ObservableObject {
                 }
             } else if let segment = work.entry.cue {
                 // Keep CUE labels even if the sidecar is temporarily unavailable.
+                work.entry.rating = result.rating
                 let previous = work.entry.duration
                 work.entry.cue = resolvedCueSegment(segment, fileDuration: result.duration)
                 work.entry.duration = work.entry.cue?.end.map { $0 - segment.start }
@@ -2554,14 +2559,14 @@ final class PlaylistManager: ObservableObject {
                           start: segment.start, end: fileDuration)
     }
 
-    private func applyCueTrack(_ track: CueTrack, to entry: PlaylistEntry, fileDuration: TimeInterval?) {
+    private func applyCueTrack(_ track: CueTrack, to entry: PlaylistEntry, fileDuration: TimeInterval?, rating: UInt8) {
         let segment = resolvedCueSegment(track.segment, fileDuration: fileDuration)
         entry.cue = segment
         entry.artist = track.artist
         entry.trackTitle = track.title
         entry.title = track.artist.map { "\($0) - \(track.title)" } ?? track.title
         entry.duration = segment.end.map { $0 - segment.start }
-        entry.rating = 0
+        entry.rating = rating
         entry.metadataIsAvailable = true
         entry.cueCheckPending = false
     }
