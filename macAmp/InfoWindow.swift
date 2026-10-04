@@ -413,7 +413,7 @@ final class InfoPanelView: NSView {
         super.draw(dirtyRect)
         let scale = pixelScale
         let logical = NSSize(width: max(125, Int((bounds.width / scale).rounded(.down))), height: max(58, Int((bounds.height / scale).rounded(.down))))
-        if let image = skin.genericWindowImage(width: Int(logical.width), height: Int(logical.height), isActive: focus.isKey) {
+        if let image = skin.genericWindowImage(width: Int(logical.width), height: Int(logical.height), isActive: focus.isKey, backgroundColor: skin.genericWindowColors().background) {
             NSGraphicsContext.current?.imageInterpolation = .none
             image.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
         }
@@ -466,7 +466,7 @@ final class InfoPanelView: NSView {
             let label = InfoWrappedTextView(
                 text: text,
                 font: skin.resolvedFont(ofSize: 8 * textScale),
-                color: skin.playlistColors().normalText,
+                color: skin.genericWindowColors().text,
                 alignment: alignment,
                 detectsLinks: detectsLinks
             )
@@ -519,7 +519,7 @@ final class InfoPanelView: NSView {
         // still be set through the context menu, but stars appear only when a
         // stored (including another player's) rating was actually read.
         if model.content.rating > 0 {
-            let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 12 * pixelScale), color: skin.playlistColors().normalText)
+            let rating = InfoRatingView(rating: model.content.rating, font: skin.resolvedFont(ofSize: 12 * pixelScale), color: skin.genericWindowColors().text)
             rating.menu = copyMenu
             rating.frame = NSRect(x: usesTwoColumnLayout ? rightColumnX : 0, y: y,
                                   width: usesTwoColumnLayout ? columnWidth : width,
@@ -531,7 +531,7 @@ final class InfoPanelView: NSView {
         let gap = 8 * pixelScale
         let tableColumnWidth = max(1, (columnWidth - gap) * 0.5)
         let tableFont = skin.resolvedFont(ofSize: 8 * textScale)
-        let tableColor = skin.playlistColors().normalText
+        let tableColor = skin.genericWindowColors().text
         for field in model.content.fields {
             let key = InfoWrappedTextView(text: field.label, font: tableFont, color: tableColor, alignment: .right)
             let value = InfoWrappedTextView(text: field.value, font: tableFont, color: tableColor, alignment: .left)
@@ -555,7 +555,7 @@ final class InfoPanelView: NSView {
                 let filenameView = InfoWrappedTextView(
                     text: filename,
                     font: skin.resolvedFont(ofSize: 8 * textScale),
-                    color: skin.playlistColors().normalText,
+                    color: skin.genericWindowColors().text,
                     alignment: .center,
                     onClick: {
                         NSWorkspace.shared.activateFileViewerSelecting([fileURL])

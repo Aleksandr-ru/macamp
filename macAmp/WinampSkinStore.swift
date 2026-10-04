@@ -204,6 +204,7 @@ final class WinampSkinStore: ObservableObject {
     private var textBackgroundColorCache: NSColor?
     private var textForegroundColorResolved = false
     private var playlistColorsCache: PlaylistColors?
+    private var genericWindowColorsCache: GenericWindowColors?
     private var resolvedFontCache: [String: NSFont] = [:]
     private var skinInformationCache: [String: SkinInformation] = [:]
     private var windowRegionCache: [String: WindowRegion] = [:]
@@ -1112,6 +1113,7 @@ final class WinampSkinStore: ObservableObject {
         textBackgroundColorCache = nil
         textForegroundColorResolved = false
         playlistColorsCache = nil
+        genericWindowColorsCache = nil
         windowRegionCache.removeAll()
         missingWindowRegions.removeAll()
     }
@@ -1190,7 +1192,7 @@ final class WinampSkinStore: ObservableObject {
     /// Exact generic-dialog compositor from Winamp's draw_embed.cpp.
     /// GEN.BMP has a 20 px title bar, tiled 29 px side rails, and a 38 px
     /// lower frame; none of these sprites is scaled with the content.
-    func genericWindowImage(width: Int, height: Int, isActive: Bool, title: String = "Info") -> NSImage? {
+    func genericWindowImage(width: Int, height: Int, isActive: Bool, title: String = "Info", backgroundColor: NSColor = .black) -> NSImage? {
         guard width >= 125, height >= 58,
               let sheet = bitmap(named: "GEN.BMP"),
               let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -1205,7 +1207,7 @@ final class WinampSkinStore: ObservableObject {
         let image = NSImage(size: NSSize(width: width, height: height))
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .none
-        NSColor.black.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
+        backgroundColor.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
 
         let stateY = isActive ? 0 : 21
         let titleImage = genericTitleGlyphImage(title, isActive: isActive)
@@ -1364,8 +1366,14 @@ final class WinampSkinStore: ObservableObject {
             }
             guard parts.count == 2 else { continue }
             let key = parts[0].lowercased()
-            let value = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "# "))
-            if let color = Self.colorIfValid(hex: value) { values[key] = color }
+            // Classic skins can append comments to a colour (Lightfield uses
+            // `#4B879F //Text`). Webamp reads the first six RGB digits; Winamp's
+            // strtol likewise stops at the trailing comment. Quotes are also
+            // permitted by Winamp's INI reader.
+            let value = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                .trimmingCharacters(in: .whitespaces)
+            let hex = value.hasPrefix("#") ? value.dropFirst() : value[...]
+            if let color = Self.colorIfValid(hex: String(hex.prefix(6))) { values[key] = color }
         }
         let colors = PlaylistColors(
             normalText: values["normal"] ?? defaults.normalText,
@@ -1374,6 +1382,34 @@ final class WinampSkinStore: ObservableObject {
             selectedBackground: values["selectedbg"] ?? defaults.selectedBackground
         )
         playlistColorsCache = colors
+        return colors
+    }
+
+    struct GenericWindowColors {
+        let background: NSColor
+        let text: NSColor
+    }
+
+    /// Winamp's wa_dlg.h stores dialog background/text at (52, 0)/(56, 0).
+    /// Resolve the pair once per skin, including the fallback for older skins.
+    func genericWindowColors() -> GenericWindowColors {
+        if let genericWindowColorsCache { return genericWindowColorsCache }
+        let playlist = playlistColors()
+        let fallback = GenericWindowColors(background: playlist.background, text: playlist.normalText)
+        guard let sheet = bitmap(named: "GENEX.BMP", fallbackToBundledSkin: false),
+              let source = sheet.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              source.width > 56, source.height > 0 else {
+            genericWindowColorsCache = fallback
+            return fallback
+        }
+        let bitmap = NSBitmapImageRep(cgImage: source)
+        guard let background = bitmap.colorAt(x: 52, y: 0),
+              let text = bitmap.colorAt(x: 56, y: 0) else {
+            genericWindowColorsCache = fallback
+            return fallback
+        }
+        let colors = GenericWindowColors(background: background, text: text)
+        genericWindowColorsCache = colors
         return colors
     }
 
