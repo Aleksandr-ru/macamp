@@ -442,10 +442,10 @@ private final class PlaylistWindowContext {
         shade.isEnabled = model.isWindowShaded
         if let frame = model.windowFrame {
             layout.width = max(275, model.unshadedWindowWidth ?? frame.width / interfaceScale)
-            layout.height = SkinWindowGeometry.snappedWindowHeight(
-                max(SkinWindowGeometry.fullWindowHeight,
-                    model.unshadedWindowHeight ?? frame.height / interfaceScale)
-            )
+            // A magnetized resize can end between grid steps. Restore that
+            // exact height so the saved origin also preserves the top edge.
+            layout.height = max(SkinWindowGeometry.fullWindowHeight,
+                                model.unshadedWindowHeight ?? frame.height / interfaceScale)
         }
     }
 }
@@ -1990,20 +1990,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         infoState.isVisible = state.infoVisible ?? false
         visualizationState.isVisible = state.visualizationVisible ?? false
         playlistLayout.width = max(275, CGFloat(state.playlistWidth))
-        playlistLayout.height = SkinWindowGeometry.snappedWindowHeight(
-            max(SkinWindowGeometry.fullWindowHeight, CGFloat(state.playlistHeight))
-        )
+        playlistLayout.height = max(SkinWindowGeometry.fullWindowHeight, CGFloat(state.playlistHeight))
         restoredMainOrigin = NSPoint(x: state.mainOriginX, y: state.mainOriginY)
         hasRestoredMainOrigin = true
         if let x = state.equalizerOriginX, let y = state.equalizerOriginY { restoredEqualizerOrigin = NSPoint(x: x, y: y) }
         if let x = state.playlistOriginX, let y = state.playlistOriginY { restoredPlaylistOrigin = NSPoint(x: x, y: y) }
         shouldRestoreInfoWindow = state.infoVisible ?? false
+        // Apply resize snapping only during a user gesture, never to saved
+        // geometry: magnetic alignment and backing pixels may be off-grid.
         if let width = state.infoWidth, let height = state.infoHeight {
             infoLogicalSize = NSSize(
                 width: max(250, CGFloat(width)),
-                height: SkinWindowGeometry.snappedWindowHeight(
-                    max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
-                )
+                height: max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
             )
         }
         if let x = state.infoOriginX, let y = state.infoOriginY { restoredInfoOrigin = NSPoint(x: x, y: y) }
@@ -2011,9 +2009,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let width = state.visualizationWidth, let height = state.visualizationHeight {
             visualizationLogicalSize = NSSize(
                 width: max(250, CGFloat(width)),
-                height: SkinWindowGeometry.snappedWindowHeight(
-                    max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
-                )
+                height: max(SkinWindowGeometry.fullWindowHeight, CGFloat(height))
             )
         }
         if let x = state.visualizationOriginX, let y = state.visualizationOriginY {
