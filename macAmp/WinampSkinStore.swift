@@ -655,7 +655,7 @@ final class WinampSkinStore: ObservableObject {
                                                             includingPropertiesForKeys: [.isSymbolicLinkKey],
                                                             options: [])
         for item in contents {
-            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
             guard isDirectChild(item.standardizedFileURL, of: skinRoot),
                   values.isSymbolicLink != true else {
                 throw SkinError.unsafePath
@@ -673,8 +673,24 @@ final class WinampSkinStore: ObservableObject {
             }
             let destination = staging.appendingPathComponent(item.lastPathComponent,
                                                               isDirectory: item.hasDirectoryPath).standardizedFileURL
-            guard isDirectChild(destination, of: normalizedStaging),
-                  !fileManager.fileExists(atPath: destination.path) else {
+            guard isDirectChild(destination, of: normalizedStaging) else {
+                throw SkinError.unsafePath
+            }
+            if fileManager.fileExists(atPath: destination.path) {
+                let destinationValues = try destination.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                // Some archives include a revised resource at the root as well
+                // as the original inside the wrapper (Denonium Remix/Eq_ex.bmp).
+                // Keep the root resource; the unused wrapped copy is removed
+                // with the verified wrapper after promotion completes.
+                guard values.isRegularFile == true,
+                      destinationValues.isRegularFile == true,
+                      destinationValues.isSymbolicLink != true,
+                      destination.resolvingSymlinksInPath().standardizedFileURL == destination else {
+                    throw SkinError.invalidArchive
+                }
+                continue
+            }
+            guard destination.resolvingSymlinksInPath().standardizedFileURL == destination else {
                 throw SkinError.invalidArchive
             }
             try fileManager.moveItem(at: item, to: destination)
