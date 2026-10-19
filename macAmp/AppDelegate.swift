@@ -706,6 +706,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static weak var shared: AppDelegate?
     var currentInterfaceScale: Double { interfaceScale.factor }
     var window: NSWindow!
+    private var isReadyToOpenFiles = false
+    private var pendingFileOpenRequests: [[URL]] = []
     private let interfaceScale = InterfaceScale()
     private let playlistFontScale = PlaylistFontScale()
     private let timeDisplayPreference = TimeDisplayPreference()
@@ -1022,6 +1024,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Write the current schema immediately, including on a first launch
         // after a persistence-format update.
         savePersistentState()
+
+        // AppKit can deliver openFiles before didFinishLaunching. Wait until
+        // windows, playback callbacks and restored state are ready, then reply
+        // to each request after processing it in arrival order.
+        isReadyToOpenFiles = true
+        let fileOpenRequests = pendingFileOpenRequests
+        pendingFileOpenRequests.removeAll()
+        for urls in fileOpenRequests {
+            let didOpen = handleOpenedFiles(urls)
+            NSApp.reply(toOpenOrPrint: didOpen ? .success : .failure)
+        }
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
@@ -2997,6 +3010,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         let urls = filenames.map(URL.init(fileURLWithPath:))
+        guard isReadyToOpenFiles else {
+            pendingFileOpenRequests.append(urls)
+            return
+        }
         let didOpen = handleOpenedFiles(urls)
         sender.reply(toOpenOrPrint: didOpen ? .success : .failure)
     }
