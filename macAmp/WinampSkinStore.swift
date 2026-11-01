@@ -635,104 +635,74 @@ final class WinampSkinStore: ObservableObject {
         return destination
     }
 
-    /// Winamp skin archives commonly contain one or more wrapper directories
-    /// (for example `SkinName/SkinName/MAIN.BMP`). The renderer consumes a
-    /// flat skin directory, so promote the directory containing MAIN.BMP to
-    /// the staging root before validation and activation.
+    /// Classic Winamp resolves resources by basename, including cursors stored
+    /// in subdirectories. Collect the tree before moving anything, then promote
+    /// regular files to the staging root. Keep root resources authoritative
+    /// for archives that ship revised sheets alongside a wrapped original.
     private func normalizeExtractedSkin(at staging: URL) throws {
-        guard let main = try findFileRecursively(named: "MAIN.BMP", in: staging) else {
-            throw SkinError.missingMainBitmap
-        }
-        let normalizedStaging = staging.standardizedFileURL
-        let skinRoot = main.deletingLastPathComponent().standardizedFileURL
-        guard skinRoot != normalizedStaging else { return }
-        guard isDescendant(skinRoot, of: normalizedStaging) else {
+        let fileManager = FileManager.default
+        let root = staging.standardizedFileURL
+        guard root.resolvingSymlinksInPath().standardizedFileURL.path == root.path else {
             throw SkinError.unsafePath
         }
 
-        let fileManager = FileManager.default
-        let contents = try fileManager.contentsOfDirectory(at: skinRoot,
-                                                            includingPropertiesForKeys: [.isSymbolicLinkKey],
-                                                            options: [])
-        for item in contents {
-            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
-            guard isDirectChild(item.standardizedFileURL, of: skinRoot),
-                  values.isSymbolicLink != true else {
-                throw SkinError.unsafePath
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        var directories = [root]
+        var directoryIndex = 0
+        var nestedFiles: [URL] = []
+        var rootItems: [String: URL] = [:]
+
+        // Walk only downwards, without recursion or following symbolic links.
+        // Finish validating the whole tree before changing its contents.
+        while directoryIndex < directories.count {
+            let directory = directories[directoryIndex]
+            directoryIndex += 1
+            let contents = try fileManager.contentsOfDirectory(at: directory,
+                                                               includingPropertiesForKeys: Array(keys),
+                                                               options: [])
+            for item in contents.sorted(by: { $0.path < $1.path }) {
+                let source = item.standardizedFileURL
+                let values = try source.resourceValues(forKeys: keys)
+                guard isDirectChild(source, of: directory),
+                      isDescendant(source, of: root),
+                      values.isSymbolicLink != true,
+                      source.resolvingSymlinksInPath().standardizedFileURL.path == source.path else {
+                    throw SkinError.unsafePath
+                }
+                if directory == root {
+                    rootItems[source.lastPathComponent.lowercased()] = source
+                }
+                if values.isDirectory == true {
+                    directories.append(source)
+                } else if values.isRegularFile == true {
+                    if directory != root { nestedFiles.append(source) }
+                } else {
+                    throw SkinError.unsafePath
+                }
             }
-            // Classic Winamp archives can contain an empty duplicate wrapper
-            // directory (for example Skin/Skin/) alongside the real assets.
-            // Winamp ignored directory entries and extracted only the files;
-            // do the same for empty directories so they cannot collide with
-            // the outer wrapper during promotion.
-            if values.isDirectory == true,
-               try fileManager.contentsOfDirectory(at: item,
-                                                    includingPropertiesForKeys: nil,
-                                                    options: []).isEmpty {
-                continue
-            }
-            let destination = staging.appendingPathComponent(item.lastPathComponent,
-                                                              isDirectory: item.hasDirectoryPath).standardizedFileURL
-            guard isDirectChild(destination, of: normalizedStaging) else {
-                throw SkinError.unsafePath
-            }
-            if fileManager.fileExists(atPath: destination.path) {
-                let destinationValues = try destination.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-                // Some archives include a revised resource at the root as well
-                // as the original inside the wrapper (Denonium Remix/Eq_ex.bmp).
-                // Keep the root resource; the unused wrapped copy is removed
-                // with the verified wrapper after promotion completes.
-                guard values.isRegularFile == true,
-                      destinationValues.isRegularFile == true,
-                      destinationValues.isSymbolicLink != true,
-                      destination.resolvingSymlinksInPath().standardizedFileURL == destination else {
+        }
+
+        for source in nestedFiles {
+            let filename = source.lastPathComponent
+            let key = filename.lowercased()
+            if let existing = rootItems[key] {
+                let values = try existing.resourceValues(forKeys: keys)
+                guard values.isRegularFile == true, values.isSymbolicLink != true else {
                     throw SkinError.invalidArchive
                 }
                 continue
             }
-            guard destination.resolvingSymlinksInPath().standardizedFileURL == destination else {
-                throw SkinError.invalidArchive
+            let destination = root.appendingPathComponent(filename, isDirectory: false).standardizedFileURL
+            guard isDirectChild(destination, of: root),
+                  destination.resolvingSymlinksInPath().standardizedFileURL.path == destination.path,
+                  !fileManager.fileExists(atPath: destination.path) else {
+                throw SkinError.unsafePath
             }
-            try fileManager.moveItem(at: item, to: destination)
+            try fileManager.moveItem(at: source, to: destination)
+            rootItems[key] = destination
         }
-
-        // Remove only the verified top-level wrapper. Never walk towards a
-        // parent path: a malformed archive must not turn cleanup into an
-        // operation outside this import's staging directory.
-        let stagingComponents = normalizedStaging.pathComponents
-        let skinRootComponents = skinRoot.pathComponents
-        guard skinRootComponents.count > stagingComponents.count else {
-            throw SkinError.unsafePath
-        }
-        let wrapper = normalizedStaging
-            .appendingPathComponent(skinRootComponents[stagingComponents.count], isDirectory: true)
-            .standardizedFileURL
-        guard isDirectChild(wrapper, of: normalizedStaging) else {
-            throw SkinError.unsafePath
-        }
-        if fileManager.fileExists(atPath: wrapper.path) {
-            try removeVerifiedDirectory(wrapper, directlyInside: normalizedStaging)
-        }
-    }
-
-    private func findFileRecursively(named filename: String, in directory: URL) throws -> URL? {
-        let contents = try FileManager.default.contentsOfDirectory(at: directory,
-                                                                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
-                                                                    options: [])
-        for item in contents.sorted(by: { $0.path < $1.path }) {
-            let values = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isSymbolicLink != true else { continue }
-            if values.isRegularFile == true,
-               item.lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame {
-                return item
-            }
-            if values.isDirectory == true {
-                if let match = try findFileRecursively(named: filename, in: item) {
-                    return match
-                }
-            }
-        }
-        return nil
+        // Retain wrapper directories instead of recursively deleting them.
+        // Resource lookup uses the root; empty wrappers have no rendering cost.
     }
 
     private func skinsRoot(create: Bool) throws -> URL {
