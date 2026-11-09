@@ -1313,6 +1313,12 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     /// cold launch can display the saved device while rendering through the
     /// system default that was active when the output node was recreated.
     private func resetAudioEnginePreservingOutputDevice() {
+        // A radio stream can announce a new PCM format while playing. Rebind
+        // the tap after reconnecting the graph instead of retaining its old
+        // format and letting the installed flag skip the new connection.
+        engine.mainMixerNode.removeTap(onBus: 0)
+        isLiveAnalysisTapInstalled = false
+        resetLiveAnalysisSamples()
         engine.reset()
         applyOutputDevice(outputDeviceManager.selectedDeviceID)
     }
@@ -1457,7 +1463,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             updateStreamingAnalysisTap()
             return
         }
-        let shouldInstall = (sourceFile != nil || decodedHTTPStream != nil) && needsLiveAnalysis
+        // The decoder exists while HTTP headers and the source format are
+        // still loading. Do not tap the previous graph during that interval.
+        let shouldInstall = (sourceFile != nil || decodedHTTPFormat != nil) && needsLiveAnalysis
         guard shouldInstall != isLiveAnalysisTapInstalled else { return }
         engine.mainMixerNode.removeTap(onBus: 0)
         isLiveAnalysisTapInstalled = false
@@ -1791,7 +1799,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.streamingPlayer = player
                 self.streamingAudioTrack = audioTrack
                 self.streamingMetadataOutput = metadataOutput
-                self.publishBitrate(bitrateKbps, for: url)
+                if let bitrateKbps { self.publishBitrate(bitrateKbps, for: url) }
                 self.scopedURL = url
                 self.hasSecurityScope = obtainedSecurityScope
                 self.updateLiveAnalysisTap()
@@ -1910,7 +1918,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.scheduledStartFrame = 0
                 self.sampleRateKHz = Int((format.sampleRate / 1_000).rounded())
                 self.channelCount = Int(format.channelCount)
-                self.publishBitrate(bitrate, for: url)
+                if let bitrate { self.publishBitrate(bitrate, for: url) }
                 self.sourceStatus = "BUFFERING"
                 self.title = self.preferredDisplayTitle
                 self.smoothedBandEnergy = Array(repeating: -60, count: 10)
@@ -2386,7 +2394,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             DispatchQueue.main.async {
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else { return }
-                self.publishBitrate(bitrate, for: url)
+                if let bitrate { self.publishBitrate(bitrate, for: url) }
                 if duration.isFinite, duration > 0 {
                     self.duration = self.relativeDuration(duration)
                 }

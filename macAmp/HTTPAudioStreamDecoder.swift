@@ -439,7 +439,9 @@ final class HTTPAudioStreamDecoder: NSObject, URLSessionDataDelegate {
     private func updateBitrate(_ bitrateKbps: Int) {
         guard bitrateKbps > 0, bitrateKbps != reportedBitrateKbps else { return }
         reportedBitrateKbps = bitrateKbps
-        guard hasReportedReady, bitrateKbps != deliveredBitrateKbps else { return }
+        // ICY headers are authoritative even before the first PCM buffer.
+        // Publish them now so a compatibility fallback can retain the rate.
+        guard bitrateKbps != deliveredBitrateKbps else { return }
         deliveredBitrateKbps = bitrateKbps
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isCancelled else { return }
