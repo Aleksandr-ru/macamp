@@ -108,15 +108,22 @@ final class InfoWindowModel: ObservableObject {
             }
         }
 
-        mutating func applyStreamBitrate(_ kbps: Int) {
-            guard kbps > 0 else { return }
+        mutating func applyStreamBitrate(_ kbps: Int?) {
+            bitrate = nil
+            technicalInfo.removeAll { $0.lowercased().hasSuffix("kbps") }
+            guard let kbps, kbps > 0 else { return }
             let value = String(kbps) + " kbps"
             bitrate = value
-            // A remote stream may initially be loaded by AVFoundation without
-            // an estimated rate. Replace any provisional rate once the HTTP
-            // stream reports its authoritative ICY/format bitrate.
-            technicalInfo.removeAll { $0.lowercased().hasSuffix("kbps") }
             technicalInfo.insert(value, at: 0)
+        }
+
+        mutating func applyStreamFormat(sampleRate: Double?, channels: Int) {
+            technicalInfo.removeAll {
+                $0.hasSuffix("kHz") || $0 == "Mono" || $0 == "Stereo" || $0.hasSuffix(" ch")
+            }
+            guard let sampleRate, sampleRate.isFinite, sampleRate > 0, channels > 0 else { return }
+            technicalInfo.append(String(format: "%g kHz", sampleRate / 1_000))
+            technicalInfo.append(channels == 1 ? "Mono" : channels == 2 ? "Stereo" : "\(channels) ch")
         }
     }
 
@@ -129,6 +136,7 @@ final class InfoWindowModel: ObservableObject {
     private var artworkCache: [URL: NSImage] = [:]
     private var streamMetadataByURL: [URL: String] = [:]
     private var streamBitrateByURL: [URL: Int] = [:]
+    private var streamFormatByURL: [URL: (sampleRate: Double, channels: Int)] = [:]
     private let queue = DispatchQueue(label: "ru.aleksandr.macAmp.info", qos: .utility)
 
     func show(_ url: URL?) { show(url, metadataDelay: 0) }
@@ -169,8 +177,13 @@ final class InfoWindowModel: ObservableObject {
         if let url, let streamBitrate = streamBitrateByURL[url] {
             initial.applyStreamBitrate(streamBitrate)
         }
+        if let url, let format = streamFormatByURL[url] {
+            initial.applyStreamFormat(sampleRate: format.sampleRate, channels: format.channels)
+        }
         content = initial
-        guard let url else { return }
+        // Radio metadata and format arrive from the actual playback decoder.
+        // A separate AVURLAsset would open the URL outside its proxy session.
+        guard let url, url.isFileURL else { return }
 
         let load = { [weak self] in self?.loadContent(for: url, token: token) }
         if metadataDelay > 0 {
@@ -217,16 +230,28 @@ final class InfoWindowModel: ObservableObject {
     }
 
     func updateStreamBitrate(_ kbps: Int?, for url: URL) {
-        guard let kbps, kbps > 0 else { return }
-        streamBitrateByURL[url] = kbps
+        streamBitrateByURL[url] = kbps.flatMap { $0 > 0 ? $0 : nil }
         guard content.url == url else { return }
         var updated = content
         updated.applyStreamBitrate(kbps)
         content = updated
     }
 
+    func updateStreamFormat(sampleRate: Double?, channels: Int, for url: URL) {
+        if let sampleRate, sampleRate.isFinite, sampleRate > 0, channels > 0 {
+            streamFormatByURL[url] = (sampleRate, channels)
+        } else {
+            streamFormatByURL.removeValue(forKey: url)
+        }
+        guard content.url == url else { return }
+        var updated = content
+        updated.applyStreamFormat(sampleRate: sampleRate, channels: channels)
+        content = updated
+    }
+
     private static func loadContent(for url: URL) -> Content {
         var result = Content(url: url)
+        guard url.isFileURL else { return result }
         let asset = AVURLAsset(url: url)
         let semaphore = DispatchSemaphore(value: 0)
         asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata", "duration"]) { semaphore.signal() }

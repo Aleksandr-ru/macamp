@@ -165,12 +165,9 @@ private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
     private static let maximumProbeBytes = 8 * 1024
 
     private let url: URL
+    private let configuration: URLSessionConfiguration
     private let completion: (Result<RemoteURLProbeResult, Error>) -> Void
     private lazy var session: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 15
-        configuration.timeoutIntervalForResource = 30
         return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
     private var task: URLSessionDataTask?
@@ -180,8 +177,9 @@ private final class RemoteURLProbe: NSObject, URLSessionDataDelegate {
     private var body = Data()
     private var isFinished = false
 
-    init(url: URL, completion: @escaping (Result<RemoteURLProbeResult, Error>) -> Void) {
+    init(url: URL, configuration: URLSessionConfiguration, completion: @escaping (Result<RemoteURLProbeResult, Error>) -> Void) {
         self.url = url
+        self.configuration = configuration
         self.responseURL = url
         self.completion = completion
         super.init()
@@ -1207,6 +1205,7 @@ final class PlaylistManager: ObservableObject {
         for entry: PlaylistEntry,
         isCancelled: () -> Bool
     ) -> (artist: String?, album: String?, trackNumber: Int?)? {
+        guard entry.url.isFileURL else { return (entry.artist, nil, nil) }
         let asset = AVURLAsset(url: entry.url)
         let semaphore = DispatchSemaphore(value: 0)
         asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata"]) {
@@ -1458,6 +1457,7 @@ final class PlaylistManager: ObservableObject {
     func addURL(
         _ rawValue: String,
         to playlist: PlaylistModel,
+        proxy: NetworkProxySnapshot,
         completion: @escaping (Result<Int, Error>) -> Void
     ) {
         guard playlists.contains(where: { $0.id == playlist.id }) else { return }
@@ -1476,6 +1476,16 @@ final class PlaylistManager: ObservableObject {
             return
         }
 
+        let configuration: URLSessionConfiguration
+        do {
+            configuration = try proxy.sessionConfiguration()
+            configuration.timeoutIntervalForRequest = 15
+            configuration.timeoutIntervalForResource = 30
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
         playlist.scannerState = .adding(playlist.entries.count)
         workers(for: playlist).loadingOperations += 1
         let token = UUID()
@@ -1486,7 +1496,7 @@ final class PlaylistManager: ObservableObject {
         // support for ordinary remote stream URLs.
         let fileQueue = workers(for: playlist).files
         let sourceURL = Self.playlistGeneratorSourceURL(from: url) ?? url
-        let probe = RemoteURLProbe(url: sourceURL) { [weak self, weak playlist] result in
+        let probe = RemoteURLProbe(url: sourceURL, configuration: configuration) { [weak self, weak playlist] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
@@ -2423,6 +2433,11 @@ final class PlaylistManager: ObservableObject {
 
         let cueTracks = work.url.isFileURL ? CueSheet.tracks(for: work.url) : nil
         let result: (duration: TimeInterval?, artist: String?, title: String?, rating: UInt8, available: Bool) = autoreleasepool {
+            // Radio titles and parameters come from its configured decoder.
+            // Never let background metadata scanning open a second HTTP path.
+            guard work.url.isFileURL else {
+                return (work.duration, work.artist, work.title, work.rating, true)
+            }
             let scoped = work.url.isFileURL && work.url.startAccessingSecurityScopedResource()
             defer { if scoped { work.url.stopAccessingSecurityScopedResource() } }
             // Every virtual track shares the backing file's POPM. Read once

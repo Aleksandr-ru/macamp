@@ -910,6 +910,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playback.onBitrateUpdated = { [weak self] url, bitrate in
             self?.infoModel.updateStreamBitrate(bitrate, for: url)
         }
+        playback.onStreamFormatUpdated = { [weak self] url, sampleRate, channels in
+            self?.infoModel.updateStreamFormat(sampleRate: sampleRate, channels: channels, for: url)
+        }
         playback.onPlaybackReady = { [weak self] url in
             guard let self else { return }
             self.playlistManager.clearPlaybackErrorForActiveEntry(url: url)
@@ -3483,7 +3486,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        playlistManager.addURL(field.stringValue, to: playlist) { [weak self, weak playlist] result in
+        playlistManager.addURL(field.stringValue, to: playlist, proxy: playback.networkPreferences.snapshot) { [weak self, weak playlist] result in
             guard let self, let playlist else { return }
             switch result {
             case .success:

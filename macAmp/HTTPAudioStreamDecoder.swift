@@ -38,7 +38,7 @@ enum NetworkProxyError: LocalizedError {
     }
 }
 
-struct NetworkProxySnapshot {
+struct NetworkProxySnapshot: Equatable {
     let mode: NetworkProxyMode
     let customAddress: String
 

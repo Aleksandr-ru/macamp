@@ -186,16 +186,6 @@ private enum TagEditorArtworkChange {
     case replace(Data)
 }
 
-private extension TagEditorArtworkChange {
-    var logName: String {
-        switch self {
-        case .unchanged: return "unchanged"
-        case .remove: return "remove"
-        case .replace: return "replace"
-        }
-    }
-}
-
 enum TagEditorError: LocalizedError {
     case invalidFile
     case unsupportedFormat(String)
@@ -242,7 +232,6 @@ final class TagEditorModel: ObservableObject {
 
     func load(_ url: URL, bookmarkData: Data? = nil) {
         let accessibleURL = Self.resolve(url, bookmarkData: bookmarkData)
-        tagEditorLogger.debug("Loading metadata from \(accessibleURL.path, privacy: .public); bookmark=\(bookmarkData != nil)")
         let token = UUID()
         generation = token
         currentURL = accessibleURL
@@ -259,7 +248,6 @@ final class TagEditorModel: ObservableObject {
         queue.async { [weak self] in
             let beganScope = accessibleURL.startAccessingSecurityScopedResource()
             let loaded = Self.read(accessibleURL)
-            tagEditorLogger.debug("Loaded metadata from \(accessibleURL.path, privacy: .public); securityScope=\(beganScope); writable=\(loaded.canWrite)")
             if beganScope { accessibleURL.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
@@ -301,16 +289,13 @@ final class TagEditorModel: ObservableObject {
         errorMessage = nil
         queue.async { [weak self] in
             let beganScope = url.startAccessingSecurityScopedResource()
-            tagEditorLogger.debug("Saving metadata to \(url.path, privacy: .public); securityScope=\(beganScope); tagEnabled=\(tagEnabled); artwork=\(artworkChange.logName)")
             let result: Result<Void, Error>
             do {
                 try AudioTagWriter.write(fields, artwork: artworkChange, tagEnabled: tagEnabled, to: url)
                 result = .success(())
-                tagEditorLogger.debug("Metadata saved to \(url.path, privacy: .public)")
             } catch {
                 result = .failure(error)
                 logTagEditorFailure("Metadata save", url: url, error: error)
-                tagEditorLogger.error("Metadata save securityScope=\(beganScope)")
             }
             if beganScope { url.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
@@ -587,7 +572,6 @@ final class TagEditorModel: ObservableObject {
         do {
             let handle = try FileHandle(forUpdating: url)
             try handle.close()
-            tagEditorLogger.debug("Write preflight passed; path=\(url.path, privacy: .public)")
         } catch {
             logTagEditorFailure("Write preflight", url: url, error: error)
             values.canWrite = false
@@ -1061,7 +1045,6 @@ final class TagEditorModel: ObservableObject {
 private enum AudioTagWriter {
     static func write(_ fields: TagEditorFields, artwork: TagEditorArtworkChange, tagEnabled: Bool, to url: URL) throws {
         guard isSafeRegularFile(url) else { throw TagEditorError.invalidFile }
-        tagEditorLogger.debug("Writing \(url.pathExtension.lowercased(), privacy: .public) metadata; path=\(url.path, privacy: .public); tagEnabled=\(tagEnabled)")
         switch url.pathExtension.lowercased() {
         case "mp3", "aac":
             if tagEnabled {
@@ -1346,7 +1329,6 @@ private enum AudioTagWriter {
     }
 
     private static func writeM4A(_ fields: TagEditorFields, tagEnabled: Bool, to url: URL) throws {
-        tagEditorLogger.debug("Preparing M4A export; path=\(url.path, privacy: .public)")
         let asset = AVURLAsset(url: url)
         let semaphore = DispatchSemaphore(value: 0)
         asset.loadValuesAsynchronously(forKeys: ["metadata"]) { semaphore.signal() }
@@ -1363,7 +1345,6 @@ private enum AudioTagWriter {
 
         let temporaryURL = try makeTemporaryFile(for: url, suffix: "m4a")
         removeTemporary(temporaryURL, for: url)
-        tagEditorLogger.debug("M4A export output: \(temporaryURL.path, privacy: .public)")
         exporter.outputURL = temporaryURL
         exporter.outputFileType = .m4a
         exporter.shouldOptimizeForNetworkUse = false
@@ -1494,7 +1475,6 @@ private enum AudioTagWriter {
             throw TagEditorError.exportFailed("The metadata tag is too large.")
         }
         let newFileLength = newTagSize + preservedLength
-        tagEditorLogger.debug("MP3 update preflight; path=\(url.path, privacy: .public); writable=\(FileManager.default.isWritableFile(atPath: url.path)); oldSize=\(fileLength); newSize=\(newFileLength)")
         let handle: FileHandle
         do {
             handle = try FileHandle(forUpdating: url)
@@ -1586,8 +1566,6 @@ private enum AudioTagWriter {
             throw TagEditorError.fileWriteFailed("The source or destination file is unavailable.")
         }
 
-        tagEditorLogger.debug("Overwriting existing file contents; original=\(original.path, privacy: .public); temporary=\(temporary.path, privacy: .public)")
-
         let source: FileHandle
         do {
             source = try FileHandle(forReadingFrom: temporary)
@@ -1605,7 +1583,6 @@ private enum AudioTagWriter {
             logTagEditorFailure("Inspecting M4A export", url: temporary, error: error)
             throw TagEditorError.fileWriteFailed(error.localizedDescription)
         }
-        tagEditorLogger.debug("M4A export size=\(sourceLength) bytes")
 
         let destination: FileHandle
         do {
@@ -1628,7 +1605,6 @@ private enum AudioTagWriter {
             logTagEditorFailure("Writing M4A contents", url: original, error: error)
             throw TagEditorError.fileWriteFailed(error.localizedDescription)
         }
-        tagEditorLogger.debug("M4A contents written successfully; path=\(original.path, privacy: .public); size=\(sourceLength) bytes")
     }
 
     private static func removeTemporary(_ temporary: URL, for original: URL) {

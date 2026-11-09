@@ -4,6 +4,7 @@ import Combine
 import Accelerate
 import CoreAudio
 import AudioToolbox
+import os
 
 /// A title-bar drag has a much stricter latency budget than normal playback.
 /// Timers use this main-thread gate to defer cosmetic updates until mouse-up.
@@ -756,6 +757,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     var onPlaybackReady: ((URL) -> Void)?
     var onStreamMetadata: ((URL, String) -> Void)?
     var onBitrateUpdated: ((URL, Int?) -> Void)?
+    var onStreamFormatUpdated: ((URL, Double?, Int) -> Void)?
     @Published private(set) var title = "MACAMP — READY"
     @Published private(set) var isPlaying = false
     @Published private(set) var isPaused = false
@@ -843,6 +845,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     private var decodedHTTPStream: HTTPAudioStreamDecoder?
     private var decodedHTTPFormat: AVAudioFormat?
     private var decodedHasStarted = false
+    private var httpPlaybackURL: URL?
+    private var openedHTTPProxy: NetworkProxySnapshot?
+    private let networkLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "network-playback")
     /// Once a volume has demonstrated that AVAudioFile indexing is slow, do
     /// not repeat that speculative open for every following track from it.
     private var streamingPreferredVolumeRoots = Set<String>()
@@ -990,6 +995,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     func togglePlayback() { isPlaying ? pause() : play() }
 
     func play() {
+        // A paused URLSession retains the configuration from its creation.
+        // Reopen it if the user changed the proxy before pressing Play.
+        if let url = httpPlaybackURL,
+           openedHTTPProxy != networkPreferences.snapshot || decodedHTTPStream == nil {
+            open(url, displayTitle: preferredDisplayTitle)
+            return
+        }
         if let decodedHTTPStream {
             decodedHTTPStream.resume()
             if decodedHasStarted {
@@ -1614,6 +1626,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         }
         fileOpenGeneration &+= 1
         let generation = fileOpenGeneration
+        httpPlaybackURL = nil
+        openedHTTPProxy = nil
         stopDecodedHTTPPlayback()
         stopStreamingPlayback()
         // Commit the track switch before touching the new URL. Apart from
@@ -1637,6 +1651,16 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         pendingSeekPosition = nil
         scheduledStartFrame = 0
         bitrateKbps = nil
+        sampleRateKHz = nil
+        channelCount = 0
+        visualization.spectrumFrame = .empty
+        visualization.milkDropSpectrumLevels = Array(repeating: 0, count: 16)
+        visualization.waveformSamples = Array(repeating: 0, count: 76)
+        resetSpectrumAnimation()
+        if isHTTPURL(url) {
+            publishBitrate(nil, for: url)
+            onStreamFormatUpdated?(url, nil, 0)
+        }
         if let playbackRange {
             guard playbackRange.start.isFinite, playbackRange.start >= 0,
                   playbackRange.end.map({ $0.isFinite && $0 > playbackRange.start }) ?? true else {
@@ -1765,6 +1789,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
     }
 
     private func startStreamingFallback(for url: URL, generation: Int) {
+        // AVPlayer does not use our URLSession proxy configuration. Keep this
+        // fallback for files; HTTP audio, metadata and analyzer PCM must all
+        // originate from the same explicitly configured decoder connection.
+        guard !isHTTPURL(url) else {
+            reportPlaybackError(for: url, title: "UNSUPPORTED URL FORMAT")
+            return
+        }
         guard generation == fileOpenGeneration, sourceFile == nil,
               streamingPlayer == nil, streamingOpenGeneration == nil else { return }
         streamingPreferredVolumeRoots.insert(streamingVolumeRoot(for: url))
@@ -1847,13 +1878,14 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                         self.position = 0
                         self.title = self.preferredDisplayTitle
                         self.sourceStatus = ""
-                        self.loadStreamingBitrate(for: url, generation: generation)
                         // Remote assets frequently expose no tracks while the
                         // AVPlayerItem is being constructed. Resolve the item
                         // track after it becomes ready, then attach the tap.
                         self.streamingAudioTrack = item.tracks
                             .compactMap(\.assetTrack)
                             .first(where: { $0.mediaType == .audio }) ?? self.streamingAudioTrack
+                        self.loadStreamingFormatDetails(asset: item.asset, track: self.streamingAudioTrack,
+                                                        for: url, generation: generation)
                         self.updateStreamingAnalysisTap()
                         let beginPlayback: (Bool) -> Void = { [weak self, weak player] finished in
                             DispatchQueue.main.async {
@@ -1891,9 +1923,12 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
 
     private func startDecodedHTTPStream(for url: URL, generation: Int) {
         guard generation == fileOpenGeneration, decodedHTTPStream == nil else { return }
+        let proxy = networkPreferences.snapshot
+        httpPlaybackURL = url
+        openedHTTPProxy = proxy
         guard let decoder = try? HTTPAudioStreamDecoder(
             url: url,
-            proxy: networkPreferences.snapshot
+            proxy: proxy
         ) else {
             reportPlaybackError(for: url, title: "INVALID PROXY")
             return
@@ -1918,6 +1953,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.scheduledStartFrame = 0
                 self.sampleRateKHz = Int((format.sampleRate / 1_000).rounded())
                 self.channelCount = Int(format.channelCount)
+                self.onStreamFormatUpdated?(url, format.sampleRate, self.channelCount)
                 if let bitrate { self.publishBitrate(bitrate, for: url) }
                 self.sourceStatus = "BUFFERING"
                 self.title = self.preferredDisplayTitle
@@ -1926,7 +1962,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 self.updateLiveAnalysisTap()
                 self.requestSpectrumFromNextPCMBuffer()
             } catch {
-                self.failDecodedHTTPStream(url: url, generation: generation)
+                self.failDecodedHTTPStream(url: url, generation: generation, error: error)
             }
         }
         decoder.onBitrate = { [weak self, weak decoder] bitrate in
@@ -1969,24 +2005,23 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
             guard let self, let decoder, self.decodedHTTPStream === decoder else { return }
             self.onStreamMetadata?(url, title)
         }
-        decoder.onFailure = { [weak self, weak decoder] _ in
+        decoder.onFailure = { [weak self, weak decoder] error in
             guard let self, let decoder, self.decodedHTTPStream === decoder,
                   self.fileOpenGeneration == generation else { return }
-            self.failDecodedHTTPStream(url: url, generation: generation)
+            self.failDecodedHTTPStream(url: url, generation: generation, error: error)
         }
         decoder.start()
     }
 
-    private func failDecodedHTTPStream(url: URL, generation: Int) {
-        let hadStarted = decodedHasStarted
+    private func failDecodedHTTPStream(url: URL, generation: Int, error: Error? = nil) {
+        guard generation == fileOpenGeneration else { return }
+        let mode = openedHTTPProxy?.mode.rawValue ?? "unknown"
+        let failure = error.map { String(describing: $0) } ?? "Audio engine could not start playback"
+        networkLogger.error("HTTP audio failed; generation=\(generation); proxy mode=\(mode, privacy: .public); error=\(failure, privacy: .private)")
         stopDecodedHTTPPlayback()
-        if hadStarted {
-            reportPlaybackError(for: url, title: "SOURCE UNAVAILABLE")
-        } else {
-            // Formats outside the incremental MP3/AAC path (for example HLS)
-            // retain AVPlayer as a playback-only compatibility fallback.
-            startStreamingFallback(for: url, generation: generation)
-        }
+        isPlaying = false
+        isPaused = false
+        reportPlaybackError(for: url, title: "SOURCE UNAVAILABLE")
     }
 
     private func stopDecodedHTTPPlayback() {
@@ -2369,18 +2404,16 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         }
     }
 
-    /// Match the Info window's asset-loading sequence. An AVPlayerItem being
-    /// ready does not guarantee its shared asset has populated a network
-    /// track's estimated data rate yet.
-    private func loadStreamingBitrate(for url: URL, generation: Int) {
+    /// Reuse the ready player's asset and track. Creating another URL asset
+    /// here would introduce an independent network request for HTTP sources.
+    private func loadStreamingFormatDetails(asset: AVAsset, track: AVAssetTrack?, for url: URL, generation: Int) {
         formatDetailsQueue.async { [weak self] in
-            let asset = AVURLAsset(url: url)
-            let semaphore = DispatchSemaphore(value: 0)
-            asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata", "duration"]) {
-                semaphore.signal()
-            }
-            guard semaphore.wait(timeout: .now() + 10) == .success else { return }
-            let rate = asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 0
+            let audioTrack = track ?? asset.tracks(withMediaType: .audio).first
+            let descriptions = audioTrack?.formatDescriptions as? [CMAudioFormatDescription] ?? []
+            let format = descriptions.lazy.compactMap {
+                CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee
+            }.first(where: { $0.mSampleRate.isFinite && $0.mSampleRate > 0 && $0.mChannelsPerFrame > 0 })
+            let rate = audioTrack?.estimatedDataRate ?? 0
             let duration = asset.duration.seconds
             let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
             let bitrate: Int?
@@ -2395,6 +2428,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 guard let self, self.fileOpenGeneration == generation,
                       self.streamingOpenGeneration == generation else { return }
                 if let bitrate { self.publishBitrate(bitrate, for: url) }
+                if let format {
+                    self.sampleRateKHz = Int((format.mSampleRate / 1_000).rounded())
+                    self.channelCount = Int(format.mChannelsPerFrame)
+                }
                 if duration.isFinite, duration > 0 {
                     self.duration = self.relativeDuration(duration)
                 }
@@ -2413,6 +2450,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
         let needsVisualAnalysis = needsClassicVisualization || milkDropVisualizationEnabled
         guard needsVisualAnalysis || needsAdaptiveAnalysis else { return }
         isSpectrumAnalysisScheduled = true
+        let generation = fileOpenGeneration
         if needsAdaptiveAnalysis { lastAdaptiveAnalysis = now }
         let analysisSize = needsAdaptiveAnalysis ? fftSize : visualFFTSize
         spectrumQueue.async { [weak self] in
@@ -2475,7 +2513,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPlayerItemMetadata
                 // A frame can finish after Stop or after the visualizer was
                 // hidden.  Do not let that stale asynchronous result repaint
                 // the cleared analyzer state.
-                guard !self.isVisualUpdatesSuspended,
+                guard self.fileOpenGeneration == generation,
+                      !self.isVisualUpdatesSuspended,
                       self.isPlaying,
                       self.needsLiveAnalysis else { return }
                 if needsClassicVisualization, let dynamics {
