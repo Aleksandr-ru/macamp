@@ -15,15 +15,6 @@ import MediaPlayer
 import QuartzCore
 import os
 
-// LaunchServices accepts a null handler to clear an explicit default. The
-// SDK's Swift import currently marks this C parameter nonnull.
-@_silgen_name("LSSetDefaultRoleHandlerForContentType")
-private func setDefaultRoleHandler(
-    _ contentType: CFString,
-    _ role: LSRolesMask,
-    _ handler: CFString?
-) -> OSStatus
-
 /// AppKit has no built-in equivalents of the classic move and diagonal resize
 /// cursors on all supported macOS versions. Render those shapes consistently
 /// for every skin window that does not provide its own cursor.
@@ -551,15 +542,40 @@ private final class StatusBarPreferences: ObservableObject {
     }
 }
 
-/// Keeps Finder's default-app choice separate for every file extension. The
+/// Finder's default-app choice belongs to a content type, which can cover
+/// several extensions (for example M3U and M3U8). The
 /// document declarations in Info.plist make macAmp appear in Finder's “Open
 /// With” menu regardless of this preference; this object changes only the
 /// default handler selected by the checkboxes in Settings.
 private final class FileAssociationPreferences: ObservableObject {
+    struct Association: Identifiable {
+        let id: String
+        var extensions: [String]
+        var title: String { extensions.map { ".\($0)" }.joined(separator: " / ") }
+    }
+
     struct Group: Identifiable {
         let id: String
         let title: String
         let extensions: [String]
+        let associations: [Association]
+
+        init(id: String, title: String, extensions: [String]) {
+            self.id = id
+            self.title = title
+            self.extensions = extensions
+            var associations: [Association] = []
+            for fileExtension in extensions {
+                let identifier = UTType(filenameExtension: fileExtension)?.identifier
+                    ?? "ru.aleksandr.macAmp.file.\(fileExtension)"
+                if let index = associations.firstIndex(where: { $0.id == identifier }) {
+                    associations[index].extensions.append(fileExtension)
+                } else {
+                    associations.append(Association(id: identifier, extensions: [fileExtension]))
+                }
+            }
+            self.associations = associations
+        }
     }
 
     static let groups: [Group] = [
@@ -567,6 +583,11 @@ private final class FileAssociationPreferences: ObservableObject {
         Group(id: "playlists", title: "Playlists", extensions: ["m3u", "m3u8", "pls"]),
         Group(id: "other", title: "Other", extensions: ["wsz", "eqf", "q1"])
     ]
+    private static let associationsByExtension = Dictionary(uniqueKeysWithValues:
+        groups.flatMap(\.associations).flatMap { association in
+            association.extensions.map { ($0, association) }
+        }
+    )
 
     private enum Key {
         static let previousHandlerPrefix = "macAmp.fileAssociation.previousHandler."
@@ -574,6 +595,8 @@ private final class FileAssociationPreferences: ObservableObject {
 
     @Published private(set) var changeRevision = 0
     @Published private(set) var statusMessage: String?
+    @Published private(set) var pendingContentTypes = Set<String>()
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ru.aleksandr.macAmp", category: "file-associations")
 
     func isAssociated(_ fileExtension: String) -> Bool {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier,
@@ -585,64 +608,67 @@ private final class FileAssociationPreferences: ObservableObject {
 
     func setAssociated(_ shouldAssociate: Bool, fileExtension: String) {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
-        let key = Key.previousHandlerPrefix + fileExtension
-
-        if shouldAssociate {
-            if UserDefaults.standard.object(forKey: key) == nil,
-               let currentHandler = defaultHandler(for: fileExtension),
-               currentHandler != bundleIdentifier {
-                UserDefaults.standard.set(currentHandler, forKey: key)
-            }
-
-            if #available(macOS 12.0, *),
-               let contentType = UTType(filenameExtension: fileExtension) {
-                // NSWorkspace is the current user-consent-aware API. Unlike
-                // the deprecated LaunchServices call, it can present macOS's
-                // confirmation when changing a protected association.
-                NSWorkspace.shared.setDefaultApplication(
-                    at: Bundle.main.bundleURL,
-                    toOpen: contentType
-                ) { [weak self] error in
-                    DispatchQueue.main.async {
-                        guard let self else { return }
-                        if let error {
-                            self.statusMessage = "macOS could not update .\(fileExtension): \(error.localizedDescription)"
-                        } else {
-                            self.statusMessage = nil
-                        }
-                        self.changeRevision &+= 1
-                    }
-                }
-                return
-            }
-        }
-
-        let handlerToRestore = shouldAssociate
-            ? bundleIdentifier
-            : UserDefaults.standard.string(forKey: key)
-        // The C API accepts a null handler to restore LaunchServices' normal
-        // resolution. Swift imports that parameter as non-optional, so retain
-        // the native ABI here rather than substituting an unrelated app.
-        let status = setDefaultRoleHandler(
-            contentTypeIdentifier(for: fileExtension) as CFString,
-            .all,
-            handlerToRestore as CFString?
-        )
-        guard status == noErr else {
-            statusMessage = "macOS could not update .\(fileExtension) (LaunchServices error \(status))."
+        let identifier = contentTypeIdentifier(for: fileExtension)
+        guard !pendingContentTypes.contains(identifier),
+              isAssociated(fileExtension) != shouldAssociate else { return }
+        let aliases = Self.associationsByExtension[fileExtension]?.extensions ?? [fileExtension]
+        let key = Key.previousHandlerPrefix + identifier
+        let legacyKeys = aliases.map { Key.previousHandlerPrefix + $0 }
+        // Older versions saved the previous app under just the clicked
+        // extension. Read every alias so an M3U choice can be undone via M3U8.
+        let previousHandler = ([key] + legacyKeys).compactMap {
+            UserDefaults.standard.string(forKey: $0)
+        }.first(where: { $0 != bundleIdentifier })
+        let handlerToRestore = shouldAssociate ? bundleIdentifier : previousHandler
+        guard let handlerToRestore else {
+            statusMessage = "Choose another default application for \(aliases.map { ".\($0)" }.joined(separator: " / ")) in Finder’s Get Info window."
             changeRevision &+= 1
             return
         }
-
-        if !shouldAssociate {
-            UserDefaults.standard.removeObject(forKey: key)
+        let currentHandler = defaultHandler(for: fileExtension)
+        let finish: (Error?) -> Void = { [weak self] error in
+            guard let self else { return }
+            self.pendingContentTypes.remove(identifier)
+            if let error {
+                let nsError = error as NSError
+                self.statusMessage = "macOS could not update .\(fileExtension): \(error.localizedDescription)"
+                self.logger.error("File association failed; type=\(identifier, privacy: .public); extension=\(fileExtension, privacy: .public); handler=\(handlerToRestore, privacy: .public); error=\(nsError.domain, privacy: .public)/\(nsError.code); description=\(nsError.localizedDescription, privacy: .public)")
+            } else {
+                if shouldAssociate, let currentHandler, currentHandler != bundleIdentifier {
+                    UserDefaults.standard.set(currentHandler, forKey: key)
+                } else if !shouldAssociate {
+                    ([key] + legacyKeys).forEach { UserDefaults.standard.removeObject(forKey: $0) }
+                }
+                self.statusMessage = nil
+            }
+            self.changeRevision &+= 1
         }
-        statusMessage = nil
-        changeRevision &+= 1
+        pendingContentTypes.insert(identifier)
+        if #available(macOS 12.0, *), let contentType = UTType(identifier) {
+            let applicationURL = shouldAssociate
+                ? Bundle.main.bundleURL
+                : NSWorkspace.shared.urlForApplication(withBundleIdentifier: handlerToRestore)
+            guard let applicationURL else {
+                finish(NSError(domain: NSOSStatusErrorDomain, code: Int(kLSApplicationNotFoundErr)))
+                return
+            }
+            // Use the consent-aware API both to select macAmp and to restore
+            // the previous app. Never pass a null handler to LaunchServices.
+            NSWorkspace.shared.setDefaultApplication(at: applicationURL, toOpen: contentType) { error in
+                DispatchQueue.main.async { finish(error) }
+            }
+            return
+        }
+        let status = LSSetDefaultRoleHandlerForContentType(identifier as CFString, .all, handlerToRestore as CFString)
+        finish(status == noErr ? nil : NSError(domain: NSOSStatusErrorDomain, code: Int(status)))
     }
 
     func setAssociated(_ shouldAssociate: Bool, in group: Group) {
-        group.extensions.forEach { setAssociated(shouldAssociate, fileExtension: $0) }
+        group.associations.forEach { association in
+            if let fileExtension = association.extensions.first {
+                setAssociated(shouldAssociate, fileExtension: fileExtension)
+            }
+        }
     }
 
     private func defaultHandler(for fileExtension: String) -> String? {
@@ -653,7 +679,8 @@ private final class FileAssociationPreferences: ObservableObject {
     }
 
     private func contentTypeIdentifier(for fileExtension: String) -> String {
-        UTType(filenameExtension: fileExtension)?.identifier
+        Self.associationsByExtension[fileExtension]?.id
+            ?? UTType(filenameExtension: fileExtension)?.identifier
             ?? "ru.aleksandr.macAmp.file.\(fileExtension)"
     }
 }
@@ -5492,14 +5519,17 @@ private struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         LazyVGrid(
                             columns: Array(
-                                repeating: GridItem(.flexible(minimum: 74, maximum: 96), spacing: 8),
+                                repeating: GridItem(.flexible(minimum: 100), spacing: 8),
                                 count: 4
                             ),
                             alignment: .leading,
                             spacing: 6
                         ) {
-                            ForEach(group.extensions, id: \.self) { fileExtension in
-                                Toggle(".\(fileExtension)", isOn: fileAssociationBinding(for: fileExtension))
+                            ForEach(group.associations) { association in
+                                if let fileExtension = association.extensions.first {
+                                    Toggle(association.title, isOn: fileAssociationBinding(for: fileExtension))
+                                        .disabled(fileAssociationPreferences.pendingContentTypes.contains(association.id))
+                                }
                             }
                         }
 
