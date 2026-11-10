@@ -551,7 +551,6 @@ private final class FileAssociationPreferences: ObservableObject {
     struct Association: Identifiable {
         let id: String
         var extensions: [String]
-        var title: String { extensions.map { ".\($0)" }.joined(separator: " / ") }
     }
 
     struct Group: Identifiable {
@@ -604,6 +603,10 @@ private final class FileAssociationPreferences: ObservableObject {
             return false
         }
         return handler == bundleIdentifier
+    }
+
+    func isUpdating(_ fileExtension: String) -> Bool {
+        pendingContentTypes.contains(contentTypeIdentifier(for: fileExtension))
     }
 
     func setAssociated(_ shouldAssociate: Bool, fileExtension: String) {
@@ -5522,17 +5525,15 @@ private struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         LazyVGrid(
                             columns: Array(
-                                repeating: GridItem(.flexible(minimum: 100), spacing: 8),
+                                repeating: GridItem(.flexible(minimum: 74, maximum: 96), spacing: 8),
                                 count: 4
                             ),
                             alignment: .leading,
                             spacing: 6
                         ) {
-                            ForEach(group.associations) { association in
-                                if let fileExtension = association.extensions.first {
-                                    Toggle(association.title, isOn: fileAssociationBinding(for: fileExtension))
-                                        .disabled(fileAssociationPreferences.pendingContentTypes.contains(association.id))
-                                }
+                            ForEach(group.extensions, id: \.self) { fileExtension in
+                                Toggle(".\(fileExtension)", isOn: fileAssociationBinding(for: fileExtension))
+                                    .disabled(fileAssociationPreferences.isUpdating(fileExtension))
                             }
                         }
 
